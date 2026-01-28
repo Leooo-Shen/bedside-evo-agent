@@ -1,0 +1,28 @@
+{
+  "data": {
+    "events_path": "data/mimic-demo/events/data_0.parquet",
+    "icu_stay_path": "data/mimic-demo/icu_stay/data_0.parquet",
+    "output_dir": "data/oracle_outputs"
+  },
+  "time_windows": {
+    "current_window_hours": 0.5,
+    "window_step_hours": 2,
+    "lookback_window_hours": 2,
+    "future_window_hours": 2,
+    "include_pre_icu_data": true
+  },
+  "oracle": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "temperature": 0.1,
+    "max_tokens": 4096
+  },
+  "logging": {
+    "log_dir": "logs/oracle",
+    "save_trajectories": true
+  },
+  "processing": {
+    "max_patients": null,
+    "include_window_data": true
+  }
+}
