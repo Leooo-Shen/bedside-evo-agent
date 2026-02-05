@@ -4,7 +4,10 @@
       "Bash(tree:*)",
       "Bash(python:*)",
       "Bash(pip install:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(tail:*)",
+      "Bash(find:*)",
+      "Bash(python3:*)"
     ]
   }
 }

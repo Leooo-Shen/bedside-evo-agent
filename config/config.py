@@ -81,33 +81,121 @@ class Config:
         return self.get("data.output_dir")
 
     # ========================================================================
-    # Time Window Configuration
+    # Oracle Time Window Configuration
+    # ========================================================================
+
+    @property
+    def oracle_current_window_hours(self) -> float:
+        """Size of current observation window in hours for Oracle (default 0.5 = 30 minutes)."""
+        return self.get("oracle_time_windows.current_window_hours", 0.5)
+
+    @property
+    def oracle_lookback_window_hours(self) -> float:
+        """Size of historical lookback window for Oracle before current window starts (default 6 hours)."""
+        return self.get("oracle_time_windows.lookback_window_hours", 6.0)
+
+    @property
+    def oracle_future_window_hours(self) -> float:
+        """Size of future prediction window for Oracle after current window ends (default 6 hours)."""
+        return self.get("oracle_time_windows.future_window_hours", 6.0)
+
+    @property
+    def oracle_window_step_hours(self) -> float:
+        """Step size between sliding windows for Oracle in hours (default 0.5 = 30 minutes)."""
+        return self.get("oracle_time_windows.window_step_hours", 0.5)
+
+    @property
+    def oracle_include_pre_icu_data(self) -> bool:
+        """Whether to include pre-ICU hospital data in history context for Oracle."""
+        return self.get("oracle_time_windows.include_pre_icu_data", True)
+
+    @property
+    def oracle_use_discharge_summary_for_history(self) -> bool:
+        """Whether to use discharge summary as history context for Oracle instead of history events."""
+        return self.get("oracle_time_windows.use_discharge_summary_for_history", False)
+
+    @property
+    def oracle_num_discharge_summaries(self) -> int:
+        """Number of most recent discharge summaries to extract for Oracle (default 3)."""
+        return self.get("oracle_time_windows.num_discharge_summaries", 3)
+
+    @property
+    def oracle_use_first_n_hours_after_icu(self) -> Optional[float]:
+        """Use only the first N hours after ICU entry for Oracle (default None = use full duration)."""
+        return self.get("oracle_time_windows.use_first_n_hours_after_icu", None)
+
+    # ========================================================================
+    # Agent Time Window Configuration
+    # ========================================================================
+
+    @property
+    def agent_current_window_hours(self) -> float:
+        """Size of current observation window in hours for Agent (default 0.5 = 30 minutes)."""
+        return self.get("agent_time_windows.current_window_hours", 0.5)
+
+    @property
+    def agent_lookback_window_hours(self) -> float:
+        """Size of historical lookback window for Agent before current window starts (default 6 hours)."""
+        return self.get("agent_time_windows.lookback_window_hours", 6.0)
+
+    @property
+    def agent_future_window_hours(self) -> float:
+        """Size of future prediction window for Agent after current window ends (default 6 hours)."""
+        return self.get("agent_time_windows.future_window_hours", 6.0)
+
+    @property
+    def agent_window_step_hours(self) -> float:
+        """Step size between sliding windows for Agent in hours (default 0.5 = 30 minutes)."""
+        return self.get("agent_time_windows.window_step_hours", 0.5)
+
+    @property
+    def agent_include_pre_icu_data(self) -> bool:
+        """Whether to include pre-ICU hospital data in history context for Agent."""
+        return self.get("agent_time_windows.include_pre_icu_data", True)
+
+    @property
+    def agent_use_discharge_summary_for_history(self) -> bool:
+        """Whether to use discharge summary as history context for Agent instead of history events."""
+        return self.get("agent_time_windows.use_discharge_summary_for_history", False)
+
+    @property
+    def agent_num_discharge_summaries(self) -> int:
+        """Number of most recent discharge summaries to extract for Agent (default 3)."""
+        return self.get("agent_time_windows.num_discharge_summaries", 3)
+
+    @property
+    def agent_use_first_n_hours_after_icu(self) -> Optional[float]:
+        """Use only the first N hours after ICU entry for Agent (default None = use full duration)."""
+        return self.get("agent_time_windows.use_first_n_hours_after_icu", None)
+
+    # ========================================================================
+    # Legacy Time Window Configuration (for backward compatibility)
     # ========================================================================
 
     @property
     def current_window_hours(self) -> float:
-        """Size of current observation window in hours (default 0.5 = 30 minutes)."""
-        return self.get("time_windows.current_window_hours", 0.5)
+        """Size of current observation window in hours (default 0.5 = 30 minutes). DEPRECATED: Use oracle_current_window_hours or agent_current_window_hours."""
+        return self.get("oracle_time_windows.current_window_hours", 0.5)
 
     @property
     def lookback_window_hours(self) -> float:
-        """Size of historical lookback window before current window starts (default 6 hours)."""
-        return self.get("time_windows.lookback_window_hours", 6.0)
+        """Size of historical lookback window before current window starts (default 6 hours). DEPRECATED: Use oracle_lookback_window_hours or agent_lookback_window_hours."""
+        return self.get("oracle_time_windows.lookback_window_hours", 6.0)
 
     @property
     def future_window_hours(self) -> float:
-        """Size of future prediction window after current window ends (default 6 hours)."""
-        return self.get("time_windows.future_window_hours", 6.0)
+        """Size of future prediction window after current window ends (default 6 hours). DEPRECATED: Use oracle_future_window_hours or agent_future_window_hours."""
+        return self.get("oracle_time_windows.future_window_hours", 6.0)
 
     @property
     def window_step_hours(self) -> float:
-        """Step size between sliding windows in hours (default 0.5 = 30 minutes)."""
-        return self.get("time_windows.window_step_hours", 0.5)
+        """Step size between sliding windows in hours (default 0.5 = 30 minutes). DEPRECATED: Use oracle_window_step_hours or agent_window_step_hours."""
+        return self.get("oracle_time_windows.window_step_hours", 0.5)
 
     @property
     def include_pre_icu_data(self) -> bool:
-        """Whether to include pre-ICU hospital data in history context."""
-        return self.get("time_windows.include_pre_icu_data", True)
+        """Whether to include pre-ICU hospital data in history context. DEPRECATED: Use oracle_include_pre_icu_data or agent_include_pre_icu_data."""
+        return self.get("oracle_time_windows.include_pre_icu_data", True)
 
     # ========================================================================
     # Oracle Configuration

@@ -93,6 +93,7 @@ def format_oracle_prompt(window_data: dict, window_hours: float = 6.0, include_o
 - Hours Since Admission: {window_data['hours_since_admission']:.1f}
 - Evaluation Window: {window_data['current_window_start']} to {window_data['current_window_end']}
 - Total ICU Duration: {metadata['total_icu_duration_hours']:.1f} hours
+
 """
 
     # Only include outcome if requested (for blinded evaluation)

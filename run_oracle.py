@@ -121,8 +121,18 @@ def process_batch_for_oracle(
                 lookback_window_hours=lookback_window_hours,
                 future_window_hours=future_window_hours,
                 window_step_hours=window_step_hours,
-                include_pre_icu_data=include_pre_icu_data
+                include_pre_icu_data=include_pre_icu_data,
+                use_first_n_hours_after_icu=config.oracle_use_first_n_hours_after_icu,
+                remove_discharge_summary=True,  # Remove discharge summary from windows
+                use_discharge_summary_for_history=config.oracle_use_discharge_summary_for_history,
+                num_discharge_summaries=config.oracle_num_discharge_summaries
             )
+
+            # TODO: Extract discharge summary separately for Oracle ground truth
+            # discharge_summary = parser.extract_discharge_summary(trajectory)
+            # if discharge_summary:
+            #     # Save or use discharge summary for Oracle evaluation
+            #     pass
 
             print(f"  Generated {len(windows)} time windows")
 
@@ -244,29 +254,29 @@ def main():
     parser.add_argument(
         "--current-window-hours",
         type=float,
-        default=config.current_window_hours,
-        help=f"Size of current observation window in hours (default: {config.current_window_hours})"
+        default=config.oracle_current_window_hours,
+        help=f"Size of current observation window in hours (default: {config.oracle_current_window_hours})"
     )
 
     parser.add_argument(
         "--lookback-window-hours",
         type=float,
-        default=config.lookback_window_hours,
-        help=f"Size of historical lookback before current starts in hours (default: {config.lookback_window_hours})"
+        default=config.oracle_lookback_window_hours,
+        help=f"Size of historical lookback before current starts in hours (default: {config.oracle_lookback_window_hours})"
     )
 
     parser.add_argument(
         "--future-window-hours",
         type=float,
-        default=config.future_window_hours,
-        help=f"Size of future prediction after current ends in hours (default: {config.future_window_hours})"
+        default=config.oracle_future_window_hours,
+        help=f"Size of future prediction after current ends in hours (default: {config.oracle_future_window_hours})"
     )
 
     parser.add_argument(
         "--window-step-hours",
         type=float,
-        default=config.window_step_hours,
-        help=f"Step size between sliding windows in hours (default: {config.window_step_hours})"
+        default=config.oracle_window_step_hours,
+        help=f"Step size between sliding windows in hours (default: {config.oracle_window_step_hours})"
     )
 
     parser.add_argument(

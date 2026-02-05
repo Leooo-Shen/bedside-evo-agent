@@ -47,18 +47,22 @@ def main():
 
     # Create time windows using config values
     print("\n3. Creating time windows...")
-    print(f"   Current window: {config.current_window_hours} hours ({config.current_window_hours * 60:.0f} minutes)")
-    print(f"   Lookback window: {config.lookback_window_hours} hours")
-    print(f"   Future window: {config.future_window_hours} hours")
-    print(f"   Window step size: {config.window_step_hours} hours ({config.window_step_hours * 60:.0f} minutes)")
-    print(f"   Include pre-ICU data: {config.include_pre_icu_data}")
+    print(f"   Current window: {config.oracle_current_window_hours} hours ({config.oracle_current_window_hours * 60:.0f} minutes)")
+    print(f"   Lookback window: {config.oracle_lookback_window_hours} hours")
+    print(f"   Future window: {config.oracle_future_window_hours} hours")
+    print(f"   Window step size: {config.oracle_window_step_hours} hours ({config.oracle_window_step_hours * 60:.0f} minutes)")
+    print(f"   Include pre-ICU data: {config.oracle_include_pre_icu_data}")
     windows = parser.create_time_windows(
         trajectory,
-        current_window_hours=config.current_window_hours,
-        lookback_window_hours=config.lookback_window_hours,
-        future_window_hours=config.future_window_hours,
-        window_step_hours=config.window_step_hours,
-        include_pre_icu_data=config.include_pre_icu_data,
+        current_window_hours=config.oracle_current_window_hours,
+        lookback_window_hours=config.oracle_lookback_window_hours,
+        future_window_hours=config.oracle_future_window_hours,
+        window_step_hours=config.oracle_window_step_hours,
+        include_pre_icu_data=config.oracle_include_pre_icu_data,
+        use_first_n_hours_after_icu=config.oracle_use_first_n_hours_after_icu,
+        remove_discharge_summary=True,  # Remove discharge summary from windows
+        use_discharge_summary_for_history=config.oracle_use_discharge_summary_for_history,
+        num_discharge_summaries=config.oracle_num_discharge_summaries
     )
     print(f"   Generated {len(windows)} time windows")
 
@@ -90,7 +94,7 @@ def main():
             model=config.oracle_model,
             temperature=config.oracle_temperature,
             max_tokens=config.oracle_max_tokens,
-            window_hours=config.current_window_hours,
+            window_hours=config.oracle_current_window_hours,
             log_dir=config.log_dir,
         )
         print("   Oracle initialized successfully")
