@@ -198,28 +198,28 @@ class Config:
         return self.get("oracle_time_windows.include_pre_icu_data", True)
 
     # ========================================================================
-    # Oracle Configuration
+    # LLM Configuration
     # ========================================================================
 
     @property
-    def oracle_provider(self) -> str:
-        """LLM provider for Oracle."""
-        return self.get("oracle.provider")
+    def llm_provider(self) -> str:
+        """LLM provider (e.g., 'openai', 'anthropic')."""
+        return self.get("llm.provider")
 
     @property
-    def oracle_model(self) -> Optional[str]:
-        """Model name for Oracle."""
-        return self.get("oracle.model")
+    def llm_model(self) -> Optional[str]:
+        """Model name for LLM."""
+        return self.get("llm.model")
 
     @property
-    def oracle_temperature(self) -> float:
-        """Sampling temperature for Oracle."""
-        return self.get("oracle.temperature")
+    def llm_temperature(self) -> float:
+        """Sampling temperature for LLM."""
+        return self.get("llm.temperature")
 
     @property
-    def oracle_max_tokens(self) -> int:
-        """Maximum tokens for Oracle responses."""
-        return self.get("oracle.max_tokens")
+    def llm_max_tokens(self) -> int:
+        """Maximum tokens for LLM responses."""
+        return self.get("llm.max_tokens")
 
     # ========================================================================
     # Logging Configuration
@@ -248,6 +248,44 @@ class Config:
     def include_window_data(self) -> bool:
         """Whether to include full window data in reports."""
         return self.get("processing.include_window_data")
+
+    # ========================================================================
+    # ReMeM Configuration
+    # ========================================================================
+
+    @property
+    def remem_observation_hours(self) -> float:
+        """Number of hours to observe before making prediction (default 12)."""
+        return self.get("remem.observation_hours", 12.0)
+
+    @property
+    def remem_max_state_length(self) -> int:
+        """Maximum length of patient state summary (default 1500)."""
+        return self.get("remem.max_state_length", 1500)
+
+    @property
+    def remem_enable_intra_patient_refinement(self) -> bool:
+        """Whether to enable Think-Refine-Act loop for intra-patient state updates (default False)."""
+        return self.get("remem.enable_intra_patient_refinement", False)
+
+    # ========================================================================
+    # AgentFold Configuration
+    # ========================================================================
+
+    @property
+    def agent_fold_observation_hours(self) -> float:
+        """Number of hours to observe before making prediction (default 12)."""
+        return self.get("agent_fold.observation_hours", 12.0)
+
+    @property
+    def agent_fold_enable_key_events_extraction(self) -> bool:
+        """Whether to enable key events extraction (default True)."""
+        return self.get("agent_fold.enable_key_events_extraction", True)
+
+    @property
+    def agent_fold_max_trajectory_entries(self) -> int:
+        """Maximum number of trajectory entries to maintain (default 20)."""
+        return self.get("agent_fold.max_trajectory_entries", 20)
 
     # ========================================================================
     # Utility Methods

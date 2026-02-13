@@ -238,14 +238,14 @@ def main():
 
     # Initialize Oracle in BLINDED mode
     print("\nInitializing Meta Oracle in BLINDED mode...")
-    print(f"  Provider: {config.oracle_provider}")
-    print(f"  Model: {config.oracle_model}")
+    print(f"  Provider: {config.llm_provider}")
+    print(f"  Model: {config.llm_model}")
     print(f"  Mode: BLINDED (outcome excluded from prompts)")
     oracle = MetaOracle(
-        provider=config.oracle_provider,
-        model=config.oracle_model,
+        provider=config.llm_provider,
+        model=config.llm_model,
         window_hours=config.current_window_hours,
-        temperature=config.oracle_temperature,
+        temperature=config.llm_temperature,
         blinded=True,  # KEY DIFFERENCE: Exclude outcome from prompts
     )
 

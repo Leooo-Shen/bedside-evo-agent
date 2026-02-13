@@ -239,16 +239,16 @@ def main():
     parser.add_argument(
         "--provider",
         type=str,
-        default=config.oracle_provider,
+        default=config.llm_provider,
         choices=["anthropic", "openai"],
-        help=f"LLM provider (default: {config.oracle_provider})"
+        help=f"LLM provider (default: {config.llm_provider})"
     )
 
     parser.add_argument(
         "--model",
         type=str,
-        default=config.oracle_model,
-        help=f"Model name (default: {config.oracle_model or 'provider default'})"
+        default=config.llm_model,
+        help=f"Model name (default: {config.llm_model or 'provider default'})"
     )
 
     parser.add_argument(

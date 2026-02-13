@@ -228,8 +228,8 @@ windows = parser.create_time_windows(
 
 # Initialize Oracle
 oracle = MetaOracle(
-    provider=config.oracle_provider,
-    model=config.oracle_model
+    provider=config.llm_provider,
+    model=config.llm_model
 )
 
 # Evaluate windows

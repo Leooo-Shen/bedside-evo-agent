@@ -31,7 +31,7 @@ from config.config import get_config
 from data_parser import MIMICDataParser
 from model.llms import LLMClient
 
-seed = 1
+SEED = 1
 
 
 def select_balanced_patients(icu_stay_df: pd.DataFrame, n_survived: int = 5, n_died: int = 5) -> pd.DataFrame:
@@ -63,11 +63,11 @@ def select_balanced_patients(icu_stay_df: pd.DataFrame, n_survived: int = 5, n_d
     print(f"   Selected: {n_survived_actual} survived, {n_died_actual} died")
 
     # Sample patients
-    selected_survived = survived_patients.sample(n=n_survived_actual, random_state=seed)
-    selected_died = died_patients.sample(n=n_died_actual, random_state=seed)
+    selected_survived = survived_patients.sample(n=n_survived_actual, random_state=SEED)
+    selected_died = died_patients.sample(n=n_died_actual, random_state=SEED)
 
     # Combine and shuffle
-    balanced_df = pd.concat([selected_survived, selected_died]).sample(frac=1, random_state=seed)
+    balanced_df = pd.concat([selected_survived, selected_died]).sample(frac=1, random_state=SEED)
 
     return balanced_df
 
@@ -283,10 +283,10 @@ def process_single_patient_baseline(
     try:
         # Create LLM client for this patient
         llm_client = LLMClient(
-            provider=config.oracle_provider,
-            model=config.oracle_model,
-            temperature=config.oracle_temperature,
-            max_tokens=config.oracle_max_tokens,
+            provider=config.llm_provider,
+            model=config.llm_model,
+            temperature=config.llm_temperature,
+            max_tokens=config.llm_max_tokens,
         )
 
         # Get patient trajectory
@@ -400,13 +400,14 @@ def process_single_patient_baseline(
         return None
 
 
-def main(max_workers: int, task: str = "survival"):
+def main(max_workers: int, task: str = "survival", patient_ids: Optional[List[int]] = None):
     """
     Run baseline prediction experiment on multiple balanced patients.
 
     Args:
         max_workers: Maximum number of parallel workers (default 4)
         task: Prediction task (default "survival")
+        patient_ids: Optional list of specific patient IDs to process (default None)
     """
     # Load configuration
     config = get_config()
@@ -433,11 +434,21 @@ def main(max_workers: int, task: str = "survival"):
     parser.load_data()
     print(f"   Loaded {len(parser.icu_stay_df)} ICU stays")
 
-    # Select balanced patients
-    print("\n2. Selecting balanced patient cohort...")
-    n_per_class = 50  # Number of patients per class (survived/died)
-    selected_patients = select_balanced_patients(parser.icu_stay_df, n_survived=n_per_class, n_died=n_per_class)
-    print(f"   Total patients selected: {len(selected_patients)}")
+    # Select patients based on whether specific IDs were provided
+    print("\n2. Selecting patient cohort...")
+    if patient_ids is not None and len(patient_ids) > 0:
+        # Filter to specific patient IDs (all ICU stays for these patients)
+        selected_patients = parser.icu_stay_df[parser.icu_stay_df["subject_id"].isin(patient_ids)].copy()
+        print(f"   Filtering to specific patient IDs: {patient_ids}")
+        print(f"   Found {len(selected_patients)} ICU stay(s) for these patient(s)")
+        if len(selected_patients) == 0:
+            print(f"   WARNING: No ICU stays found for the specified patient IDs!")
+            return
+    else:
+        # Use balanced selection
+        n_per_class = 10  # Number of patients per class (survived/died)
+        selected_patients = select_balanced_patients(parser.icu_stay_df, n_survived=n_per_class, n_died=n_per_class)
+        print(f"   Total patients selected: {len(selected_patients)}")
 
     # Run experiments in parallel
     print(f"\n3. Running baseline experiments (up to {max_workers} in parallel)...")
@@ -550,4 +561,19 @@ def main(max_workers: int, task: str = "survival"):
 
 
 if __name__ == "__main__":
-    main(max_workers=4)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Baseline Prediction Experiment")
+    parser.add_argument("--max-workers", type=int, default=4, help="Maximum number of parallel workers")
+    parser.add_argument("--task", type=str, default="survival", help="Prediction task (default: survival)")
+    parser.add_argument(
+        "--patient-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Specific patient IDs to process (e.g., --patient-ids 19904685 12345678)",
+    )
+
+    args = parser.parse_args()
+
+    main(max_workers=args.max_workers, task=args.task, patient_ids=args.patient_ids)

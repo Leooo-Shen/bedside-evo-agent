@@ -1,9 +1,12 @@
 import json
 import random
+import sys
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+
+sys.path.append("..")  # Add parent directory to path for imports
 
 
 class MIMICDataParser:
@@ -179,6 +182,12 @@ class MIMICDataParser:
         # Calculate age at admission
         age_at_admission = (icu_stay["enter_time"] - icu_stay["birth_time"]).days / 365.25
 
+        # Extract gender from META_GENDER event
+        gender = None
+        gender_events = patient_events[patient_events["code"] == "META_GENDER"]
+        if len(gender_events) > 0:
+            gender = gender_events.iloc[0].get("code_specifics", None)
+
         # Apply de-identification if enabled
         if self.de_identify:
             deidentified_subject_id = self._deidentify_patient_id(subject_id, "subject")
@@ -201,6 +210,7 @@ class MIMICDataParser:
             "enter_time": enter_time_deidentified.isoformat(),
             "leave_time": leave_time_deidentified.isoformat(),
             "age_at_admission": float(age_at_admission),
+            "gender": gender,
             "icu_duration_hours": float(icu_stay["icu_duration_hours"]),
             "survived": bool(icu_stay["survived"]),
             "death_time": death_time_deidentified.isoformat() if death_time_deidentified else None,
@@ -428,9 +438,10 @@ class MIMICDataParser:
             if len(outcome_events) > 0:
                 # Find the earliest outcome event
                 first_outcome_time = outcome_events["event_time"].min()
-                # Update effective_leave_time to stop before this event
-                effective_leave_time = min(effective_leave_time, first_outcome_time)
-                print(f"  Found outcome event at {first_outcome_time}, stopping windows before this time")
+                # Stop windows just before the outcome event (subtract 1 second to ensure we don't include it)
+                stop_time = first_outcome_time - timedelta(seconds=1)
+                effective_leave_time = min(effective_leave_time, stop_time)
+                print(f"  Found outcome event at {first_outcome_time}, stopping windows at {stop_time}")
 
         # Extract discharge summaries from BEFORE current ICU stay if requested
         discharge_summary_content = None
@@ -490,7 +501,8 @@ class MIMICDataParser:
         # Use effective_leave_time for windowing (may be earlier than actual leave_time)
         while current_start < effective_leave_time:
             # Calculate window boundaries
-            current_end = current_start + timedelta(hours=current_window_hours)
+            # IMPORTANT: Cap current_end at effective_leave_time to prevent including outcome events
+            current_end = min(current_start + timedelta(hours=current_window_hours), effective_leave_time)
             future_end = min(current_end + timedelta(hours=future_window_hours), effective_leave_time)
             history_start = current_start - timedelta(hours=lookback_window_hours)
 
@@ -555,6 +567,9 @@ class MIMICDataParser:
                 windows.append(window)
 
             current_start += timedelta(hours=window_step_hours)
+
+        # Drop the window if it has no current events
+        windows = [w for w in windows if len(w["current_events"]) > 0]
 
         return windows
 

@@ -7,11 +7,11 @@ patient trajectories and their outcomes.
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+from typing import Dict, List, Optional
 
 sys.path.append(str(Path(__file__).parent.parent))
 

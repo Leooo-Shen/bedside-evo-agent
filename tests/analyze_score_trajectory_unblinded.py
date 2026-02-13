@@ -224,14 +224,14 @@ def main():
 
     # Initialize Oracle (unblinded mode)
     print("\nInitializing Meta Oracle...")
-    print(f"  Provider: {config.oracle_provider}")
-    print(f"  Model: {config.oracle_model}")
+    print(f"  Provider: {config.llm_provider}")
+    print(f"  Model: {config.llm_model}")
     print(f"  Mode: UNBLINDED")
     oracle = MetaOracle(
-        provider=config.oracle_provider,
-        model=config.oracle_model,
+        provider=config.llm_provider,
+        model=config.llm_model,
         window_hours=config.current_window_hours,
-        temperature=config.oracle_temperature,
+        temperature=config.llm_temperature,
         blinded=False,  # Explicitly set unblinded mode
     )
 

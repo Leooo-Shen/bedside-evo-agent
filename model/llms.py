@@ -106,9 +106,21 @@ class LLMClient:
         request_params = {
             "model": self.model,
             "messages": messages,
-            "temperature": kwargs.get("temperature", self.temperature),
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
         }
+
+        # Handle temperature parameter
+        # Some models (gpt-5*, o1*) only support default temperature (1.0)
+        if not (self.model.startswith("gpt-5") or self.model.startswith("o1")):
+            request_params["temperature"] = kwargs.get("temperature", self.temperature)
+
+        # Determine which token parameter to use based on model
+        # Newer models (gpt-5*, o1*) use max_completion_tokens
+        # Older models use max_tokens
+        max_tokens_value = kwargs.get("max_tokens", self.max_tokens)
+        if self.model.startswith("gpt-5") or self.model.startswith("o1"):
+            request_params["max_completion_tokens"] = max_tokens_value
+        else:
+            request_params["max_tokens"] = max_tokens_value
 
         # Add JSON mode if requested
         if response_format == "json":
