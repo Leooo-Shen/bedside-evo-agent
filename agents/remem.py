@@ -132,7 +132,7 @@ class RememAgent:
         Initialize ReMeM Agent.
 
         Args:
-            provider: LLM provider ("openai" or "anthropic")
+            provider: LLM provider ("openai", "anthropic", "google", or "gemini")
             model: Model name
             api_key: API key
             temperature: Sampling temperature
@@ -402,6 +402,11 @@ class RememAgent:
         pred_match = re.search(r"<prediction>(.*?)</prediction>", response, re.DOTALL | re.IGNORECASE)
         if pred_match:
             return ("predict", pred_match.group(1).strip())
+
+        # Check for response tags (shared prediction prompt format)
+        resp_match = re.search(r"<response>(.*?)</response>", response, re.DOTALL | re.IGNORECASE)
+        if resp_match:
+            return ("predict", resp_match.group(1).strip())
 
         # Fallback: treat entire response as prediction
         return ("predict", response)
@@ -726,6 +731,16 @@ class RememAgent:
             self.total_tokens_used += input_tokens + output_tokens
 
         content = response.get("content", "")
+        log_metadata = dict(metadata or {})
+        log_metadata.update(
+            {
+                "step_type": step_type,
+                "llm_provider": self.llm_client.provider,
+                "llm_model": self.llm_client.model,
+            }
+        )
+        if response.get("model"):
+            log_metadata["llm_response_model"] = response.get("model")
 
         # Log the call if logging is enabled
         if self.enable_logging:
@@ -746,7 +761,7 @@ class RememAgent:
                 parsed_response=parsed,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                metadata=metadata or {},
+                metadata=log_metadata,
             )
             self.call_logs.append(log_entry)
 

@@ -10,6 +10,8 @@ may use different prompting strategies.
 
 from typing import Dict, List
 
+from prompts.shared_prompts import get_prediction_prompt
+
 
 def format_state_update_prompt(context: str) -> str:
 
@@ -103,54 +105,5 @@ Respond in JSON format:
 
 
 def format_survival_prediction_prompt(context: str) -> str:
-    return f"""You are an ICU expert predicting patient survival after ICU discharge. Based on the clinical state summary and current events, determine whether this patient will SURVIVE or DIE.
-
-Analyze using the four pillars:
-1. Hemodynamics: Are vitals stable?
-2. Respiratory: Is oxygenation adequate?
-3. Renal/Metabolic: Are labs improving?
-4. Neurology: Is mental status appropriate?
-
-{context}
-
-## DECISION FLOW:
-1. ALWAYS start with <thought_process>.
-2. Analyze the Focus Areas in your thought process.
-3. Identify any Memory IDs that contain outdated or conflicting clinical data.
-4. If conflicts exist, output <action>PRUNE</action> followed by <ids>. You have to STOP and DO NOT proceed to state update.
-5. If no conflicts exist or after pruning, output <state_update> with JSON.
-
-## REQUIRED OUTPUT FORMATS:
-### Step 1: Mandatory Thought Process (ALWAYS REQUIRED)
-<thought_process>
-- [Assessment]: Summary of current vitals/trends.
-- [Evaluating Concerns]: Evaluate previous concerns and new events, update their status (resolved, ongoing, new).
-- [Conflict Check]: List specific Memory IDs that are now medically obsolete or factually contradicted.
-- [Decision]: Explain why you are either Pruning or proceeding directly to State Update.
-</thought_process>
-
-### Step 2: Choose ONE of the following actions:
-
-#### OPTION A: PRUNE MEMORY (If data is conflicting/obsolete)
-<action>PRUNE</action>
-<ids>1, 2</ids>
-Note: you have to STOP here.
-
-#### OPTION B: FINAL PREDICTION (If ready to predict)
-<prediction>
-{{
-  "survival_prediction": {{
-    "outcome": "survive/die",
-    "confidence": <float 0.0-1.0>,
-    "rationale": "Explanation based on 4-pillar analysis"
-  }},
-  "patient_status": {{
-    "severity_category": "Critical/Unstable/Guarded/Stable/Improving",
-    "trajectory": "improving/stable/deteriorating",
-    "key_concerns": "Primary concern"
-  }},
-  "risk_factors": [
-    {{"factor": "name", "impact": "high/medium/low", "description": "why"}}
-  ]
-}}
-</prediction>"""
+    """Use the shared prediction prompt, formatted with the given context."""
+    return get_prediction_prompt().format(context=context)

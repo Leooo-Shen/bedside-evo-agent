@@ -145,7 +145,7 @@ class MetaOracle:
         Initialize Meta Oracle.
 
         Args:
-            provider: LLM provider ("anthropic" or "openai")
+            provider: LLM provider ("anthropic", "openai", "google", or "gemini")
             model: Model name (defaults to best available)
             api_key: API key (if None, uses environment variable)
             temperature: Sampling temperature (lower = more deterministic)

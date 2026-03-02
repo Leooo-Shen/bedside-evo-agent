@@ -10,7 +10,8 @@
       "Bash(python3:*)",
       "Bash(xargs:*)",
       "Bash(ls:*)",
-      "Bash(git mv:*)"
+      "Bash(git mv:*)",
+      "Bash(PYTHONPATH=/Users/leo/Workdir/PhD/evo-agent python:*)"
     ]
   }
 }

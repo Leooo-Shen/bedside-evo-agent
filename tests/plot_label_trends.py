@@ -268,8 +268,6 @@ def main():
     windows = parser.create_time_windows(
         trajectory,
         current_window_hours=config.oracle_current_window_hours,
-        lookback_window_hours=config.oracle_lookback_window_hours,
-        future_window_hours=config.oracle_future_window_hours,
         window_step_hours=0.5,  # 30-minute step size
         include_pre_icu_data=config.oracle_include_pre_icu_data,
     )

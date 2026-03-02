@@ -228,11 +228,11 @@ class MIMICDataParser:
         Clean and filter event data to keep only relevant fields.
 
         This reduces context size by keeping only clinically relevant information:
-        - time: Event timestamp (formatted as YYYY-MM-DD HH:MM)
+        - time: Event timestamp (formatted as YYYY-MM-DD HH:MM:SS)
         - code: Item identifier
         - numeric_value: Numeric measurement
         - code_specifics: Label/description
-        - end_time: End timestamp if available (formatted as YYYY-MM-DD HH:MM)
+        - end_time: End timestamp if available (formatted as YYYY-MM-DD HH:MM:SS)
         - text_value: Text value or unit
         - time_delta_minutes: Minutes since previous event
 
@@ -246,24 +246,24 @@ class MIMICDataParser:
         cleaned = {}
 
         if "time" in event and pd.notna(event["time"]):
-            # Format time as YYYY-MM-DD HH:MM (remove seconds for readability and token efficiency)
+            # Format time as YYYY-MM-DD HH:MM:SS to preserve second-level precision.
             try:
                 time_dt = pd.to_datetime(event["time"])
                 # Apply de-identification if enabled
                 if self.de_identify:
                     time_dt = self._deidentify_timestamp(time_dt)
-                cleaned["time"] = time_dt.strftime("%Y-%m-%d %H:%M")
+                cleaned["time"] = time_dt.strftime("%Y-%m-%d %H:%M:%S")
             except:
                 cleaned["time"] = str(event["time"])
 
         if "end" in event and pd.notna(event["end"]):
-            # Format end time as YYYY-MM-DD HH:MM
+            # Format end time as YYYY-MM-DD HH:MM:SS to preserve second-level precision.
             try:
                 end_dt = pd.to_datetime(event["end"])
                 # Apply de-identification if enabled
                 if self.de_identify:
                     end_dt = self._deidentify_timestamp(end_dt)
-                cleaned["end_time"] = end_dt.strftime("%Y-%m-%d %H:%M")
+                cleaned["end_time"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
             except:
                 cleaned["end_time"] = str(event["end"])
 
@@ -344,8 +344,6 @@ class MIMICDataParser:
         self,
         trajectory: Dict,
         current_window_hours: float = 0.5,
-        lookback_window_hours: float = 2.0,
-        future_window_hours: float = 2.0,
         window_step_hours: float = 0.5,
         include_pre_icu_data: bool = True,
         use_first_n_hours_after_icu: float = 12,
@@ -355,12 +353,11 @@ class MIMICDataParser:
         """
         Split a patient trajectory into time windows for Oracle or Agent evaluation.
 
-        Each window contains THREE segments:
-        - History: Events from (current_start - lookback_window_hours) to current_start
+        Each window contains:
+        - History: All events before current window start
           If include_pre_icu_data is True, includes pre-ICU hospital events
           If use_discharge_summary_for_history is True, uses discharge summary instead
         - Current: Events from current_start to (current_start + current_window_hours)
-        - Future: Events from (current_start + current_window_hours) to (current_start + current_window_hours + future_window_hours)
         - Metadata: Patient info and outcome
 
         IMPORTANT: To prevent information leakage, window creation automatically stops at the first
@@ -371,8 +368,6 @@ class MIMICDataParser:
         Args:
             trajectory: Patient trajectory from get_patient_trajectory()
             current_window_hours: Size of current observation window (default 0.5 = 30 minutes)
-            lookback_window_hours: Size of historical lookback before current starts (default 6 hours)
-            future_window_hours: Size of future prediction window after current ends (default 6 hours)
             window_step_hours: Step size between sliding windows (default 0.5 = 30 minutes)
             include_pre_icu_data: Whether to include pre-ICU hospital data (default True)
             use_first_n_hours_after_icu: Use only the first N hours after ICU entry (default None)
@@ -386,10 +381,10 @@ class MIMICDataParser:
                                      before current ICU stay (default 3). Only used when
                                      use_discharge_summary_for_history is True
 
-        Example with current=0.5, lookback=6, future=6, step=0.5:
-            Window 0: history=[-6h, 0h], current=[0h, 0.5h], future=[0.5h, 6.5h]
-            Window 1: history=[-5.5h, 0.5h], current=[0.5h, 1h], future=[1h, 7h]
-            Window 2: history=[-5h, 1h], current=[1h, 1.5h], future=[1.5h, 7.5h]
+        Example with current=0.5, step=0.5:
+            Window 0: history=[ICU_start, 0h], current=[0h, 0.5h]
+            Window 1: history=[ICU_start, 0.5h], current=[0.5h, 1h]
+            Window 2: history=[ICU_start, 1h], current=[1h, 1.5h]
             ...
 
         Returns:
@@ -503,28 +498,20 @@ class MIMICDataParser:
             # Calculate window boundaries
             # IMPORTANT: Cap current_end at effective_leave_time to prevent including outcome events
             current_end = min(current_start + timedelta(hours=current_window_hours), effective_leave_time)
-            future_end = min(current_end + timedelta(hours=future_window_hours), effective_leave_time)
-            history_start = current_start - timedelta(hours=lookback_window_hours)
 
-            # Split events into three segments: history, current, future
-            # History: events from history_start to current_start
-            history_events = events_df[
-                (events_df["event_time"] >= history_start) & (events_df["event_time"] < current_start)
-            ]
+            # Split events into two segments: history (all events before current), current
+            # History: all events from ICU start (or pre-ICU if enabled) to current_start
+            history_events = events_df[events_df["event_time"] < current_start]
+
             # Current: events from current_start to current_end
             current_events = events_df[
                 (events_df["event_time"] >= current_start) & (events_df["event_time"] < current_end)
             ]
-            # Future: events from current_end to future_end
-            future_events = events_df[
-                (events_df["event_time"] >= current_end) & (events_df["event_time"] < future_end)
-            ]
 
-            # Only create window if there are current or future events to evaluate
-            if len(current_events) > 0 or len(future_events) > 0:
+            # Only create window if there are current events to evaluate
+            if len(current_events) > 0:
                 # Clean events to reduce context size
                 cleaned_current = self._clean_events_list(current_events.to_dict("records"))
-                cleaned_future = self._clean_events_list(future_events.to_dict("records"))
 
                 # Handle history: use discharge summary if available and mode is enabled
                 if use_discharge_summary_for_history and discharge_summary_content:
@@ -545,12 +532,8 @@ class MIMICDataParser:
                     "icu_stay_id": trajectory["icu_stay_id"],
                     "current_window_start": current_start.isoformat(),
                     "current_window_end": current_end.isoformat(),
-                    "history_start": history_start.isoformat(),
-                    "future_end": future_end.isoformat(),
                     "hours_since_admission": (current_start - enter_time).total_seconds() / 3600,
                     "current_window_hours": current_window_hours,
-                    "lookback_window_hours": lookback_window_hours,
-                    "future_window_hours": future_window_hours,
                     "patient_metadata": {
                         "age": trajectory["age_at_admission"],
                         "survived": trajectory["survived"],
@@ -559,17 +542,12 @@ class MIMICDataParser:
                     },
                     "history_events": cleaned_history,
                     "current_events": cleaned_current,
-                    "future_events": cleaned_future,
                     "num_history_events": len(cleaned_history),
                     "num_current_events": len(cleaned_current),
-                    "num_future_events": len(cleaned_future),
                 }
                 windows.append(window)
 
             current_start += timedelta(hours=window_step_hours)
-
-        # Drop the window if it has no current events
-        windows = [w for w in windows if len(w["current_events"]) > 0]
 
         return windows
 

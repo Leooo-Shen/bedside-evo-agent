@@ -137,8 +137,12 @@ def plot_patient_status_trajectory(patient_results: Dict, output_path: Optional[
 
     # Extract data
     windows = [p.get("window_index", i) for i, p in enumerate(predictions)]
-    severity_scores = [p.get("patient_status_prediction", {}).get("severity_score", 0.0) for p in predictions]
+    severity_categories = [p.get("patient_status_prediction", {}).get("severity_category", "unknown") for p in predictions]
     trajectories = [p.get("patient_status_prediction", {}).get("trajectory", "unknown") for p in predictions]
+
+    # Convert severity_category to numeric for plotting
+    severity_map = {"Critical": -1.0, "Unstable": -0.5, "Guarded": 0.0, "Stable": 0.5, "Improving": 1.0, "unknown": 0.0}
+    severity_numeric = [severity_map.get(s, 0.0) for s in severity_categories]
 
     # Convert trajectory to numeric
     trajectory_map = {"improving": 1, "stable": 0, "deteriorating": -1, "unknown": 0}
@@ -147,12 +151,14 @@ def plot_patient_status_trajectory(patient_results: Dict, output_path: Optional[
     # Create figure
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-    # Plot 1: Severity score
-    ax1.plot(windows, severity_scores, marker="o", linewidth=2, markersize=8, color="purple")
+    # Plot 1: Severity category
+    ax1.plot(windows, severity_numeric, marker="o", linewidth=2, markersize=8, color="purple")
     ax1.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
-    ax1.fill_between(windows, severity_scores, alpha=0.3, color="purple")
-    ax1.set_ylabel("Severity Score", fontsize=12)
-    ax1.set_ylim(-1.1, 1.1)
+    ax1.fill_between(windows, severity_numeric, alpha=0.3, color="purple")
+    ax1.set_ylabel("Severity Category", fontsize=12)
+    ax1.set_ylim(-1.3, 1.3)
+    ax1.set_yticks([-1.0, -0.5, 0.0, 0.5, 1.0])
+    ax1.set_yticklabels(["Critical", "Unstable", "Guarded", "Stable", "Improving"])
     ax1.grid(True, alpha=0.3)
     ax1.set_title(
         f"Patient Status Trajectory - Patient {subject_id}\n" f"Actual Outcome: {actual_outcome.upper()}",

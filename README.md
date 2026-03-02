@@ -72,7 +72,7 @@ LLM-powered retrospective evaluator:
 - **Input**: Time window with patient history and future events
 - **Output**: Structured evaluation report
 - **Key Features**:
-  - Supports multiple LLM providers (Anthropic, OpenAI)
+  - Supports multiple LLM providers (Anthropic, OpenAI, Google Gemini)
   - Chain-of-Thought reasoning
   - Structured JSON output
   - Error handling and fallback parsing
@@ -90,7 +90,7 @@ Carefully designed prompt template:
 
 Unified interface for multiple LLM providers:
 
-- Supports Anthropic (Claude) and OpenAI (GPT)
+- Supports Anthropic (Claude), OpenAI (GPT), and Google Gemini
 - Handles API authentication
 - JSON response parsing
 - Token usage tracking
@@ -119,9 +119,11 @@ cp .env.example .env
 export ANTHROPIC_API_KEY="your-key-here"
 # or
 export OPENAI_API_KEY="your-key-here"
+# or
+export GOOGLE_API_KEY="your-key-here"
 ```
 
-**Note:** You only need one API key (Anthropic or OpenAI) depending on which provider you plan to use. The system automatically loads API keys from the `.env` file if present.
+**Note:** You only need one API key (Anthropic, OpenAI, or Google) depending on which provider you plan to use. The system automatically loads API keys from the `.env` file if present.
 
 ## Project Structure
 
@@ -194,7 +196,7 @@ python run_oracle.py \
 - `--events`: Path to events parquet file
 - `--icu-stay`: Path to ICU stay parquet file
 - `--output`: Output directory for reports
-- `--provider`: LLM provider (`anthropic` or `openai`)
+- `--provider`: LLM provider (`anthropic`, `openai`, `google`, or `gemini`)
 - `--model`: Specific model name (optional)
 - `--window-hours`: Size of future window (default: 6.0)
 - `--step-hours`: Step between windows (default: 1.0)

@@ -4,7 +4,7 @@
 
 1. Python 3.8 or higher
 2. MIMIC-demo dataset in `data/mimic-demo/`
-3. OpenAI API key (or Anthropic API key for Claude)
+3. OpenAI, Anthropic, or Google Gemini API key
 
 ## Installation
 
@@ -21,9 +21,11 @@ cp .env.example .env
 export ANTHROPIC_API_KEY="your-anthropic-key"
 # OR
 export OPENAI_API_KEY="your-openai-key"
+# OR
+export GOOGLE_API_KEY="your-google-key"
 ```
 
-**Note:** The `.env` file is automatically loaded by the system. The system is configured to use OpenAI by default. You can switch to Anthropic by using `--provider anthropic` flag.
+**Note:** The `.env` file is automatically loaded by the system. The system is configured to use OpenAI by default. You can switch providers with `--provider anthropic` or `--provider google`.
 
 ## Verify Setup
 
@@ -129,6 +131,11 @@ The system uses OpenAI (GPT-4o) by default. To use Anthropic Claude instead:
 python run_oracle.py --provider anthropic --model claude-3-5-sonnet-20241022
 ```
 
+To use Google Gemini:
+```bash
+python run_oracle.py --provider google --model gemini-1.5-flash
+```
+
 ## Programmatic Usage
 
 ```python
@@ -178,9 +185,9 @@ for report in reports:
 
 ## Troubleshooting
 
-### "Cannot import anthropic/openai"
+### "Cannot import anthropic/openai/google"
 ```bash
-pip install anthropic openai
+pip install anthropic openai google-genai
 ```
 
 ### "API key not found"
@@ -190,6 +197,8 @@ echo $ANTHROPIC_API_KEY
 
 # Set it if missing
 export ANTHROPIC_API_KEY="your-key"
+# Or for Gemini:
+export GOOGLE_API_KEY="your-key"
 ```
 
 ### "No windows generated"

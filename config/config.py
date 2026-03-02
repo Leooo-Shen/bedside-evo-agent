@@ -80,6 +80,25 @@ class Config:
         """Output directory for Oracle reports."""
         return self.get("data.output_dir")
 
+    @property
+    def max_patients(self) -> Optional[int]:
+        """Maximum number of patients to process."""
+        return self.get("data.max_patients")
+
+    # ========================================================================
+    # Data Loading Configuration
+    # ========================================================================
+
+    @property
+    def agent_observation_hours(self) -> float:
+        """Number of hours to observe for agent before making prediction (default 12)."""
+        return self.get("data_loading.agent_observation_hours", 12.0)
+
+    @property
+    def oracle_observation_hours(self) -> Optional[float]:
+        """Number of hours to observe for oracle (default None = use all data)."""
+        return self.get("data_loading.oracle_observation_hours", None)
+
     # ========================================================================
     # Oracle Time Window Configuration
     # ========================================================================
@@ -88,16 +107,6 @@ class Config:
     def oracle_current_window_hours(self) -> float:
         """Size of current observation window in hours for Oracle (default 0.5 = 30 minutes)."""
         return self.get("oracle_time_windows.current_window_hours", 0.5)
-
-    @property
-    def oracle_lookback_window_hours(self) -> float:
-        """Size of historical lookback window for Oracle before current window starts (default 6 hours)."""
-        return self.get("oracle_time_windows.lookback_window_hours", 6.0)
-
-    @property
-    def oracle_future_window_hours(self) -> float:
-        """Size of future prediction window for Oracle after current window ends (default 6 hours)."""
-        return self.get("oracle_time_windows.future_window_hours", 6.0)
 
     @property
     def oracle_window_step_hours(self) -> float:
@@ -119,11 +128,6 @@ class Config:
         """Number of most recent discharge summaries to extract for Oracle (default 3)."""
         return self.get("oracle_time_windows.num_discharge_summaries", 3)
 
-    @property
-    def oracle_use_first_n_hours_after_icu(self) -> Optional[float]:
-        """Use only the first N hours after ICU entry for Oracle (default None = use full duration)."""
-        return self.get("oracle_time_windows.use_first_n_hours_after_icu", None)
-
     # ========================================================================
     # Agent Time Window Configuration
     # ========================================================================
@@ -132,16 +136,6 @@ class Config:
     def agent_current_window_hours(self) -> float:
         """Size of current observation window in hours for Agent (default 0.5 = 30 minutes)."""
         return self.get("agent_time_windows.current_window_hours", 0.5)
-
-    @property
-    def agent_lookback_window_hours(self) -> float:
-        """Size of historical lookback window for Agent before current window starts (default 6 hours)."""
-        return self.get("agent_time_windows.lookback_window_hours", 6.0)
-
-    @property
-    def agent_future_window_hours(self) -> float:
-        """Size of future prediction window for Agent after current window ends (default 6 hours)."""
-        return self.get("agent_time_windows.future_window_hours", 6.0)
 
     @property
     def agent_window_step_hours(self) -> float:
@@ -163,47 +157,13 @@ class Config:
         """Number of most recent discharge summaries to extract for Agent (default 3)."""
         return self.get("agent_time_windows.num_discharge_summaries", 3)
 
-    @property
-    def agent_use_first_n_hours_after_icu(self) -> Optional[float]:
-        """Use only the first N hours after ICU entry for Agent (default None = use full duration)."""
-        return self.get("agent_time_windows.use_first_n_hours_after_icu", None)
-
-    # ========================================================================
-    # Legacy Time Window Configuration (for backward compatibility)
-    # ========================================================================
-
-    @property
-    def current_window_hours(self) -> float:
-        """Size of current observation window in hours (default 0.5 = 30 minutes). DEPRECATED: Use oracle_current_window_hours or agent_current_window_hours."""
-        return self.get("oracle_time_windows.current_window_hours", 0.5)
-
-    @property
-    def lookback_window_hours(self) -> float:
-        """Size of historical lookback window before current window starts (default 6 hours). DEPRECATED: Use oracle_lookback_window_hours or agent_lookback_window_hours."""
-        return self.get("oracle_time_windows.lookback_window_hours", 6.0)
-
-    @property
-    def future_window_hours(self) -> float:
-        """Size of future prediction window after current window ends (default 6 hours). DEPRECATED: Use oracle_future_window_hours or agent_future_window_hours."""
-        return self.get("oracle_time_windows.future_window_hours", 6.0)
-
-    @property
-    def window_step_hours(self) -> float:
-        """Step size between sliding windows in hours (default 0.5 = 30 minutes). DEPRECATED: Use oracle_window_step_hours or agent_window_step_hours."""
-        return self.get("oracle_time_windows.window_step_hours", 0.5)
-
-    @property
-    def include_pre_icu_data(self) -> bool:
-        """Whether to include pre-ICU hospital data in history context. DEPRECATED: Use oracle_include_pre_icu_data or agent_include_pre_icu_data."""
-        return self.get("oracle_time_windows.include_pre_icu_data", True)
-
     # ========================================================================
     # LLM Configuration
     # ========================================================================
 
     @property
     def llm_provider(self) -> str:
-        """LLM provider (e.g., 'openai', 'anthropic')."""
+        """LLM provider (e.g., 'openai', 'anthropic', 'google', 'gemini')."""
         return self.get("llm.provider")
 
     @property
@@ -226,37 +186,28 @@ class Config:
     # ========================================================================
 
     @property
-    def log_dir(self) -> str:
+    def oracle_log_dir(self) -> str:
         """Directory for Oracle logs."""
-        return self.get("logging.log_dir")
+        return self.get("oracle_logging.log_dir")
 
     @property
-    def save_trajectories(self) -> bool:
-        """Whether to save intermediate trajectory data."""
-        return self.get("logging.save_trajectories")
-
-    # ========================================================================
-    # Processing Configuration
-    # ========================================================================
+    def oracle_save_trajectories(self) -> bool:
+        """Whether to save intermediate trajectory data for Oracle."""
+        return self.get("oracle_logging.save_trajectories")
 
     @property
-    def max_patients(self) -> Optional[int]:
-        """Maximum number of patients to process."""
-        return self.get("processing.max_patients")
+    def agent_log_dir(self) -> str:
+        """Directory for Agent logs."""
+        return self.get("agent_logging.log_dir")
 
     @property
-    def include_window_data(self) -> bool:
-        """Whether to include full window data in reports."""
-        return self.get("processing.include_window_data")
+    def agent_save_trajectories(self) -> bool:
+        """Whether to save intermediate trajectory data for Agent."""
+        return self.get("agent_logging.save_trajectories")
 
     # ========================================================================
     # ReMeM Configuration
     # ========================================================================
-
-    @property
-    def remem_observation_hours(self) -> float:
-        """Number of hours to observe before making prediction (default 12)."""
-        return self.get("remem.observation_hours", 12.0)
 
     @property
     def remem_max_state_length(self) -> int:
@@ -273,11 +224,6 @@ class Config:
     # ========================================================================
 
     @property
-    def agent_fold_observation_hours(self) -> float:
-        """Number of hours to observe before making prediction (default 12)."""
-        return self.get("agent_fold.observation_hours", 12.0)
-
-    @property
     def agent_fold_enable_key_events_extraction(self) -> bool:
         """Whether to enable key events extraction (default True)."""
         return self.get("agent_fold.enable_key_events_extraction", True)
@@ -286,6 +232,55 @@ class Config:
     def agent_fold_max_trajectory_entries(self) -> int:
         """Maximum number of trajectory entries to maintain (default 20)."""
         return self.get("agent_fold.max_trajectory_entries", 20)
+
+    # ========================================================================
+    # AgentMulti Configuration
+    # ========================================================================
+
+    @property
+    def agent_multi_use_observer_agent(self) -> bool:
+        """Whether to enable observer agent in MultiAgent pipeline (default True)."""
+        return self.get("agent_multi.use_observer_agent", True)
+
+    @property
+    def agent_multi_use_memory_agent(self) -> bool:
+        """Whether to enable memory agent for trajectory management (default True)."""
+        return self.get("agent_multi.use_memory_agent", True)
+
+    @property
+    def agent_multi_use_reflection_agent(self) -> bool:
+        """Whether to enable reflection agent for trajectory quality review (default False)."""
+        return self.get("agent_multi.use_reflection_agent", False)
+
+    @property
+    def agent_multi_observer_use_thinking(self) -> bool:
+        """Whether observer agent uses explicit chain of thought (default True)."""
+        return self.get("agent_multi.observer_use_thinking", True)
+
+    @property
+    def agent_multi_memory_use_thinking(self) -> bool:
+        """Whether memory agent uses explicit chain of thought (default True)."""
+        return self.get("agent_multi.memory_use_thinking", True)
+
+    @property
+    def agent_multi_reflection_use_thinking(self) -> bool:
+        """Whether reflection agent uses explicit chain of thought (default True)."""
+        return self.get("agent_multi.reflection_use_thinking", True)
+
+    @property
+    def agent_multi_predictor_use_thinking(self) -> bool:
+        """Whether predictor agent uses explicit chain of thought (default True)."""
+        return self.get("agent_multi.predictor_use_thinking", True)
+
+    @property
+    def agent_multi_observer_cache_enabled(self) -> bool:
+        """Whether observer-output cache is enabled for MultiAgent ablation runs."""
+        return self.get("agent_multi.observer_cache.enabled", True)
+
+    @property
+    def agent_multi_observer_cache_dir(self) -> str:
+        """Directory for observer-output cache files."""
+        return self.get("agent_multi.observer_cache.cache_dir", "experiment_results/observer_cache")
 
     # ========================================================================
     # Utility Methods

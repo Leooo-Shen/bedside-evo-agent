@@ -23,8 +23,6 @@ def process_batch_for_oracle(
     provider: str = "anthropic",
     model: str = None,
     current_window_hours: float = 0.5,
-    lookback_window_hours: float = 6.0,
-    future_window_hours: float = 6.0,
     window_step_hours: float = 0.5,
     include_pre_icu_data: bool = True,
     max_patients: int = None,
@@ -37,11 +35,9 @@ def process_batch_for_oracle(
         events_path: Path to events parquet file
         icu_stay_path: Path to ICU stay parquet file
         output_dir: Directory to save outputs
-        provider: LLM provider ("anthropic" or "openai")
+        provider: LLM provider ("anthropic", "openai", "google", or "gemini")
         model: Model name (optional)
         current_window_hours: Size of current observation window (default 0.5 = 30 minutes)
-        lookback_window_hours: Size of historical lookback before current starts (default 6 hours)
-        future_window_hours: Size of future prediction window after current ends (default 6 hours)
         window_step_hours: Step size between sliding windows (default 0.5 = 30 minutes)
         include_pre_icu_data: Whether to include pre-ICU hospital data (default True)
         max_patients: Maximum number of patients to process (None = all)
@@ -64,8 +60,6 @@ def process_batch_for_oracle(
     print(f"  Provider: {provider}")
     print(f"  Model: {model or 'default'}")
     print(f"  Current window: {current_window_hours} hours ({current_window_hours * 60:.0f} minutes)")
-    print(f"  Lookback window: {lookback_window_hours} hours")
-    print(f"  Future window: {future_window_hours} hours")
     print(f"  Window step size: {window_step_hours} hours ({window_step_hours * 60:.0f} minutes)")
     print(f"  Include pre-ICU data: {include_pre_icu_data}")
 
@@ -118,12 +112,9 @@ def process_batch_for_oracle(
             windows = parser.create_time_windows(
                 trajectory,
                 current_window_hours=current_window_hours,
-                lookback_window_hours=lookback_window_hours,
-                future_window_hours=future_window_hours,
                 window_step_hours=window_step_hours,
                 include_pre_icu_data=include_pre_icu_data,
-                use_first_n_hours_after_icu=config.oracle_use_first_n_hours_after_icu,
-                remove_discharge_summary=True,  # Remove discharge summary from windows
+                use_first_n_hours_after_icu=config.oracle_observation_hours,
                 use_discharge_summary_for_history=config.oracle_use_discharge_summary_for_history,
                 num_discharge_summaries=config.oracle_num_discharge_summaries
             )
@@ -240,7 +231,7 @@ def main():
         "--provider",
         type=str,
         default=config.llm_provider,
-        choices=["anthropic", "openai"],
+        choices=["anthropic", "openai", "google", "gemini"],
         help=f"LLM provider (default: {config.llm_provider})"
     )
 
@@ -256,20 +247,6 @@ def main():
         type=float,
         default=config.oracle_current_window_hours,
         help=f"Size of current observation window in hours (default: {config.oracle_current_window_hours})"
-    )
-
-    parser.add_argument(
-        "--lookback-window-hours",
-        type=float,
-        default=config.oracle_lookback_window_hours,
-        help=f"Size of historical lookback before current starts in hours (default: {config.oracle_lookback_window_hours})"
-    )
-
-    parser.add_argument(
-        "--future-window-hours",
-        type=float,
-        default=config.oracle_future_window_hours,
-        help=f"Size of future prediction after current ends in hours (default: {config.oracle_future_window_hours})"
     )
 
     parser.add_argument(
@@ -320,8 +297,6 @@ def main():
         provider=args.provider,
         model=args.model,
         current_window_hours=args.current_window_hours,
-        lookback_window_hours=args.lookback_window_hours,
-        future_window_hours=args.future_window_hours,
         window_step_hours=args.window_step_hours,
         include_pre_icu_data=not args.no_pre_icu_data,
         max_patients=args.max_patients,

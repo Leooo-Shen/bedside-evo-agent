@@ -1,5 +1,7 @@
 """Prompt templates for AgentFold with dynamic trajectory folding."""
 
+from prompts.shared_prompts import get_prediction_prompt
+
 
 def get_window_update_prompt() -> str:
     return """You are a Senior ICU Clinical Decision Support Agent specializing in hierarchical memory management. 
@@ -90,39 +92,4 @@ Analyze the latest patient data and provide your update."""
 
 
 def get_survival_prediction_prompt() -> str:
-    return """You are an ICU clinical decision support system predicting patient survival after ICU discharge.
-
-## Clinical Contexts (First 12 Hours After ICU Admission)
-Below are all clinical contexts from the first 12 hours after ICU admission:
-
-{context}
-
-## Your Task
-Based on the patient context from the first 12 hours after ICU admission, predict whether this patient will SURVIVE or DIE after ICU discharge.
-
-Provide your response in the following JSON format:
-{{
-  "survival_prediction": {{
-    "outcome": "survive/die",
-    "confidence": <float from 0.0 to 1.0>,
-    "rationale": "Detailed clinical reasoning for your prediction"
-  }},
-  "patient_assessment": {{
-    "severity_score": <float from -1.0 to 1.0>,
-    "trajectory": "improving/stable/deteriorating",
-    "key_factors": "Main clinical factors affecting survival"
-  }},
-  "risk_factors": [
-    {{
-      "factor": "Specific risk factor",
-      "impact": "high/medium/low",
-      "description": "How this affects survival"
-    }}
-  ]
-}}
-
-Note:
-- Severity score: -1.0 = critically ill, 0.0 = stable, 1.0 = improving
-- Base your prediction on clinical patterns and vital trends
-- Be honest about uncertainty - low confidence is acceptable
-"""
+    return get_prediction_prompt()

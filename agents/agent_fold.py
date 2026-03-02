@@ -90,6 +90,15 @@ class WorkingContext:
     historical_key_events: List[str] = field(default_factory=list)  # Append-only
     trajectory: List[TrajectoryEntry] = field(default_factory=list)  # Dynamically folded
     active_concerns: List[ClinicalConcern] = field(default_factory=list)  # Dynamically updated
+    clinical_history: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            "overall_status": [],
+            "hemodynamics": [],
+            "respiratory": [],
+            "renal_metabolic": [],
+            "neurology": [],
+        }
+    )  # Track clinical assessment trajectory
 
     def add_key_event(self, event: str) -> None:
         """Add a key event (append-only)."""
@@ -124,35 +133,77 @@ class WorkingContext:
         """Get only active concerns."""
         return [c for c in self.active_concerns if c.status == "Active"]
 
-    def to_text(self, current_events: List[Dict] = None, current_window_info: str = "") -> str:
-        """Convert to text format for LLM prompt."""
+    def add_clinical_assessment(self, clinical_assessment: Dict) -> None:
+        """Add clinical assessment status to history."""
+        # Extract overall status
+        overall_status = clinical_assessment.get("overall_status", "").lower()
+        if overall_status:
+            self.clinical_history["overall_status"].append(overall_status)
+
+        # Extract physiology trends statuses
+        physiology = clinical_assessment.get("physiology_trends", {})
+        for domain in ["hemodynamics", "respiratory", "renal_metabolic", "neurology"]:
+            if isinstance(physiology.get(domain), dict):
+                status = physiology[domain].get("status", "").lower()
+            else:
+                # Fallback for old format (string instead of dict)
+                status = ""
+            if status:
+                self.clinical_history[domain].append(status)
+
+    def to_text(
+        self,
+        current_events: List[Dict] = None,
+        current_window_info: str = "",
+        sections: Dict[str, bool] = None
+    ) -> str:
+        """Convert to text format for LLM prompt.
+
+        Args:
+            current_events: Optional list of current events to include
+            current_window_info: Optional window info string
+            sections: Dict controlling which sections to include. Defaults to all True.
+                Keys: patient_metadata, historical_key_events, trajectory,
+                      clinical_concerns, clinical_trajectory, current_events
+        """
+        if sections is None:
+            sections = {
+                "patient_metadata": True,
+                "historical_key_events": True,
+                "trajectory": True,
+                "clinical_concerns": True,
+                "clinical_trajectory": True,
+                "current_events": True,
+            }
+
         parts = []
 
         # Patient metadata - filter out IDs, format age to 1 decimal place
-        parts.append("## Patient Metadata [Static]")
-        if self.patient_metadata:
-            for key, value in self.patient_metadata.items():
-                # Skip IDs
-                if key in ["subject_id", "icu_stay_id"]:
-                    continue
-                # Format age to 1 decimal place
-                if key == "age" and value is not None:
-                    parts.append(f"{key}: {float(value):.1f}")
-                # Include gender and other fields
-                elif value is not None:
-                    parts.append(f"{key}: {value}")
-        parts.append("")
+        if sections.get("patient_metadata", True):
+            parts.append("## Patient Metadata")
+            if self.patient_metadata:
+                for key, value in self.patient_metadata.items():
+                    # Skip IDs
+                    if key in ["subject_id", "icu_stay_id"]:
+                        continue
+                    # Format age to 1 decimal place
+                    if key == "age" and value is not None:
+                        parts.append(f"{key}: {float(value):.1f}")
+                    # Include gender and other fields
+                    elif value is not None:
+                        parts.append(f"{key}: {value}")
+            parts.append("")
 
         # Historical key events
-        if self.historical_key_events:
+        if sections.get("historical_key_events", True) and self.historical_key_events:
             parts.append("## Historical Key Events")
             for event in self.historical_key_events:
                 parts.append(f"- {event}")
             parts.append("")
 
         # Previous trajectory
-        if self.trajectory:
-            parts.append("## Previous Trajectory")
+        if sections.get("trajectory", True) and self.trajectory:
+            parts.append("## Patient Trajectory")
             for traj in self.trajectory:
                 # Format index based on window range
                 if traj.start_window == traj.end_window:
@@ -163,15 +214,37 @@ class WorkingContext:
             parts.append("")
 
         # Active concerns
-        active = self.get_active_concerns()
-        if active:
-            parts.append("## Open Clinical Concerns")
-            for concern in active:
-                parts.append(f"- {concern.note}")
-            parts.append("")
+        if sections.get("clinical_concerns", True):
+            active = self.get_active_concerns()
+            if active:
+                parts.append("## Open Clinical Concerns")
+                for concern in active:
+                    parts.append(f"- {concern.note}")
+                parts.append("")
+
+        # Clinical trajectory (status history across windows)
+        if sections.get("clinical_trajectory", True) and any(self.clinical_history.values()):
+            parts.append("## Status Trajectory")
+            num_windows = len(self.clinical_history["overall_status"])
+            if num_windows > 0:
+                parts.append(f"({num_windows} windows)")
+
+                # Overall status
+                if self.clinical_history["overall_status"]:
+                    status_str = ", ".join(self.clinical_history["overall_status"])
+                    parts.append(f"Overall Status: [{status_str}]")
+
+                # Physiology domains
+                for domain in ["hemodynamics", "respiratory", "renal_metabolic", "neurology"]:
+                    if self.clinical_history[domain]:
+                        status_str = ", ".join(self.clinical_history[domain])
+                        domain_label = domain.replace("_", "/").title()
+                        parts.append(f"{domain_label}: [{status_str}]")
+
+                parts.append("")
 
         # Current events
-        if current_events:
+        if sections.get("current_events", True) and current_events:
             parts.append(f"## Current Events {current_window_info}")
             # Format events
             for event in current_events:  # Limit to avoid overflow
@@ -245,7 +318,7 @@ class FoldAgent:
         Initialize FoldAgent.
 
         Args:
-            provider: LLM provider ("openai" or "anthropic")
+            provider: LLM provider ("openai", "anthropic", "google", or "gemini")
             model: Model name
             api_key: API key
             temperature: Sampling temperature
@@ -655,6 +728,16 @@ class FoldAgent:
             self.total_tokens_used += input_tokens + output_tokens
 
         content = response.get("content", "")
+        log_metadata = dict(metadata or {})
+        log_metadata.update(
+            {
+                "step_type": step_type,
+                "llm_provider": self.llm_client.provider,
+                "llm_model": self.llm_client.model,
+            }
+        )
+        if response.get("model"):
+            log_metadata["llm_response_model"] = response.get("model")
 
         # Log the call if logging is enabled
         if self.enable_logging:
@@ -668,7 +751,7 @@ class FoldAgent:
                 parsed_response=None,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                metadata=metadata or {},
+                metadata=log_metadata,
             )
             self.call_logs.append(log_entry)
 

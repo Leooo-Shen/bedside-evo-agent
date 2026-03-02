@@ -27,49 +27,12 @@ from datetime import datetime
 
 import pandas as pd
 
+from prompts.shared_prompts import get_prediction_prompt
+
 from config.config import get_config
 from data_parser import MIMICDataParser
 from model.llms import LLMClient
-
-SEED = 1
-
-
-def select_balanced_patients(icu_stay_df: pd.DataFrame, n_survived: int = 5, n_died: int = 5) -> pd.DataFrame:
-    """
-    Select balanced set of patients (equal numbers who survived and died).
-
-    Args:
-        icu_stay_df: DataFrame with ICU stay data
-        n_survived: Number of patients who survived to select
-        n_died: Number of patients who died to select
-
-    Returns:
-        DataFrame with balanced patient selection
-    """
-    # Separate patients by outcome
-    survived_patients = icu_stay_df[icu_stay_df["survived"] == True]
-    died_patients = icu_stay_df[icu_stay_df["survived"] == False]
-
-    # Get actual available counts
-    n_survived_available = len(survived_patients)
-    n_died_available = len(died_patients)
-
-    # Adjust requested numbers if they exceed available
-    n_survived_actual = min(n_survived, n_survived_available)
-    n_died_actual = min(n_died, n_died_available)
-
-    print(f"   Requested: {n_survived} survived, {n_died} died")
-    print(f"   Available: {n_survived_available} survived, {n_died_available} died")
-    print(f"   Selected: {n_survived_actual} survived, {n_died_actual} died")
-
-    # Sample patients
-    selected_survived = survived_patients.sample(n=n_survived_actual, random_state=SEED)
-    selected_died = died_patients.sample(n=n_died_actual, random_state=SEED)
-
-    # Combine and shuffle
-    balanced_df = pd.concat([selected_survived, selected_died]).sample(frac=1, random_state=SEED)
-
-    return balanced_df
+from utils.patient_selection import select_balanced_patients
 
 
 def format_events_for_baseline(events: List[Dict], max_events: Optional[int] = None) -> str:
@@ -143,45 +106,9 @@ def create_baseline_prompt(
     events_str = format_events_for_baseline(all_events, max_events=max_events)
 
     if task == "survival":
-        prompt = f"""You are an ICU clinical decision support system predicting patient survival after ICU discharge.
-
-## Patient Information
-- Age: {age_str} years
-
-## Clinical Events (First 12 Hours After ICU Admission)
-Below are all clinical events from the first 12 hours after ICU admission:
-
-{events_str}
-
-## Your Task
-Based on the patient trajectory from the first 12 hours after ICU admission, predict whether this patient will SURVIVE or DIE after ICU discharge.
-
-Provide your response in the following JSON format:
-{{
-  "prediction": {{
-    "outcome": "survive/die",
-    "confidence": <float from 0.0 to 1.0>,
-    "rationale": "Detailed clinical reasoning for your prediction"
-  }},
-  "patient_assessment": {{
-    "severity_score": <float from -1.0 to 1.0>,
-    "trajectory": "improving/stable/deteriorating",
-    "key_factors": "Main clinical factors affecting survival"
-  }},
-  "risk_factors": [
-    {{
-      "factor": "Specific risk factor",
-      "impact": "high/medium/low",
-      "description": "How this affects survival"
-    }}
-  ]
-}}
-
-Note:
-- Severity score: -1.0 = critically ill, 0.0 = stable, 1.0 = improving
-- Base your prediction on clinical patterns and vital trends
-- Be honest about uncertainty - low confidence is acceptable
-"""
+        # Build context string with patient info and events
+        context = f"## Patient Information\n- Age: {age_str} years\n\n## Clinical Events (First 12 Hours After ICU Admission)\n{events_str}"
+        prompt = get_prediction_prompt().format(context=context)
 
     return prompt
 
@@ -210,7 +137,13 @@ def make_baseline_prediction(
     prompt = create_baseline_prompt(trajectory, all_events, task=task)
 
     # Get prediction from LLM
-    response = llm_client.chat(prompt=prompt, response_format="json")
+    llm_call_error = None
+    try:
+        response = llm_client.chat(prompt=prompt, response_format="json")
+    except Exception as e:
+        # Preserve failed calls as explicit wrong predictions instead of dropping them.
+        llm_call_error = str(e)
+        response = {"content": "", "usage": {}}
 
     # Log prompt and response if log_dir is provided
     if log_dir is not None:
@@ -222,9 +155,13 @@ def make_baseline_prediction(
             "subject_id": subject_id,
             "icu_stay_id": icu_stay_id,
             "task": task,
+            "llm_provider": getattr(llm_client, "provider", None),
+            "llm_model": getattr(llm_client, "model", None),
             "prompt": prompt,
             "response": response.get("content", ""),
             "usage": response.get("usage", {}),
+            "llm_call_failed": llm_call_error is not None,
+            "llm_call_error": llm_call_error,
         }
 
         log_file = log_dir / f"baseline_prediction_{subject_id}_{icu_stay_id}.json"
@@ -232,13 +169,43 @@ def make_baseline_prediction(
             json.dump(log_data, f, indent=2)
 
     # Parse response
-    try:
-        prediction = json.loads(response["content"])
-    except json.JSONDecodeError:
-        # Fallback if JSON parsing fails
+    if llm_call_error is not None:
         prediction = {
-            "prediction": {"outcome": "unknown", "confidence": 0.0, "rationale": "Failed to parse prediction"}
+            "survival_prediction": {
+                "outcome": "unknown",
+                "confidence": 0.0,
+                "rationale": f"LLM call failed: {llm_call_error}",
+            }
         }
+    else:
+        try:
+            content = response["content"]
+            # Extract from <response> tags if present
+            import re
+
+            resp_match = re.search(r"<response>(.*?)</response>", content, re.DOTALL | re.IGNORECASE)
+            if resp_match:
+                content = resp_match.group(1).strip()
+            prediction = json.loads(content)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            # Fallback if JSON parsing fails
+            prediction = {
+                "survival_prediction": {
+                    "outcome": "unknown",
+                    "confidence": 0.0,
+                    "rationale": "Failed to parse prediction",
+                }
+            }
+
+    if llm_call_error is not None:
+        prediction["llm_call_failed"] = True
+        prediction["llm_call_error"] = llm_call_error
+    else:
+        prediction["llm_call_failed"] = False
+        prediction["llm_call_error"] = None
+
+    if llm_call_error is not None:
+        print(f"   WARNING: LLM call failed and will be counted as incorrect: {llm_call_error}")
 
     # Add metadata
     prediction["task"] = task
@@ -301,17 +268,14 @@ def process_single_patient_baseline(
         # Use create_time_windows to get properly filtered events (removes discharge summaries)
         # This ensures we use the same data processing pipeline as survival_prediction_experiment
 
-        # Only use the first 12 hours after entering the ICU
+        # Use the same time-window configuration as survival_experiment.py
+        observation_hours = config.agent_observation_hours
         windows = parser.create_time_windows(
             trajectory,
-            current_window_hours=1,
-            lookback_window_hours=0,
-            future_window_hours=0,
-            window_step_hours=1,
-            include_pre_icu_data=False,
-            use_first_n_hours_after_icu=12,
-            use_discharge_summary_for_history=False,  # Don't use discharge summary for baseline
-            num_discharge_summaries=0,  # Not needed for baseline
+            current_window_hours=config.agent_current_window_hours,
+            window_step_hours=config.agent_window_step_hours,
+            include_pre_icu_data=config.agent_include_pre_icu_data,
+            use_first_n_hours_after_icu=observation_hours,
         )
 
         if len(windows) < 1:
@@ -327,7 +291,8 @@ def process_single_patient_baseline(
                 all_events.append(event)
 
         print(
-            f"   Events after filtering: {len(all_trajectory_events)} → {len(all_events)} (First 12 hour ICU events)"
+            f"   Events after filtering: {len(all_trajectory_events)} → {len(all_events)} "
+            f"(First {observation_hours:.1f} hour ICU events)"
         )
 
         if len(all_events) == 0:
@@ -341,8 +306,8 @@ def process_single_patient_baseline(
         prediction = make_baseline_prediction(llm_client, trajectory, all_events, task=task, log_dir=log_dir)
 
         # Extract predicted outcome
-        predicted_outcome = prediction.get("prediction", {}).get("outcome", "unknown")
-        confidence = prediction.get("prediction", {}).get("confidence", 0.0)
+        predicted_outcome = prediction.get("survival_prediction", {}).get("outcome", "unknown")
+        confidence = prediction.get("survival_prediction", {}).get("confidence", 0.0)
         is_correct = predicted_outcome == actual_outcome
 
         # Print summary
@@ -376,6 +341,8 @@ def process_single_patient_baseline(
             "predicted_outcome": predicted_outcome,
             "is_correct": is_correct,
             "confidence": confidence,
+            "llm_call_failed": prediction.get("llm_call_failed", False),
+            "llm_call_error": prediction.get("llm_call_error"),
             "num_events_used": len(all_events),
             "icu_duration_hours": icu_duration_hours,
             "cutoff_time": str(cutoff_time),
@@ -400,14 +367,20 @@ def process_single_patient_baseline(
         return None
 
 
-def main(max_workers: int, task: str = "survival", patient_ids: Optional[List[int]] = None):
+def main(
+    max_workers: int,
+    task: str = "survival",
+    n_survived: int = 10,
+    n_died: int = 10,
+):
     """
     Run baseline prediction experiment on multiple balanced patients.
 
     Args:
         max_workers: Maximum number of parallel workers (default 4)
         task: Prediction task (default "survival")
-        patient_ids: Optional list of specific patient IDs to process (default None)
+        n_survived: Number of survived patients for balanced selection
+        n_died: Number of died patients for balanced selection
     """
     # Load configuration
     config = get_config()
@@ -428,27 +401,18 @@ def main(max_workers: int, task: str = "survival", patient_ids: Optional[List[in
     parser = MIMICDataParser(
         events_path=config.events_path,
         icu_stay_path=config.icu_stay_path,
-        de_identify=config.get("data.de_identify", False),
-        de_identify_seed=config.get("data.de_identify_seed", None),
     )
     parser.load_data()
     print(f"   Loaded {len(parser.icu_stay_df)} ICU stays")
 
-    # Select patients based on whether specific IDs were provided
+    # Select balanced patient cohort
     print("\n2. Selecting patient cohort...")
-    if patient_ids is not None and len(patient_ids) > 0:
-        # Filter to specific patient IDs (all ICU stays for these patients)
-        selected_patients = parser.icu_stay_df[parser.icu_stay_df["subject_id"].isin(patient_ids)].copy()
-        print(f"   Filtering to specific patient IDs: {patient_ids}")
-        print(f"   Found {len(selected_patients)} ICU stay(s) for these patient(s)")
-        if len(selected_patients) == 0:
-            print(f"   WARNING: No ICU stays found for the specified patient IDs!")
-            return
-    else:
-        # Use balanced selection
-        n_per_class = 10  # Number of patients per class (survived/died)
-        selected_patients = select_balanced_patients(parser.icu_stay_df, n_survived=n_per_class, n_died=n_per_class)
-        print(f"   Total patients selected: {len(selected_patients)}")
+    selected_patients = select_balanced_patients(
+        parser.icu_stay_df,
+        n_survived=n_survived,
+        n_died=n_died,
+    )
+    print(f"   Total patients selected: {len(selected_patients)}")
 
     # Run experiments in parallel
     print(f"\n3. Running baseline experiments (up to {max_workers} in parallel)...")
@@ -566,14 +530,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Baseline Prediction Experiment")
     parser.add_argument("--max-workers", type=int, default=4, help="Maximum number of parallel workers")
     parser.add_argument("--task", type=str, default="survival", help="Prediction task (default: survival)")
-    parser.add_argument(
-        "--patient-ids",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Specific patient IDs to process (e.g., --patient-ids 19904685 12345678)",
-    )
+    parser.add_argument("--n-survived", type=int, default=10, help="Number of survived patients")
+    parser.add_argument("--n-died", type=int, default=10, help="Number of died patients")
 
     args = parser.parse_args()
 
-    main(max_workers=args.max_workers, task=args.task, patient_ids=args.patient_ids)
+    main(
+        max_workers=args.max_workers,
+        task=args.task,
+        n_survived=args.n_survived,
+        n_died=args.n_died,
+    )
