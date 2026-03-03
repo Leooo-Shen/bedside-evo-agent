@@ -32,6 +32,7 @@ from prompts.shared_prompts import get_prediction_prompt
 from config.config import get_config
 from data_parser import MIMICDataParser
 from model.llms import LLMClient
+from utils.outcome_utils import evaluate_outcome_match
 from utils.patient_selection import select_balanced_patients
 
 
@@ -308,7 +309,10 @@ def process_single_patient_baseline(
         # Extract predicted outcome
         predicted_outcome = prediction.get("survival_prediction", {}).get("outcome", "unknown")
         confidence = prediction.get("survival_prediction", {}).get("confidence", 0.0)
-        is_correct = predicted_outcome == actual_outcome
+        is_correct, normalized_predicted_outcome, normalized_actual_outcome = evaluate_outcome_match(
+            predicted=predicted_outcome,
+            actual=actual_outcome,
+        )
 
         # Print summary
         print(f"   Predicted: {predicted_outcome.upper()} (confidence: {confidence:.2f})")
@@ -339,6 +343,8 @@ def process_single_patient_baseline(
             "icu_stay_id": icu_stay_id,
             "actual_outcome": actual_outcome,
             "predicted_outcome": predicted_outcome,
+            "actual_outcome_normalized": normalized_actual_outcome,
+            "predicted_outcome_normalized": normalized_predicted_outcome,
             "is_correct": is_correct,
             "confidence": confidence,
             "llm_call_failed": prediction.get("llm_call_failed", False),

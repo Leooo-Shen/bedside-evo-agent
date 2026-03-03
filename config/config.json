@@ -40,8 +40,8 @@
     "max_trajectory_entries": 20
   },
   "agent_multi": {
-    "use_observer_agent": true,
-    "use_memory_agent": false,
+    "use_observer_agent": false,
+    "use_memory_agent": true,
     "use_reflection_agent": false,
     "observer_use_thinking": false,
     "memory_use_thinking": false,

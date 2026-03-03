@@ -7,7 +7,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from agents.agent_multi import MultiAgent, _normalize_token_count
+from agents.agent_fold_multi import MultiAgent, _normalize_token_count
 
 
 def test_normalize_token_count_handles_none_and_strings():

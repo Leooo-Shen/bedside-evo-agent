@@ -35,7 +35,7 @@ Below are all clinical contexts from the first {obs_hours} hours after ICU admis
 {{context}}
 
 ## Your Task
-Based on the patient context from the first {obs_hours} hours after ICU admission, predict whether this patient will SURVIVE or DIE after ICU discharge.
+Based on the patient context from the first {obs_hours} hours after ICU admission, predict whether this patient will survive or die after ICU discharge.
 
 {thinking_section}<response>
 {{{{

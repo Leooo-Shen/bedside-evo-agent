@@ -7,7 +7,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from agents.agent_multi import _parse_json_response
+from agents.agent_fold_multi import _parse_json_response
 
 
 def test_parse_multiple_response_blocks():

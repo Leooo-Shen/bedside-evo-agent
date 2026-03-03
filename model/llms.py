@@ -1,6 +1,7 @@
 # basic calling for llms, for example with openai api
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -42,6 +43,9 @@ class LLMClient:
         api_key: str = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        max_retries: int = 3,
+        retry_base_delay_seconds: float = 1.0,
+        retry_max_delay_seconds: float = 30.0,
     ):
         """
         Initialize LLM client.
@@ -52,10 +56,16 @@ class LLMClient:
             api_key: API key (if None, will use environment variable)
             temperature: Sampling temperature
             max_tokens: Maximum tokens in response
+            max_retries: Maximum number of retries for transient API errors
+            retry_base_delay_seconds: Base backoff delay in seconds
+            retry_max_delay_seconds: Maximum backoff delay in seconds
         """
         self.provider = provider.lower()
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.max_retries = max_retries
+        self.retry_base_delay_seconds = retry_base_delay_seconds
+        self.retry_max_delay_seconds = retry_max_delay_seconds
 
         if self.provider == "anthropic":
             self.model = model or "claude-3-5-sonnet-20241022"
@@ -107,12 +117,104 @@ class LLMClient:
         Returns:
             Dictionary with 'content' and optionally 'parsed' (for JSON responses)
         """
-        if self.provider == "anthropic":
-            return self._chat_anthropic(prompt, system_prompt, response_format, **kwargs)
-        elif self.provider == "openai":
-            return self._chat_openai(prompt, system_prompt, response_format, **kwargs)
-        elif self.provider in {"google", "gemini"}:
-            return self._chat_gemini(prompt, system_prompt, response_format, **kwargs)
+        def _single_attempt() -> Dict[str, Any]:
+            if self.provider == "anthropic":
+                return self._chat_anthropic(prompt, system_prompt, response_format, **kwargs)
+            if self.provider == "openai":
+                return self._chat_openai(prompt, system_prompt, response_format, **kwargs)
+            if self.provider in {"google", "gemini"}:
+                return self._chat_gemini(prompt, system_prompt, response_format, **kwargs)
+            raise ValueError(f"Unsupported provider: {self.provider}")
+
+        return self._chat_with_retries(_single_attempt)
+
+    def _chat_with_retries(self, chat_call) -> Dict[str, Any]:
+        """Retry transient provider failures with exponential backoff."""
+        for attempt in range(self.max_retries + 1):
+            try:
+                return chat_call()
+            except Exception as e:
+                if attempt >= self.max_retries or not self._is_retryable_error(e):
+                    raise
+                delay_seconds = self._compute_retry_delay_seconds(e, attempt)
+                print(
+                    f"[LLMClient] transient API error from {self.provider} "
+                    f"(attempt {attempt + 1}/{self.max_retries + 1}), retrying in {delay_seconds:.1f}s: {e}"
+                )
+                time.sleep(delay_seconds)
+
+        # Unreachable because loop either returns or raises.
+        raise RuntimeError("LLM retry loop terminated unexpectedly.")
+
+    def _is_retryable_error(self, error: Exception) -> bool:
+        """Detect provider errors that should be retried."""
+        status_code = self._extract_status_code(error)
+        if status_code in {408, 409, 429, 500, 502, 503, 504}:
+            return True
+
+        message = str(error).lower()
+        retry_markers = (
+            "rate limit",
+            "too many requests",
+            "resource_exhausted",
+            "high demand",
+            "please try again later",
+            "temporarily unavailable",
+            "service unavailable",
+            "status': 'unavailable'",
+            '"status": "unavailable"',
+        )
+        return any(marker in message for marker in retry_markers)
+
+    def _extract_status_code(self, error: Exception) -> Optional[int]:
+        """Extract HTTP status code from SDK exceptions when available."""
+        status_code = getattr(error, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+
+        response = getattr(error, "response", None)
+        if response is not None:
+            response_status = getattr(response, "status_code", None)
+            if isinstance(response_status, int):
+                return response_status
+
+        return None
+
+    def _extract_retry_after_seconds(self, error: Exception) -> Optional[float]:
+        """Extract Retry-After hints from exception response headers when available."""
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return None
+
+        retry_after_ms = headers.get("retry-after-ms")
+        if retry_after_ms is not None:
+            try:
+                parsed = float(retry_after_ms) / 1000.0
+                if parsed > 0:
+                    return parsed
+            except (TypeError, ValueError):
+                pass
+
+        retry_after = headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                parsed = float(retry_after)
+                if parsed > 0:
+                    return parsed
+            except (TypeError, ValueError):
+                pass
+
+        return None
+
+    def _compute_retry_delay_seconds(self, error: Exception, attempt: int) -> float:
+        """Use Retry-After when present, otherwise exponential backoff."""
+        retry_after_seconds = self._extract_retry_after_seconds(error)
+        if retry_after_seconds is not None:
+            return min(retry_after_seconds, self.retry_max_delay_seconds)
+
+        delay = self.retry_base_delay_seconds * (2**attempt)
+        return min(delay, self.retry_max_delay_seconds)
 
     def _chat_anthropic(
         self, prompt: str, system_prompt: Optional[str], response_format: str, **kwargs

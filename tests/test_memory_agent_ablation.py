@@ -7,8 +7,8 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from agents.agent_multi import MultiAgent
 from agents.agent_fold import WorkingContext
+from agents.agent_fold_multi import MultiAgent
 
 
 def test_memory_agent_disabled():

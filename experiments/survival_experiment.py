@@ -6,11 +6,11 @@ This script runs the Evo-ICU experiment using different agent approaches:
 2. AgentFold: Hierarchical Memory with Dynamic Trajectory Folding
 """
 
+import hashlib
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,11 +21,12 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from agents.agent_fold import FoldAgent
-from agents.agent_multi import MultiAgent
+from agents.agent_fold_multi import MultiAgent
 from agents.remem import PatientState, RememAgent
 from config.config import get_config
 from data_parser import MIMICDataParser
 from utils.llm_log_viewer import build_pipeline_agents, save_llm_calls_html
+from utils.outcome_utils import evaluate_outcome_match
 from utils.patient_selection import select_balanced_patients
 
 OBSERVER_CACHE_VERSION = 1
@@ -370,7 +371,10 @@ def process_single_patient(
         # Evaluate prediction
         predicted_outcome = prediction.get("survival_prediction", {}).get("outcome", "unknown")
         confidence = prediction.get("survival_prediction", {}).get("confidence", 0.0)
-        is_correct = predicted_outcome == actual_outcome
+        is_correct, normalized_predicted_outcome, normalized_actual_outcome = evaluate_outcome_match(
+            predicted=predicted_outcome,
+            actual=actual_outcome,
+        )
 
         if verbose:
             print(f"   Predicted: {predicted_outcome.upper()} (confidence: {confidence:.2f})")
@@ -386,6 +390,8 @@ def process_single_patient(
             "icu_stay_id": icu_stay_id,
             "actual_outcome": actual_outcome,
             "predicted_outcome": predicted_outcome,
+            "actual_outcome_normalized": normalized_actual_outcome,
+            "predicted_outcome_normalized": normalized_predicted_outcome,
             "is_correct": is_correct,
             "confidence": confidence,
             "num_windows": len(windows),

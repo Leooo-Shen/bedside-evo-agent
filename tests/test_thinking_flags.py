@@ -133,7 +133,7 @@ def test_predictor_thinking():
 
 def test_multi_agent_initialization():
     """Test MultiAgent initialization with thinking flags."""
-    from agents.agent_multi import MultiAgent
+    from agents.agent_fold_multi import MultiAgent
 
     # Test with thinking disabled
     agent = MultiAgent(
@@ -155,7 +155,7 @@ def test_multi_agent_initialization():
 
 def test_multi_agent_log_stores_parsed_response():
     """Test _log_call stores parsed_response."""
-    from agents.agent_multi import MultiAgent
+    from agents.agent_fold_multi import MultiAgent
 
     agent = MultiAgent(
         provider="openai",

@@ -1,7 +1,9 @@
 """Test script for Reflection Agent functionality."""
 
 import json
-from agents.agent_multi import MultiAgent
+
+from agents.agent_fold_multi import MultiAgent
+
 
 def test_reflection_agent_initialization():
     """Test that reflection agent can be initialized."""
@@ -11,7 +13,7 @@ def test_reflection_agent_initialization():
         model="gpt-4",
         use_reflection_agent=False,
     )
-    assert not hasattr(agent_no_reflection, 'reflection_agent') or not agent_no_reflection.use_reflection_agent
+    assert not hasattr(agent_no_reflection, "reflection_agent") or not agent_no_reflection.use_reflection_agent
     print("✓ MultiAgent without reflection agent initialized")
 
     # With reflection agent
@@ -21,8 +23,9 @@ def test_reflection_agent_initialization():
         use_reflection_agent=True,
     )
     assert agent_with_reflection.use_reflection_agent
-    assert hasattr(agent_with_reflection, 'reflection_agent')
+    assert hasattr(agent_with_reflection, "reflection_agent")
     print("✓ MultiAgent with reflection agent initialized")
+
 
 def test_statistics_tracking():
     """Test that reflection statistics are tracked."""
@@ -39,6 +42,7 @@ def test_statistics_tracking():
     assert stats["total_revisions"] == 0
     print("✓ Reflection statistics tracked correctly")
 
+
 def test_prompt_structure():
     """Test that reflection agent prompt is properly formatted."""
     from prompts.agent_multi_prompts import get_reflection_agent_prompt
@@ -53,6 +57,7 @@ def test_prompt_structure():
     assert "evidence_grounding" in prompt.lower()
     assert "clinical_coherence" in prompt.lower()
     print("✓ Reflection agent prompt structure correct")
+
 
 if __name__ == "__main__":
     print("Testing Reflection Agent Implementation...\n")
@@ -69,4 +74,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ Test failed: {e}")
         import traceback
+
         traceback.print_exc()
