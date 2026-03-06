@@ -2,21 +2,32 @@
   "data": {
     "events_path": "data/mimic-demo/events/data_0.parquet",
     "icu_stay_path": "data/mimic-demo/icu_stay/data_0.parquet",
-    "output_dir": "data/oracle_outputs",
+    "output_dir": "oracle_results",
     "de_identify": false,
     "de_identify_seed": 42,
     "max_patients": null
   },
   "data_loading": {
     "agent_observation_hours": 12,
-    "oracle_observation_hours": null
+    "oracle_observation_hours": 12
   },
   "oracle_time_windows": {
-    "current_window_hours": 1,
-    "window_step_hours": 1,
-    "include_pre_icu_data": false,
-    "use_discharge_summary_for_history": false,
-    "num_discharge_summaries": 3
+    "current_window_hours": 0.5,
+    "window_step_hours": 4,
+    "include_pre_icu_data": true,
+    "use_discharge_summary_for_history": true,
+    "num_discharge_summaries": 2,
+    "relative_report_codes": [
+      "NOTE_RADIOLOGYREPORT",
+      "NOTE_DISCHARGESUMMARY"
+    ],
+    "pre_icu_history_hours": 72
+  },
+  "oracle_context": {
+    "history_hours": 6,
+    "future_hours": 6,
+    "use_discharge_summary": true,
+    "top_k_recommendations": 3
   },
   "agent_time_windows": {
     "current_window_hours": 1,
@@ -27,7 +38,7 @@
   },
   "llm": {
     "provider": "google",
-    "model": "gemini-3-flash-preview",
+    "model": "gemini-2.5-flash-lite",
     "temperature": 1.0,
     "max_tokens": 8192
   },
@@ -41,7 +52,7 @@
   },
   "agent_multi": {
     "use_observer_agent": false,
-    "use_memory_agent": true,
+    "use_memory_agent": false,
     "use_reflection_agent": false,
     "observer_use_thinking": false,
     "memory_use_thinking": false,
@@ -51,6 +62,16 @@
       "enabled": true,
       "cache_dir": "experiment_results/observer_cache"
     }
+  },
+  "med_agent": {
+    "use_llm_static_compression": true,
+    "baseline_lab_lookback_start_hours": 72,
+    "baseline_lab_lookback_end_hours": 24,
+    "max_active_problems": 8,
+    "max_critical_events": 20,
+    "max_patterns": 8,
+    "memory_use_thinking": false,
+    "predictor_use_thinking": true
   },
   "oracle_logging": {
     "log_dir": "logs/oracle",

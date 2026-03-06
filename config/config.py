@@ -8,7 +8,7 @@ to all configuration parameters throughout the application.
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class Config:
@@ -125,8 +125,57 @@ class Config:
 
     @property
     def oracle_num_discharge_summaries(self) -> int:
-        """Number of most recent discharge summaries to extract for Oracle (default 3)."""
-        return self.get("oracle_time_windows.num_discharge_summaries", 3)
+        """Maximum prioritized pre-ICU reports to include per NOTE_* code for Oracle."""
+        return self.get("oracle_time_windows.num_discharge_summaries", 2)
+
+    @property
+    def oracle_relative_report_codes(self) -> List[str]:
+        """Additional pre-ICU NOTE_* report codes to prioritize with discharge summaries."""
+        value = self.get("oracle_time_windows.relative_report_codes", ["NOTE_RADIOLOGYREPORT"])
+        if not isinstance(value, list):
+            return ["NOTE_RADIOLOGYREPORT"]
+        return [str(code) for code in value if str(code).strip()]
+
+    @property
+    def oracle_pre_icu_history_hours(self) -> float:
+        """Pre-ICU history lookback window (hours) for fallback + LAB/VITAL baseline context."""
+        value = self.get("oracle_time_windows.pre_icu_history_hours")
+        if value is None:
+            # Backward compatibility for older configs.
+            value = self.get("oracle_time_windows.pre_icu_history_fallback_hours", 72.0)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 72.0
+
+    # ========================================================================
+    # Oracle Context Configuration
+    # ========================================================================
+
+    @property
+    def oracle_context_history_hours(self) -> float:
+        """History threshold (hours) before current window start for Oracle context."""
+        return self.get("oracle_context.history_hours", 48.0)
+
+    @property
+    def oracle_context_future_hours(self) -> float:
+        """Future threshold (hours) after current window start for Oracle context."""
+        return self.get("oracle_context.future_hours", 48.0)
+
+    @property
+    def oracle_context_use_discharge_summary(self) -> bool:
+        """Whether Oracle local context should include ICU discharge summary block."""
+        return self.get("oracle_context.use_discharge_summary", False)
+
+    @property
+    def oracle_context_top_k_recommendations(self) -> int:
+        """Top-k recommendation count requested in Oracle prompt output."""
+        value = self.get("oracle_context.top_k_recommendations", 3)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 3
+        return max(1, parsed)
 
     # ========================================================================
     # Agent Time Window Configuration
@@ -154,7 +203,7 @@ class Config:
 
     @property
     def agent_num_discharge_summaries(self) -> int:
-        """Number of most recent discharge summaries to extract for Agent (default 3)."""
+        """Maximum prioritized pre-ICU reports to include per NOTE_* code for Agent."""
         return self.get("agent_time_windows.num_discharge_summaries", 3)
 
     # ========================================================================
@@ -281,6 +330,50 @@ class Config:
     def agent_multi_observer_cache_dir(self) -> str:
         """Directory for observer-output cache files."""
         return self.get("agent_multi.observer_cache.cache_dir", "experiment_results/observer_cache")
+
+    # ========================================================================
+    # MedAgent Configuration
+    # ========================================================================
+
+    @property
+    def med_agent_use_llm_static_compression(self) -> bool:
+        """Whether to compress static memory with an LLM summary."""
+        return self.get("med_agent.use_llm_static_compression", True)
+
+    @property
+    def med_agent_baseline_lab_lookback_start_hours(self) -> float:
+        """Baseline lab window start (hours before ICU admission)."""
+        return self.get("med_agent.baseline_lab_lookback_start_hours", 72.0)
+
+    @property
+    def med_agent_baseline_lab_lookback_end_hours(self) -> float:
+        """Baseline lab window end (hours before ICU admission)."""
+        return self.get("med_agent.baseline_lab_lookback_end_hours", 24.0)
+
+    @property
+    def med_agent_max_active_problems(self) -> int:
+        """Maximum active problems in dynamic memory."""
+        return self.get("med_agent.max_active_problems", 8)
+
+    @property
+    def med_agent_max_critical_events(self) -> int:
+        """Maximum critical events in dynamic memory."""
+        return self.get("med_agent.max_critical_events", 20)
+
+    @property
+    def med_agent_max_patterns(self) -> int:
+        """Maximum patient-specific patterns in dynamic memory."""
+        return self.get("med_agent.max_patterns", 8)
+
+    @property
+    def med_agent_memory_use_thinking(self) -> bool:
+        """Whether dynamic memory agent uses explicit chain of thought."""
+        return self.get("med_agent.memory_use_thinking", True)
+
+    @property
+    def med_agent_predictor_use_thinking(self) -> bool:
+        """Whether predictor uses explicit chain of thought."""
+        return self.get("med_agent.predictor_use_thinking", True)
 
     # ========================================================================
     # Utility Methods

@@ -1,193 +1,332 @@
-"""
-Oracle System Prompt for Retrospective Clinical Evaluation
+"""Prompt templates for Oracle offline evaluator."""
 
-This prompt template is used by the Meta Oracle to evaluate clinical decisions
-with the benefit of hindsight.
-"""
+from __future__ import annotations
 
-ORACLE_SYSTEM_PROMPT = """
-## Role
-You are a Senior Retrospective Clinical Auditor. Your objective is to perform a high-fidelity "Root Cause Analysis" (RCA) and quality assessment of patient care within a specific time window. You possess "hindsight clarity," meaning you evaluate decisions made at Time T by analyzing the patient's subsequent clinical trajectory.
+import math
+from datetime import datetime
+from typing import Any, Dict, List
 
-## Objective
-Determine if clinical interventions during the Evaluation Window (T to T + {window_hours} hours) were evidence-based and appropriate, using Future Events to validate the efficacy of those decisions while strictly avoiding "Outcome Bias" (i.e., not blaming clinicians for poor outcomes that were physiologically inevitable).
+ORACLE_PROMPT_TEMPLATE = """
+You are Oracle, a clinical AI evaluator with hindsight access to a patient's full ICU trajectory including the ICU results.
+Your task is to evaluate a specific local observation window {window_time} using the hindsight knowledge of the ICU trajectory.
+For evaluating this observation window you must produce two assessments:
 
+## PART 1 — PATIENT STATUS
+Using the provided local context as ground truth, assess the patient's clinical direction at the time of this window across four domains, then synthesize an overall status.
 
-## 1. Data Input Structure
-You will be provided with four distinct data blocks. You must maintain strict traceability by referencing events by their indices:
-* **Patient Context**: Demographics, comorbidities, and admission etiology.
-* **History (Hn)**: Events preceding the evaluation window.
-* **Current Window (Cn)**: The {window_hours}-hour period currently under audit.
-* **Future Trajectory (Fn)**: Events occurring after the window, used to verify the impact of Cn decisions.
+Domains:
+- Hemodynamics: heart rate, MAP, lactate, perfusion, vasopressor requirements
+- Respiratory: SpO2, PaO2/FiO2, respiratory rate, ventilator settings
+- Renal/Metabolic: creatinine, urine output, electrolytes, acid-base status
+- Neurology: GCS, mental status changes, RASS sedation score
 
+For each domain and the overall status, choose exactly one of:
+- improving: indicators trending toward stability or recovery relative to the provided context.
+- stable: no meaningful change in either direction.
+- deteriorating: indicators trending toward worsening or decompensation relative to the provided context.
+- insufficient_data: available information is not sufficient to make a reliable judgment (e.g., sparse events, conflicting signals).
 
-## 2. Evaluation Framework
+Synthesize the overall label by reasoning about the relative clinical weight of each domain for this specific patient — do not apply a fixed rule.
 
-### A. Patient Status Score
-Assign a value from -1.0 to +1.0 based on the patient’s physiological stability at the end of the Current Window:
-* -1.0 (Critical): Active decompensation; failure of multiple organ systems.
-* -0.5 (Unstable): Trending toward deterioration; escalating support required.
-* 0.0 (Stable): Homeostasis maintained; no immediate threat to life.
-* +0.5 (Improving): Resolving pathology; weaning of support.
-* +1.0 (Recovered): Baseline status achieved or ready for step-down/discharge.
-
-### B. Action Quality Categorization
-Audit the interventions in the Current Window (Cn) against the Standard of Care:
-* **Optimal**: Decisions were proactive, evidence-based, and addressed the primary pathology. Future data (Fn) confirms these actions stabilized or mitigated risks.
-* **Neutral**: Care was routine or observational. No critical interventions were indicated, or actions had no measurable impact on the trajectory.
-* **Sub-optimal**: Actions deviated from clinical guidelines, ignored significant trends in Hn or Cn, or represented missed opportunities that led to preventable complications in Fn.
+Important nuances:
+- Do NOT conflate outcome with care quality. A patient may be deteriorating despite excellent care (e.g., terminal illness, refractory septic shock managed correctly).
+- A patient may be labelled stable or improving even if they eventually die, if the trajectory at this window genuinely reflects that direction.
+- If the case involves expected end-of-life or palliative management, note this explicitly in your reasoning.
 
 
-## 3. Logic & Constraint Guidelines
-* **The Hindsight Rule**: Use the Future Trajectory (Fn) to diagnose the correctness of a decision, but evaluate the quality of the clinician's choice based on the data available at Time T.
-* **Evidence-Based Traceability**: Every assertion in your rationale must cite at least one index (Hn, Cn, Fn).
-* **Physiological Justification**: Link your assessment to specific clinical markers (e.g., MAP, SpO2, Serum Lactate, GCS).
-* **Non-Determinism**: A "Sub-optimal" action might still result in a "Positive Outcome" due to patient resilience, and an "Optimal" action might result in a "Negative Outcome" due to disease severity.
+## PART 2 — DOCTOR ACTION EVALUATION AND RECOMMENDATIONS
+You will be given a list of clinical actions taken during the {window_time} window.
+Evaluate EACH action individually on two dimensions:
+
+A. Guideline adherence — does this action follow established ICU clinical guidelines (e.g., Surviving Sepsis Campaign, ARDSNet, PADIS guidelines, AHA/ACC where relevant)?
+Labels: adherent | non_adherent | not_applicable | guideline_unclear
+
+B. Contextual appropriateness — given THIS patient's specific condition, trajectory, comorbidities, and the eventual outcome known to you, was this action appropriate?
+Labels: appropriate | suboptimal | potentially_harmful | not_enough_context
+
+Use your hindsight knowledge from the provided context to inform contextual appropriateness, but be fair: judge the action against what the context reveals, not against impossible foresight.
+If an action was reasonable at the time but later context revealed a missed diagnosis, note this nuance.
+
+After evaluating all actions, provide the top {top_k} recommendations for what the clinical team should have prioritised at this window, grounded in hindsight knowledge of the trajectory.
+Each recommendation must be concrete and actionable (e.g., "Increase norepinephrine dose — MAP trending below 65 despite fluid resuscitation over the next 4 hours"),
+and must reference specific trajectory evidence that justifies it. Do not recommend actions already taken correctly.
 
 
-## 4. Output Format
-Return the analysis strictly as a JSON object:
-```json
-{{
-  "audit_metadata": {{
-    "primary_clinical_driver": "Short description of the main medical issue"
-  }},
-  "patient_status": {{
-    "score": 0.0,
-    "rationale": "Detailed reasoning referencing indices (e.g., C4, F2) and physiological trends."
-  }},
-  "clinical_quality": {{
-    "rating": "optimal | neutral | sub-optimal",
-    "rationale": "Comprehensive evaluation of interventions. Connects Current Window actions (Cn) to Future outcomes (Fn).",
-    "guideline_adherence": "Reference to standard protocols (e.g., Surviving Sepsis, ACLS, etc.)"
-  }},
-  "clinical_pearl": "A generalizable, high-value takeaway for medical education."
-}}
-```
-**The patient case for evaluation follows:**
+## OUTPUT FORMAT
+Output your structured response inside <response></response> tags as valid JSON:
 
-"""
+<response>
+{
+  "patient_status": {
+    "domains": {
+      "hemodynamics":    {"label": "...", "key_signals": ["..."], "rationale": "..."},
+      "respiratory":     {"label": "...", "key_signals": ["..."], "rationale": "..."},
+      "renal_metabolic": {"label": "...", "key_signals": ["..."], "rationale": "..."},
+      "neurology":       {"label": "...", "key_signals": ["..."], "rationale": "..."}
+    },
+    "overall": {
+      "label": "<improving | stable | deteriorating | insufficient_data>",
+      "rationale": "<1–3 sentence summary grounded in trajectory evidence>"
+    },
+    "palliative_flag": true | false
+  },
+  "action_evaluations": [
+    {
+      "action_id": "<identifier for the action, e.g., CW1 for current window event 1>",
+      "action_description": "<brief restatement of the action for clarity>",
+      "guideline_adherence": {
+        "label": "<adherent | non_adherent | not_applicable | guideline_unclear>",
+        "guideline_reference": "<name or source of the relevant guideline, or null>",
+        "rationale": "<1–2 sentences>"
+      },
+      "contextual_appropriateness": {
+        "label": "<appropriate | suboptimal | potentially_harmful | not_enough_context>",
+        "rationale": "<1–3 sentences referencing patient-specific trajectory evidence>",
+        "hindsight_caveat": "<note if hindsight changes the interpretation vs. real-time judgment, or null>",
+      },
+      "overall": {
+        "label": "<appropriate | suboptimal | potentially_harmful | not_enough_context>",
+        "rationale": "<1–3 sentence synthesis of the above evaluations, grounded in trajectory evidence>"
+      }
+    }
+  ],
+  "recommendations": [
+    {
+      "rank": 1,
+      "action": "<concrete, actionable clinical recommendation>",
+      "rationale": "<1–3 sentences grounded in specific hindsight trajectory evidence>",
+      "urgency": "<immediate | within_1h | longterm | optional>"
+    }
+  ],
+  "overall_window_summary": "<2–4 sentence synthesis of the window: patient direction, care quality, and any critical observations>"
+}
+</response>
 
 
-def format_oracle_prompt(window_data: dict, window_hours: float = 6.0, include_outcome: bool = True) -> str:
-    """
-    Format the Oracle prompt with specific patient window data.
+## PATIENT ICU CONTEXT WINDOW
+{patient_icu_trajectory}
 
-    Args:
-        window_data: Dictionary containing patient metadata, history, and future events
-        window_hours: Size of the future window in hours
-        include_outcome: Whether to include patient outcome in the prompt (default: True)
+## CURRENT OBSERVATION WINDOW FOR EVALUATION — {window_time}
+{events}
 
-    Returns:
-        Formatted prompt string ready for LLM
-    """
+Now, evaluate the CURRENT OBSERVATION WINDOW according to the instructions above.
+""".strip()
 
-    # Extract patient metadata
-    metadata = window_data["patient_metadata"]
 
-    # Format patient context
-    patient_context = f"""
-## Patient Context
+def format_oracle_prompt(
+    window_data: Dict[str, Any],
+    context_block: str,
+    context_mode: str,
+    history_hours: Any = None,
+    future_hours: Any = None,
+    top_k: Any = None,
+) -> str:
+    """Format Oracle prompt with local ICU context window + current raw window."""
+    metadata = window_data.get("patient_metadata", {})
+    current_events = window_data.get("current_events", [])
+    window_time = _format_window_time(window_data)
+    current_hour_since_admission = _safe_float(window_data.get("hours_since_admission"))
+    icu_duration_hours = _safe_float(metadata.get("total_icu_duration_hours"))
+    outcome_text = _format_outcome(metadata.get("survived"))
+    history_hours_text = _format_hours_for_template(history_hours)
+    future_hours_text = _format_hours_for_template(future_hours)
+    top_k_text = _format_top_k(top_k)
 
-- Age: {metadata['age']:.1f} years
-- Hours Since Admission: {window_data['hours_since_admission']:.1f}
-- Evaluation Window: {window_data['current_window_start']} to {window_data['current_window_end']}
-- Total ICU Duration: {metadata['total_icu_duration_hours']:.1f} hours
+    patient_context = [
+        "## Patient Context",
+        f"- Age: {_format_age(metadata.get('age'))}",
+        f"- Total ICU Stay: {icu_duration_hours:.1f} hours",
+        f"- Current Hour Since ICU Admission: {current_hour_since_admission:.1f}",
+        f"- ICU Outcome: {outcome_text}",
+        f"- Context Mode: {context_mode}",
+        f"- Current Window Start: {window_data.get('current_window_start')}",
+        f"- Current Window End: {window_data.get('current_window_end')}",
+        "",
+    ]
+    pre_icu_history_lines = _format_pre_icu_history_lines(window_data.get("pre_icu_history"))
 
-"""
-
-    # Only include outcome if requested (for blinded evaluation)
-    if include_outcome:
-        patient_context += f"- Outcome: {'Survived' if metadata['survived'] else 'Died'}\n"
-
-        if metadata["death_time"]:
-            patient_context += f"- Death Time: {metadata['death_time']}\n"
-
-    # Format history events
-    history_summary = f"\n## History Events (Before Time T)\n\n"
-    history_summary += f"Total events in history: {window_data['num_history_events']}\n\n"
-
-    if window_data["num_history_events"] > 0:
-        # Show all history events
-        all_history = window_data["history_events"]
-        history_summary += "All events:\n"
-        for i, event in enumerate(all_history, 1):
-            history_summary += f"H{i}. {_format_event(event)}\n"
+    current_window_lines = [f"Total current-window events: {len(current_events)}"]
+    if current_events:
+        for idx, event in enumerate(current_events, start=1):
+            current_window_lines.append(f"CW{idx}. {format_event_line(event)}")
     else:
-        history_summary += "No prior events (evaluation at admission)\n"
+        current_window_lines.append("(No events)")
 
-    # Format current events
-    current_summary = f"\n## Current Events (Evaluation Window from Time T to T+{window_hours} hours)\n\n"
-    current_summary += f"Total events in current window: {window_data['num_current_events']}\n\n"
+    patient_trajectory = "\n".join([*patient_context, *pre_icu_history_lines, "", context_block]).strip()
+    events = "\n".join(current_window_lines)
 
-    if window_data["num_current_events"] > 0:
-        for i, event in enumerate(window_data["current_events"], 1):
-            current_summary += f"C{i}. {_format_event(event)}\n"
+    prompt = ORACLE_PROMPT_TEMPLATE
+    prompt = prompt.replace("{history_hours}", history_hours_text)
+    prompt = prompt.replace("{future_hours}", future_hours_text)
+    prompt = prompt.replace("{top_k}", top_k_text)
+    prompt = prompt.replace("{patient_icu_trajectory}", patient_trajectory)
+    prompt = prompt.replace("{window_time}", window_time)
+    # Backward-compatible token replacement for legacy templates.
+    prompt = prompt.replace("{window time}", window_time)
+    prompt = prompt.replace("{events}", events)
+    return prompt
+
+
+def _format_pre_icu_history_lines(pre_icu_history: Any) -> List[str]:
+    lines = ["## PRE-ICU HISTORY"]
+
+    if not isinstance(pre_icu_history, dict):
+        lines.append("No pre-ICU history provided.")
+        return lines
+
+    source = str(pre_icu_history.get("source") or "").strip().lower()
+    items = int(_safe_float(pre_icu_history.get("items")))
+    content = str(pre_icu_history.get("content") or "").strip()
+    fallback_hours = _safe_float(pre_icu_history.get("fallback_hours"))
+
+    if source in {"", "none", "disabled"}:
+        lines.append("No pre-ICU history provided.")
+    elif source == "reports":
+        lines.append(content if content else "No pre-ICU history provided.")
+    elif source == "events_fallback":
+        lines.append(f"({items} item(s) from previous {fallback_hours:.1f} hours)")
+        lines.append(content if content else "No pre-ICU history provided.")
     else:
-        current_summary += "No events in current evaluation window\n"
+        lines.append(f"Source: {source} ({items} item(s))")
+        lines.append(content if content else "No pre-ICU history provided.")
 
-    # Format future events
-    future_summary = f"\n## Future Events (After T+{window_hours} hours)\n\n"
-    future_summary += f"Total events in future window: {window_data['num_future_events']}\n\n"
+    baseline_content = str(pre_icu_history.get("baseline_content") or "").strip()
+    baseline_events_count = int(_safe_float(pre_icu_history.get("baseline_events_count")))
+    baseline_history_hours = _safe_float(pre_icu_history.get("history_hours"))
+    if baseline_history_hours <= 0:
+        baseline_history_hours = _safe_float(pre_icu_history.get("fallback_hours"))
 
-    if window_data["num_future_events"] > 0:
-        for i, event in enumerate(window_data["future_events"], 1):
-            future_summary += f"F{i}. {_format_event(event)}\n"
-    else:
-        future_summary += "No events in future window\n"
+    if baseline_content:
+        lines.append("")
+        lines.append("## PRE-ICU BASELINE SNAPSHOT")
+        lines.append(
+            f"({baseline_events_count} LAB/VITAL event(s) from last {baseline_history_hours:.1f}h before ICU)"
+        )
+        lines.append(baseline_content)
 
-    # Combine everything
-    full_prompt = ORACLE_SYSTEM_PROMPT.format(window_hours=window_hours)
-    full_prompt += "\n\n" + patient_context
-    full_prompt += "\n" + history_summary
-    full_prompt += "\n" + current_summary
-    full_prompt += "\n" + future_summary
-    full_prompt += "\n\n## Your Evaluation\n\nProvide your evaluation as a JSON object:"
-
-    return full_prompt
+    return lines
 
 
-def _format_event(event: dict) -> str:
-    """
-    Format a single cleaned event for display in the prompt.
+def format_event_line(event: Dict[str, Any]) -> str:
+    """Format one event into a compact, stable line for prompts."""
+    parts: List[str] = []
 
-    Args:
-        event: Cleaned event dictionary with filtered fields
+    time_value = event.get("time") or event.get("start_time")
+    if not _is_missing_value(time_value):
+        parts.append(_format_time(time_value))
 
-    Returns:
-        Formatted event string
-    """
-    parts = []
+    code = event.get("code")
+    if not _is_missing_value(code):
+        parts.append(str(code))
 
-    # Time (always first if available)
-    if "start_time" in event:
-        # Format timestamp without seconds (YYYY-MM-DD HH:MM:SS -> YYYY-MM-DD HH:MM)
-        timestamp = event["start_time"]
-        if len(timestamp) >= 19 and timestamp[16] == ":":  # Check if format includes seconds
-            timestamp = timestamp[:16]  # Remove :SS part
-        parts.append(f"[{timestamp}]")
+    details = event.get("code_specifics")
+    if not _is_missing_value(details):
+        parts.append(str(details))
 
-    # Time delta (if available)
-    if "time_delta_minutes" in event:
-        parts.append(f"(+{event['time_delta_minutes']}min)")
+    numeric_value = event.get("numeric_value")
+    if not _is_missing_value(numeric_value):
+        parts.append(f"={_format_numeric_value(numeric_value)}")
 
-    # Code specifics (label/description)
-    if "code" in event:
-        parts.append(f"{event['code']}")
+    text_value = event.get("text_value")
+    if not _is_missing_value(text_value):
+        parts.append(str(text_value))
 
-    if "code_specifics" in event:
-        parts.append(event["code_specifics"])
+    if not parts:
+        return json.dumps(event, ensure_ascii=False, default=str)
+    return " ".join(parts)
 
-    # Numeric value with text value (unit)
-    if "numeric_value" in event:
-        value_str = str(event["numeric_value"])
-        parts.append(f"={value_str}")
 
-    if "text_value" in event:
-        parts.append(f"{event['text_value']}")
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"", "nan", "null", "none"}
+    try:
+        return bool(math.isnan(value))
+    except (TypeError, ValueError):
+        return False
 
-    # # End time (if different from start)
-    # if "end_time" in event and event.get("end_time") != event.get("time"):
-    #     parts.append(f"(until {event['end_time']})")
 
-    return " ".join(parts) if parts else str(event)
+def _format_age(age: Any) -> str:
+    if age is None:
+        return "Unknown"
+    try:
+        return f"{float(age):.1f} years"
+    except (TypeError, ValueError):
+        return str(age)
+
+
+def _format_outcome(survived: Any) -> str:
+    if isinstance(survived, bool):
+        return "Survived after ICU" if survived else "Died after ICU"
+
+    text = str(survived).strip().lower()
+    if text in {"true", "1", "yes", "y", "survived", "alive"}:
+        return "Survived after ICU"
+    if text in {"false", "0", "no", "n", "died", "dead", "deceased"}:
+        return "Died after ICU"
+    return "Unknown"
+
+
+def _format_hours_for_template(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_top_k(value: Any) -> str:
+    if value is None:
+        return "3"
+    try:
+        as_int = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if as_int < 1:
+        as_int = 1
+    return str(as_int)
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _format_numeric_value(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_window_time(window_data: Dict[str, Any]) -> str:
+    start = window_data.get("current_window_start")
+    end = window_data.get("current_window_end")
+    start_text = _format_time(start) if start else "unknown_start"
+    end_text = _format_time(end) if end else "unknown_end"
+    return f"{start_text} to {end_text}"
+
+
+def _format_time(value: Any) -> str:
+    if value is None:
+        return "Unknown"
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+
+    text = str(value).strip()
+    if not text:
+        return "Unknown"
+
+    try:
+        parsed = datetime.fromisoformat(text)
+        return parsed.strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        pass
+
+    if len(text) >= 16:
+        return text[:16]
+    return text

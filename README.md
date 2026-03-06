@@ -21,7 +21,7 @@ The Meta Oracle system processes MIMIC-demo ICU patient data to evaluate clinica
 ┌─────────────────────────────────────────────────────────────┐
 │                    Data Parser                               │
 │  • Loads patient trajectories                               │
-│  • Creates time windows (history + future)                  │
+│  • Creates sliding current windows (30min)                  │
 │  • Formats data for Oracle evaluation                       │
 └─────────────────────────────────────────────────────────────┘
                           ↓
@@ -34,11 +34,10 @@ The Meta Oracle system processes MIMIC-demo ICU patient data to evaluate clinica
                           ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                    Oracle Reports                            │
-│  • patient_status_score: -1.0 to 1.0                        │
-│  • status_rationale: Medical reasoning                      │
-│  • action_quality: optimal/neutral/sub-optimal              │
-│  • recommended_action: What should have been done           │
-│  • clinical_insight: Transferable clinical pearl            │
+│  • patient_status: overall + physiology trends              │
+│  • doctor_actions: extracted actions in current window      │
+│  • context_mode: raw_local_trajectory_*                     │
+│  • context_stats: local context-window metadata             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -49,10 +48,10 @@ The Meta Oracle system processes MIMIC-demo ICU patient data to evaluate clinica
 Processes MIMIC-demo dataset into patient trajectories with time windows:
 
 - **Input**: Events parquet + ICU stay parquet
-- **Output**: Time-windowed trajectories with history and future events
+- **Output**: Time-windowed trajectories with history + current events
 - **Key Features**:
   - Extracts complete patient trajectories per ICU stay
-  - Creates sliding time windows (default: 6-hour future window, 1-hour steps)
+  - Creates sliding current windows (default: 30-minute window, configurable step)
   - Handles multiple ICU stays per patient
   - **Event Cleaning**: Filters events to keep only clinically relevant fields:
     - `time`: Event timestamp
@@ -69,12 +68,12 @@ Processes MIMIC-demo dataset into patient trajectories with time windows:
 
 LLM-powered retrospective evaluator:
 
-- **Input**: Time window with patient history and future events
-- **Output**: Structured evaluation report
+- **Input**: Current raw window + local ICU context window (history 48h + future 48h)
+- **Output**: Structured status + doctor-action extraction report
 - **Key Features**:
   - Supports multiple LLM providers (Anthropic, OpenAI, Google Gemini)
-  - Chain-of-Thought reasoning
   - Structured JSON output
+  - Bounded local context per window (`current_window_start ± 48h`)
   - Error handling and fallback parsing
 
 ### 3. Oracle Prompt ([prompts/oracle_prompt.py](prompts/oracle_prompt.py))
@@ -186,8 +185,8 @@ python run_oracle.py \
   --icu-stay data/mimic-demo/icu_stay/data_0.parquet \
   --output data/oracle_outputs \
   --provider anthropic \
-  --window-hours 6.0 \
-  --step-hours 1.0 \
+  --current-window-hours 0.5 \
+  --window-step-hours 0.5 \
   --max-patients 10
 ```
 
@@ -198,8 +197,8 @@ python run_oracle.py \
 - `--output`: Output directory for reports
 - `--provider`: LLM provider (`anthropic`, `openai`, `google`, or `gemini`)
 - `--model`: Specific model name (optional)
-- `--window-hours`: Size of future window (default: 6.0)
-- `--step-hours`: Step between windows (default: 1.0)
+- `--current-window-hours`: Size of current observation window (default from config)
+- `--window-step-hours`: Step between windows (default from config)
 - `--max-patients`: Limit number of patients (for testing)
 
 ### Programmatic Usage
@@ -234,16 +233,14 @@ oracle = MetaOracle(
     model=config.llm_model
 )
 
-# Evaluate windows
-reports = oracle.evaluate_trajectory(windows)
+# Evaluate windows (Oracle V2 needs trajectory for full-context building)
+reports = oracle.evaluate_trajectory(windows, trajectory=trajectory)
 
 # Access results
 for report in reports:
-    print(f"Patient Status Score: {report.patient_status_score}")
-    print(f"Status Rationale: {report.status_rationale}")
-    print(f"Action Quality: {report.action_quality}")
-    print(f"Recommended Action: {report.recommended_action}")
-    print(f"Clinical Insight: {report.clinical_insight}")
+    print(f"Overall Status: {report.patient_status['overall_status']}")
+    print(f"Status Summary: {report.patient_status['summary']}")
+    print(f"Doctor Actions Extracted: {len(report.doctor_actions)}")
 ```
 
 ## Output Format
@@ -252,11 +249,30 @@ for report in reports:
 
 ```json
 {
-  "patient_status_score": 0.5,
-  "status_rationale": "Patient showing signs of improvement with stabilizing vitals...",
-  "action_quality": "optimal",
-  "recommended_action": "Continue current norepinephrine dose and monitor MAP closely...",
-  "clinical_insight": "Early vasopressor initiation in septic shock improves outcomes..."
+  "patient_status": {
+    "overall_status": "stable",
+    "physiology_trends": {
+      "hemodynamics": {"status": "stable", "rationale": "..."},
+      "respiratory": {"status": "improving", "rationale": "..."},
+      "renal_metabolic": {"status": "insufficient_data", "rationale": "..."},
+      "neurology": {"status": "stable", "rationale": "..."}
+    },
+    "summary": "Window-end status summary."
+  },
+  "doctor_actions": [
+    {
+      "time": "2024-01-01 10:12",
+      "action": "Norepinephrine infusion started",
+      "category": "medication_start",
+      "evidence_event_refs": ["CW4"]
+    }
+  ],
+  "context_mode": "raw_local_trajectory_icu_events_only",
+  "context_stats": {
+    "context_tokens": 52311,
+    "context_event_count": 412,
+    "context_window_start": "2024-01-01T00:00:00"
+  }
 }
 ```
 
@@ -271,19 +287,19 @@ After processing, the output directory contains:
 
 ## Oracle Evaluation Framework
 
-### Patient Status Score Scale
+### Patient Status Categories
 
-- **-1.0**: Critically ill, severe deterioration
-- **-0.5**: Unstable, concerning trajectory
-- **0.0**: Stable condition
-- **+0.5**: Improving, positive trajectory
-- **+1.0**: Significantly improving, excellent recovery
+- **deteriorating**: clear short-term decline by window end
+- **fluctuating**: contradictory/oscillating signals in window
+- **stable**: no major net change by window end
+- **improving**: clear stabilization/recovery trend
+- **insufficient_data**: not enough evidence in one or more major domains
 
-### Action Quality Categories
+### Doctor Action Extraction
 
-- **optimal**: Interventions were clinically appropriate and beneficial
-- **neutral**: Routine care, no significant positive or negative impact
-- **sub-optimal**: Decisions had minor to serious negative consequences
+- Oracle extracts actions directly from the full raw current window.
+- No hardcoded whitelist filtering is applied before extraction.
+- Actions are represented with `time`, `action`, `category`, and `evidence_event_refs`.
 
 ### Evaluation Principles
 

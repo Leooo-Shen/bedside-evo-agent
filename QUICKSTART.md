@@ -57,17 +57,16 @@ This will:
 - Load the MIMIC-demo data
 - Extract one patient's trajectory
 - Create time windows
-- Run Oracle evaluation on the first window
+- Run Oracle V2 evaluation on the first window
 - Display the evaluation report
 - Save results to `data/oracle_outputs/`
 
-**Expected output:**
+**Expected output (Oracle V2):**
 ```
-Patient Status Score: 0.25
-Status Rationale: [Brief medical reasoning for patient condition]
-Action Quality: optimal
-Recommended Action: [Specific recommendation]
-Clinical Insight: [Transferable clinical pearl]
+Overall Status: stable
+Status Summary: [Brief medical reasoning for patient condition]
+Doctor Actions Extracted: 2
+Context Mode: raw_local_trajectory_icu_events_only or raw_local_trajectory_with_icu_discharge_summary
 ```
 
 ## Process All Patients
@@ -112,16 +111,16 @@ After running, check `data/oracle_outputs/`:
 
 ### Change Window Size
 
-Evaluate with 12-hour future windows:
+Evaluate with 30-minute current windows:
 ```bash
-python run_oracle.py --window-hours 12.0
+python run_oracle.py --current-window-hours 0.5
 ```
 
 ### Change Step Size
 
 Create windows every 30 minutes:
 ```bash
-python run_oracle.py --step-hours 0.5
+python run_oracle.py --window-step-hours 0.5
 ```
 
 ### Use Different LLM
@@ -165,22 +164,18 @@ windows = parser.create_time_windows(
     window_size_hours=config.window_size_hours
 )
 
-# Evaluate
+# Evaluate (Oracle V2 requires trajectory for context building)
 oracle = MetaOracle(
     provider=config.llm_provider,
     model=config.llm_model
 )
-reports = oracle.evaluate_trajectory(windows)
+reports = oracle.evaluate_trajectory(windows, trajectory=trajectory)
 
 # Use results
 for report in reports:
-    print(f"Patient Status Score: {report.patient_status_score}")
-    if report.patient_status_score < -0.5:
-        print(f"⚠️  Patient critically ill!")
-        print(f"Rationale: {report.status_rationale}")
-    if report.action_quality == "sub-optimal":
-        print(f"⚠️  Sub-optimal action detected!")
-        print(f"Recommended: {report.recommended_action}")
+    status = report.patient_status["overall_status"]
+    print(f"Overall Status: {status}")
+    print(f"Doctor Actions Extracted: {len(report.doctor_actions)}")
 ```
 
 ## Troubleshooting
@@ -203,7 +198,7 @@ export GOOGLE_API_KEY="your-key"
 
 ### "No windows generated"
 - Patient ICU stay may be too short
-- Try reducing `--window-hours` parameter
+- Try reducing `--current-window-hours` parameter
 - Check that events data is properly loaded
 
 ### "JSON parsing failed"

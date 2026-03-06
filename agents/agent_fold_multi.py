@@ -423,19 +423,19 @@ class MultiAgent:
                 if time_str and event_name and event_name != "None":
                     working_context.add_key_event(f"{time_str}: {event_name}")
 
-        # Update concerns
-        concerns_update = clinical.get("active_concerns_update", [])
-        updated_concerns = []
-        for c in concerns_update:
-            note = c.get("concern", c.get("note", ""))
-            updated_concerns.append(
-                ClinicalConcern(
-                    concern_id=c.get("id", ""),
-                    status=c.get("status", "Active"),
-                    note=note,
-                )
-            )
-        working_context.update_concerns(updated_concerns)
+        # # Update concerns
+        # concerns_update = clinical.get("active_concerns_update", [])
+        # updated_concerns = []
+        # for c in concerns_update:
+        #     note = c.get("concern", c.get("note", ""))
+        #     updated_concerns.append(
+        #         ClinicalConcern(
+        #             concern_id=c.get("id", ""),
+        #             status=c.get("status", "Active"),
+        #             note=note,
+        #         )
+        #     )
+        # working_context.update_concerns(updated_concerns)
 
     def _reflection_loop(
         self,
@@ -921,9 +921,9 @@ class MultiAgent:
                     ],
                 },
                 "key_events": working_context.historical_key_events.copy(),
-                "active_concerns": [
-                    {"id": c.concern_id, "status": c.status, "note": c.note} for c in working_context.active_concerns
-                ],
+                # "active_concerns": [
+                #     {"id": c.concern_id, "status": c.status, "note": c.note} for c in working_context.active_concerns
+                # ],
             }
             memory_db.add_window(window_record)
 

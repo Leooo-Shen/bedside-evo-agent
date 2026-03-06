@@ -4,6 +4,7 @@ Survival Prediction Experiment with Multiple Agent Types
 This script runs the Evo-ICU experiment using different agent approaches:
 1. ReMeM: Retrieval-Enhanced Memory Management (intra-patient memory only)
 2. AgentFold: Hierarchical Memory with Dynamic Trajectory Folding
+3. MedAgent: Static + Dynamic Memory with final predictor
 """
 
 import hashlib
@@ -22,6 +23,7 @@ sys.path.insert(0, str(project_root))
 
 from agents.agent_fold import FoldAgent
 from agents.agent_fold_multi import MultiAgent
+from agents.med_agent import MedAgent
 from agents.remem import PatientState, RememAgent
 from config.config import get_config
 from data_parser import MIMICDataParser
@@ -197,7 +199,7 @@ def _save_observer_cache(
 def process_single_patient(
     patient_row: pd.Series,
     parser: MIMICDataParser,
-    agent,  # Can be RememAgent, FoldAgent, or MultiAgent
+    agent,  # Can be RememAgent, FoldAgent, MultiAgent, or MedAgent
     agent_type: str,
     config,
     results_dir: Path,
@@ -211,8 +213,8 @@ def process_single_patient(
     Args:
         patient_row: Patient data from ICU stay DataFrame
         parser: MIMICDataParser instance
-        agent: Agent instance (RememAgent or FoldAgent)
-        agent_type: Type of agent ("remem", "fold", or "multi")
+        agent: Agent instance
+        agent_type: Type of agent ("remem", "fold", "multi", or "med")
         config: Configuration object
         results_dir: Directory to save results
         patient_idx: Index of this patient
@@ -326,6 +328,7 @@ def process_single_patient(
         agent.clear_logs()
 
         # Run appropriate agent pipeline
+        med_output = None
         if agent_type == "remem":
             prediction, final_state, window_states = agent.run_patient_trajectory(
                 windows=windows,
@@ -359,6 +362,15 @@ def process_single_patient(
                         observer_cache_info["save_error"] = str(e)
                         if verbose:
                             print(f"   Observer cache: SAVE ERROR ({e})")
+        elif agent_type == "med":
+            prediction, med_output = agent.run_patient_trajectory(
+                windows=windows,
+                patient_metadata=patient_metadata,
+                trajectory=trajectory,
+                verbose=verbose,
+            )
+            final_state_text = med_output.final_state_text
+            window_states = []
         else:  # agent_fold
             prediction, working_context, memory_db = agent.run_patient_trajectory(
                 windows=windows,
@@ -415,6 +427,12 @@ def process_single_patient(
             }
             with open(patient_dir / "patient_specific_insights.json", "w") as f:
                 json.dump(insights, f, indent=2)
+        elif agent_type == "med":
+            if med_output is not None:
+                with open(patient_dir / "patient_memory.json", "w") as f:
+                    json.dump(med_output.patient_memory_dict(), f, indent=2)
+                with open(patient_dir / "dynamic_memory_history.json", "w") as f:
+                    json.dump(med_output.dynamic_history_dict(), f, indent=2)
         else:  # agent_fold or multi
             # Save memory database
             memory_db.save(str(patient_dir / "memory_database.json"))
@@ -433,9 +451,9 @@ def process_single_patient(
                     for t in working_context.trajectory
                 ],
                 "key_events": working_context.historical_key_events,
-                "active_concerns": [
-                    {"id": c.concern_id, "status": c.status, "note": c.note} for c in working_context.active_concerns
-                ],
+                # "active_concerns": [
+                #     {"id": c.concern_id, "status": c.status, "note": c.note} for c in working_context.active_concerns
+                # ],
             }
             with open(patient_dir / "working_context.json", "w") as f:
                 json.dump(context_data, f, indent=2)
@@ -488,7 +506,7 @@ def run_experiment(
     Run the survival prediction experiment.
 
     Args:
-        agent_type: "remem", "fold", or "multi"
+        agent_type: "remem", "fold", "multi", or "med"
         n_survived: Number of survived patients to include
         n_died: Number of died patients to include
         verbose: Print progress
@@ -541,6 +559,24 @@ def run_experiment(
             memory_use_thinking=config.agent_multi_memory_use_thinking,
             reflection_use_thinking=config.agent_multi_reflection_use_thinking,
             predictor_use_thinking=config.agent_multi_predictor_use_thinking,
+        )
+    elif agent_type == "med":
+        # Initialize MedAgent (Static Memory + Dynamic Memory + Predictor)
+        agent = MedAgent(
+            provider=config.llm_provider,
+            model=config.llm_model,
+            temperature=config.llm_temperature,
+            max_tokens=config.llm_max_tokens,
+            enable_logging=enable_logging,
+            observation_hours=config.agent_observation_hours,
+            use_llm_static_compression=config.med_agent_use_llm_static_compression,
+            baseline_lab_lookback_start_hours=config.med_agent_baseline_lab_lookback_start_hours,
+            baseline_lab_lookback_end_hours=config.med_agent_baseline_lab_lookback_end_hours,
+            max_active_problems=config.med_agent_max_active_problems,
+            max_critical_events=config.med_agent_max_critical_events,
+            max_patterns=config.med_agent_max_patterns,
+            memory_use_thinking=config.med_agent_memory_use_thinking,
+            predictor_use_thinking=config.med_agent_predictor_use_thinking,
         )
     elif agent_type == "fold":
         # Initialize FoldAgent
@@ -609,6 +645,23 @@ def run_experiment(
                 memory_use_thinking=config.agent_multi_memory_use_thinking,
                 reflection_use_thinking=config.agent_multi_reflection_use_thinking,
                 predictor_use_thinking=config.agent_multi_predictor_use_thinking,
+            )
+        elif agent_type == "med":
+            patient_agent = MedAgent(
+                provider=config.llm_provider,
+                model=config.llm_model,
+                temperature=config.llm_temperature,
+                max_tokens=config.llm_max_tokens,
+                enable_logging=enable_logging,
+                observation_hours=config.agent_observation_hours,
+                use_llm_static_compression=config.med_agent_use_llm_static_compression,
+                baseline_lab_lookback_start_hours=config.med_agent_baseline_lab_lookback_start_hours,
+                baseline_lab_lookback_end_hours=config.med_agent_baseline_lab_lookback_end_hours,
+                max_active_problems=config.med_agent_max_active_problems,
+                max_critical_events=config.med_agent_max_critical_events,
+                max_patterns=config.med_agent_max_patterns,
+                memory_use_thinking=config.med_agent_memory_use_thinking,
+                predictor_use_thinking=config.med_agent_predictor_use_thinking,
             )
         else:  # agent_fold
             patient_agent = FoldAgent(
@@ -694,6 +747,11 @@ def run_experiment(
                     print(f"  Revisions: {stats.get('total_revisions', 0)}")
             else:
                 print(f"  Memory Agent: DISABLED (ablation mode)")
+        elif agent_type == "med":
+            print(f"  Static Compression Calls: {stats.get('total_static_compression_calls', 0)}")
+            print(f"  Dynamic Memory Calls: {stats.get('total_memory_calls', 0)}")
+            print(f"  Predictor Calls: {stats.get('total_predictor_calls', 0)}")
+            print(f"  Dynamic Fallbacks: {stats.get('total_dynamic_fallbacks', 0)}")
         else:  # agent_fold
             print(f"  Total Folds: {stats['total_folds']}")
             print(f"  Total Appends: {stats['total_appends']}")
@@ -726,7 +784,7 @@ def main():
     parser = argparse.ArgumentParser(description="Survival Prediction Experiment")
     parser.add_argument(
         "--agent-type",
-        choices=["remem", "fold", "multi"],
+        choices=["remem", "fold", "multi", "med"],
         default="multi",
         help="Agent type to use",
     )

@@ -9,7 +9,8 @@ def get_observer_prompt(use_thinking: bool = True) -> str:
     Args:
         use_thinking: Whether to include explicit chain of thought section
     """
-    thinking_section = """ALWAYS start with thinking first in <think></think>. Then provide your response in JSON format in <response></response>.
+    thinking_section = (
+        """ALWAYS start with thinking first in <think></think>. Then provide your response in JSON format in <response></response>.
 <think>
 1. Physiological Snapshot: Summarize the current state based on the four focus areas.
 2. Comparative Analysis: Compare current events with the previous trajectories.
@@ -18,7 +19,10 @@ def get_observer_prompt(use_thinking: bool = True) -> str:
 3. Clinical Significance: Identify only events that indicate a significant change, a key intervention, or are directly relevant to the trajectory. If there are contradictory signals, do not log them as they might be sensor noise.
 </think>
 
-""" if use_thinking else "Provide your response in JSON format in <response></response>.\n\n"
+"""
+        if use_thinking
+        else "Provide your response in JSON format in <response></response>.\n\n"
+    )
 
     return f"""You are a Senior ICU Clinical Decision Support Agent. Your task is to analyze the current window of patient events and produce a clinical assessment.
 
@@ -31,49 +35,55 @@ Evaluate trends across these four domains:
 3. Renal/Metabolic: Electrolyte balance, creatinine trends, and hourly urine output (UOP).
 4. Neurology: GCS score, changes in mental status, and sedation depth (RASS).
 
+If no events exist for a domain in this window, set status to "insufficient_data" and description to "No relevant events in current window."
+
 ### OUTPUT SPECIFICATION
 {thinking_section}<response>
 {{{{
   "clinical_summary": "A concise 1-2 sentence summary of the current clinical picture.",
-  "clinical_assessment": {{{{
-    "physiology_trends": {{{{
-      "hemodynamics": {{{{
-        "status": "improving/stable/deteriorating/fluctuating",
-        "description": "Desciption of the hemodynamic status. Refer to specific events for justification. "
-      }}}},
-      "respiratory": {{{{
-        "status": "improving/stable/deteriorating/fluctuating",
-        "description": "Desciption of the respiratory status. Refer to specific events for justification. "
-      }}}},
-      "renal_metabolic": {{{{
-        "status": "improving/stable/deteriorating/fluctuating",
-        "description": "Desciption of the renal/metabolic status. Refer to specific events for justification. "
-      }}}},
-      "neurology": {{{{
-        "status": "improving/stable/deteriorating/fluctuating",
-        "description": "Desciption of the neurological status. Refer to specific events for justification. "
-      }}}}
-    }}}},
-    "overall_status": "improving/stable/deteriorating/fluctuating",
-    "critical_events": [
+  "critical_events": [
       {{{{
         "time": "YY-MM-DD HH:MM, or None if no critical events",
         "event": "Event name from current window. Write None if no critical events.",
-        "significance": "Why this matters clinically."
       }}}},
       ...
     ],
-    "active_concerns_update": [
+  "interventions_and_responses": [
       {{{{
-        "id": "String ID",
-        "concern": "Brief description of the concern with update on progression or resolution",
-        "status": "Active / Resolved"
+        "time": "YY-MM-DD HH:MM, or None if no interventions",
+        "intervention": "Intervention name from current window. Write None if no interventions.",
+        "response": "Patient's response to the intervention. Describe any improvement, deterioration, or lack of change in clinical status. Refer to specific physiological parameters if relevant."
       }}}},
       ...
-    ]
+    ],
+  "clinical_assessment": {{{{
+    "physiology_trends": {{{{
+      "hemodynamics": {{{{
+        "status": "improving/stable/deteriorating/fluctuating/insufficient_data",
+        "description": "Desciption of the hemodynamic status. Refer to specific events for justification. "
+      }}}},
+      "respiratory": {{{{
+        "status": "improving/stable/deteriorating/fluctuating/insufficient_data",
+        "description": "Desciption of the respiratory status. Refer to specific events for justification. "
+      }}}},
+      "renal_metabolic": {{{{
+        "status": "improving/stable/deteriorating/fluctuating/insufficient_data",
+        "description": "Desciption of the renal/metabolic status. Refer to specific events for justification. "
+      }}}},
+      "neurology": {{{{
+        "status": "improving/stable/deteriorating/fluctuating/insufficient_data",
+        "description": "Desciption of the neurological status. Refer to specific events for justification. "
+      }}}}
+    }}}},
+    "overall_status": "improving/stable/deteriorating/fluctuating/insufficient_data"
   }}}}
 }}}}
-</response>"""
+</response>
+
+### Critial Events
+These are events that represent significant changes in the patient's clinical course, such as new organ dysfunction, initiation of a major intervention (e.g., intubation, vasopressor start), or a critical lab result. Do not include routine events or minor fluctuations unless they represent a key turning point in the trajectory.
+
+"""
 
 
 def get_memory_agent_prompt(use_thinking: bool = True) -> str:
@@ -82,14 +92,18 @@ def get_memory_agent_prompt(use_thinking: bool = True) -> str:
     Args:
         use_thinking: Whether to include explicit chain of thought section
     """
-    thinking_section = """ALWAYS start with thinking first in <think></think>. Then provide your response in JSON format in <response></response>.
+    thinking_section = (
+        """ALWAYS start with thinking first in <think></think>. Then provide your response in JSON format in <response></response>.
 <think>
 1. Review the window evidence and the existing trajectory.
 2. Determine if this is a new clinical phase (APPEND) or a continuation (MERGE).
 3. If merging, identify the logical "thread" that connects these windows (e.g., "Ongoing fluid resuscitation for septic shock").
 </think>
 
-""" if use_thinking else "Provide your response in JSON format in <response></response>.\n\n"
+"""
+        if use_thinking
+        else "Provide your response in JSON format in <response></response>.\n\n"
+    )
 
     return f"""You are a Memory Management Agent for an ICU clinical decision support system. Your task is to decide how to integrate a new clinical observation into the patient's trajectory history.
 
@@ -152,7 +166,8 @@ def get_reflection_agent_prompt(use_thinking: bool = True) -> str:
     Args:
         use_thinking: Whether to include explicit chain of thought section
     """
-    thinking_section = """ALWAYS start with thinking first in <think></think>. Then provide your response in JSON format in <response></response>.
+    thinking_section = (
+        """ALWAYS start with thinking first in <think></think>. Then provide your response in JSON format in <response></response>.
 
 <think>
 1. Review the previous trajectory to understand the baseline clinical state
@@ -161,7 +176,10 @@ def get_reflection_agent_prompt(use_thinking: bool = True) -> str:
 4. Determine if the summary needs revision
 </think>
 
-""" if use_thinking else "Provide your response in JSON format in <response></response>.\n\n"
+"""
+        if use_thinking
+        else "Provide your response in JSON format in <response></response>.\n\n"
+    )
 
     return f"""You are a Clinical Auditor Agent reviewing trajectory summaries for quality and accuracy. Your task is to verify that the Memory Agent's trajectory summary is clinically sound and evidence-based.
 

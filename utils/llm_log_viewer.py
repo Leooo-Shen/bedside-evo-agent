@@ -48,6 +48,25 @@ def build_pipeline_agents(agent: Any, agent_type: str) -> List[Dict[str, Any]]:
     if agent_type == "remem":
         return [{"name": "remem_agent", "used": True, "thinking": None}]
 
+    if agent_type == "med":
+        return [
+            {
+                "name": "static_memory_builder",
+                "used": bool(getattr(agent, "use_llm_static_compression", False)),
+                "thinking": None,
+            },
+            {
+                "name": "memory_agent",
+                "used": True,
+                "thinking": bool(getattr(agent, "memory_use_thinking", False)),
+            },
+            {
+                "name": "predictor",
+                "used": True,
+                "thinking": bool(getattr(agent, "predictor_use_thinking", False)),
+            },
+        ]
+
     return []
 
 
