@@ -280,10 +280,10 @@ for report in reports:
 
 After processing, the output directory contains:
 
-- `all_oracle_reports.json`: Combined reports for all patients
-- `patient_{id}_icu_{id}_oracle_report.json`: Individual patient reports
-- `patient_trajectories.jsonl`: Intermediate trajectory data
-- `processing_summary.json`: Statistics and metadata
+- `processing_summary.json`: Run-level statistics and metadata
+- `patients/<subject_id>_<icu_stay_id>/oracle_predictions.json`: Per-window parsed Oracle outputs with run/patient metadata
+- `patients/<subject_id>_<icu_stay_id>/llm_calls.json`: Full prompt/response logs for Oracle calls
+- `patients/<subject_id>_<icu_stay_id>/llm_calls.html`: HTML viewer for call logs
 
 ## Oracle Evaluation Framework
 

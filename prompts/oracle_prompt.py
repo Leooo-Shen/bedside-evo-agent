@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 ORACLE_PROMPT_TEMPLATE = """
 You are Oracle, a clinical AI evaluator with hindsight access to a patient's full ICU trajectory including the ICU results.
-Your task is to evaluate a specific local observation window {window_time} using the hindsight knowledge of the ICU trajectory.
+Your task is to evaluate a specific local observation window {window_time} using the hindsight knowledge of the ICU trajectory. Depending on the context, your hindsight can come from ICU discharge summaries or future ICU events. 
 For evaluating this observation window you must produce two assessments:
 
 ## PART 1 — PATIENT STATUS
@@ -31,8 +31,6 @@ Synthesize the overall label by reasoning about the relative clinical weight of 
 Important nuances:
 - Do NOT conflate outcome with care quality. A patient may be deteriorating despite excellent care (e.g., terminal illness, refractory septic shock managed correctly).
 - A patient may be labelled stable or improving even if they eventually die, if the trajectory at this window genuinely reflects that direction.
-- If the case involves expected end-of-life or palliative management, note this explicitly in your reasoning.
-
 
 ## PART 2 — DOCTOR ACTION EVALUATION AND RECOMMENDATIONS
 You will be given a list of clinical actions taken during the {window_time} window.
@@ -47,9 +45,9 @@ Labels: appropriate | suboptimal | potentially_harmful | not_enough_context
 Use your hindsight knowledge from the provided context to inform contextual appropriateness, but be fair: judge the action against what the context reveals, not against impossible foresight.
 If an action was reasonable at the time but later context revealed a missed diagnosis, note this nuance.
 
-After evaluating all actions, provide the top {top_k} recommendations for what the clinical team should have prioritised at this window, grounded in hindsight knowledge of the trajectory.
-Each recommendation must be concrete and actionable (e.g., "Increase norepinephrine dose — MAP trending below 65 despite fluid resuscitation over the next 4 hours"),
-and must reference specific trajectory evidence that justifies it. Do not recommend actions already taken correctly.
+After evaluating all actions, provide maximum top {top_k} recommendations for what the clinical team should have prioritised at this window, grounded in hindsight knowledge of the trajectory.
+Each recommendation must be concrete and actionable (e.g., "Increase norepinephrine dose — MAP trending below 65 despite fluid resuscitation over the next 4 hours"), and must reference specific trajectory evidence that justifies it. Do not recommend actions already taken correctly. 
+If no further recommendations can be made, write null.
 
 
 ## OUTPUT FORMAT
@@ -67,8 +65,7 @@ Output your structured response inside <response></response> tags as valid JSON:
     "overall": {
       "label": "<improving | stable | deteriorating | insufficient_data>",
       "rationale": "<1–3 sentence summary grounded in trajectory evidence>"
-    },
-    "palliative_flag": true | false
+    }
   },
   "action_evaluations": [
     {
@@ -93,10 +90,11 @@ Output your structured response inside <response></response> tags as valid JSON:
   "recommendations": [
     {
       "rank": 1,
-      "action": "<concrete, actionable clinical recommendation>",
-      "rationale": "<1–3 sentences grounded in specific hindsight trajectory evidence>",
+      "action": "<a short name of the recommended action>",
+      "action_description": "<1-2 sentences of the concrete, actionable clinical recommendation>",
+      "rationale": "<1–2 sentences grounded in specific hindsight trajectory evidence>",
       "urgency": "<immediate | within_1h | longterm | optional>"
-    }
+    }, // Or null if no recommendations
   ],
   "overall_window_summary": "<2–4 sentence synthesis of the window: patient direction, care quality, and any critical observations>"
 }
@@ -105,9 +103,6 @@ Output your structured response inside <response></response> tags as valid JSON:
 
 ## PATIENT ICU CONTEXT WINDOW
 {patient_icu_trajectory}
-
-## CURRENT OBSERVATION WINDOW FOR EVALUATION — {window_time}
-{events}
 
 Now, evaluate the CURRENT OBSERVATION WINDOW according to the instructions above.
 """.strip()
@@ -120,10 +115,10 @@ def format_oracle_prompt(
     history_hours: Any = None,
     future_hours: Any = None,
     top_k: Any = None,
+    include_icu_outcome: bool = True,
 ) -> str:
     """Format Oracle prompt with local ICU context window + current raw window."""
     metadata = window_data.get("patient_metadata", {})
-    current_events = window_data.get("current_events", [])
     window_time = _format_window_time(window_data)
     current_hour_since_admission = _safe_float(window_data.get("hours_since_admission"))
     icu_duration_hours = _safe_float(metadata.get("total_icu_duration_hours"))
@@ -137,23 +132,16 @@ def format_oracle_prompt(
         f"- Age: {_format_age(metadata.get('age'))}",
         f"- Total ICU Stay: {icu_duration_hours:.1f} hours",
         f"- Current Hour Since ICU Admission: {current_hour_since_admission:.1f}",
-        f"- ICU Outcome: {outcome_text}",
         f"- Context Mode: {context_mode}",
         f"- Current Window Start: {window_data.get('current_window_start')}",
         f"- Current Window End: {window_data.get('current_window_end')}",
         "",
     ]
+    if include_icu_outcome:
+        patient_context.insert(4, f"- ICU Outcome: {outcome_text}")
     pre_icu_history_lines = _format_pre_icu_history_lines(window_data.get("pre_icu_history"))
 
-    current_window_lines = [f"Total current-window events: {len(current_events)}"]
-    if current_events:
-        for idx, event in enumerate(current_events, start=1):
-            current_window_lines.append(f"CW{idx}. {format_event_line(event)}")
-    else:
-        current_window_lines.append("(No events)")
-
     patient_trajectory = "\n".join([*patient_context, *pre_icu_history_lines, "", context_block]).strip()
-    events = "\n".join(current_window_lines)
 
     prompt = ORACLE_PROMPT_TEMPLATE
     prompt = prompt.replace("{history_hours}", history_hours_text)
@@ -163,7 +151,6 @@ def format_oracle_prompt(
     prompt = prompt.replace("{window_time}", window_time)
     # Backward-compatible token replacement for legacy templates.
     prompt = prompt.replace("{window time}", window_time)
-    prompt = prompt.replace("{events}", events)
     return prompt
 
 

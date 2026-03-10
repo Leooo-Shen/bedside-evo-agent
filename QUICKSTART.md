@@ -103,9 +103,9 @@ After running, check `data/oracle_outputs/`:
    }
    ```
 
-2. **`all_oracle_reports.json`** - All evaluations combined
+2. **`patients/<subject_id>_<icu_stay_id>/oracle_predictions.json`** - Per-window Oracle outputs
 
-3. **`patient_{id}_icu_{id}_oracle_report.json`** - Individual reports
+3. **`patients/<subject_id>_<icu_stay_id>/llm_calls.json`** - Full LLM call logs (plus `llm_calls.html` viewer)
 
 ## Customization
 

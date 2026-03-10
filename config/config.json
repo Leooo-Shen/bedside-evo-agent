@@ -9,11 +9,11 @@
   },
   "data_loading": {
     "agent_observation_hours": 12,
-    "oracle_observation_hours": 12
+    "oracle_observation_hours": null
   },
   "oracle_time_windows": {
     "current_window_hours": 0.5,
-    "window_step_hours": 4,
+    "window_step_hours": 0.5,
     "include_pre_icu_data": true,
     "use_discharge_summary_for_history": true,
     "num_discharge_summaries": 2,
@@ -21,12 +21,13 @@
       "NOTE_RADIOLOGYREPORT",
       "NOTE_DISCHARGESUMMARY"
     ],
-    "pre_icu_history_hours": 72
+    "pre_icu_history_hours": 48
   },
   "oracle_context": {
-    "history_hours": 6,
-    "future_hours": 6,
+    "history_hours": 1,
+    "future_hours": 3,
     "use_discharge_summary": true,
+    "include_icu_outcome_in_prompt": false,
     "top_k_recommendations": 3
   },
   "agent_time_windows": {
@@ -38,9 +39,9 @@
   },
   "llm": {
     "provider": "google",
-    "model": "gemini-2.5-flash-lite",
+    "model": "gemini-3-flash-preview",
     "temperature": 1.0,
-    "max_tokens": 8192
+    "max_tokens": 128000
   },
   "remem": {
     "max_state_length": 1500,

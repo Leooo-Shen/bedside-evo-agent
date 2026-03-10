@@ -1,4 +1,4 @@
-"""Experiment: Analyze Oracle patient status trajectories vs outcomes (unblinded)."""
+"""Experiment: Analyze Oracle patient status trajectories (prompt includes ICU outcome)."""
 
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ def run_oracle_on_patient(
         reports = oracle.evaluate_trajectory(windows, trajectory=trajectory)
 
     print(f"  Completed: {len(reports)} evaluations")
-    oracle.save_trajectory_log(subject_id, icu_stay_id, run_id="unblinded_experiment")
+    oracle.save_trajectory_log(subject_id, icu_stay_id, run_id="with_outcome_experiment")
     return reports
 
 
@@ -120,7 +120,7 @@ def plot_status_trajectories(died_reports: List[OracleReport], survived_reports:
     plt.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
     plt.xlabel("Hours since ICU admission", fontsize=12)
     plt.ylabel("Status Index (mapped)", fontsize=12)
-    plt.title("Oracle Status Trajectory: Survivors vs Non-Survivors (Unblinded)", fontsize=14, fontweight="bold")
+    plt.title("Oracle Status Trajectory: Survivors vs Non-Survivors (With Outcome)", fontsize=14, fontweight="bold")
     plt.legend(fontsize=11)
     plt.grid(True, alpha=0.3)
     plt.ylim(-1.1, 1.1)
@@ -154,7 +154,7 @@ def plot_status_trajectories(died_reports: List[OracleReport], survived_reports:
 
 def main() -> None:
     print("=" * 80)
-    print("EXPERIMENT: Oracle Status Trajectory Analysis (UNBLINDED)")
+    print("EXPERIMENT: Oracle Status Trajectory Analysis (WITH ICU OUTCOME IN PROMPT)")
     print("=" * 80)
 
     timestamp = datetime.now().strftime("%m%d-%H%M")
@@ -178,7 +178,7 @@ def main() -> None:
         provider=config.llm_provider,
         model=config.llm_model,
         temperature=config.llm_temperature,
-        blinded=False,
+        include_icu_outcome_in_prompt=True,
         use_discharge_summary=config.oracle_context_use_discharge_summary,
         history_context_hours=config.oracle_context_history_hours,
         future_context_hours=config.oracle_context_future_hours,
@@ -195,13 +195,13 @@ def main() -> None:
         print("\nERROR: Failed to generate reports for one or both patients")
         return
 
-    died_output = output_dir / f"died_patient_{died_patient['subject_id']}_reports_unblinded.json"
-    survived_output = output_dir / f"survived_patient_{survived_patient['subject_id']}_reports_unblinded.json"
+    died_output = output_dir / f"died_patient_{died_patient['subject_id']}_reports_with_outcome.json"
+    survived_output = output_dir / f"survived_patient_{survived_patient['subject_id']}_reports_with_outcome.json"
 
     save_oracle_reports(died_reports, str(died_output), include_window_data=True)
     save_oracle_reports(survived_reports, str(survived_output), include_window_data=True)
 
-    plot_path = output_dir / "status_trajectory_comparison_unblinded.png"
+    plot_path = output_dir / "status_trajectory_comparison_with_outcome.png"
     plot_status_trajectories(died_reports, survived_reports, str(plot_path))
 
     print("\n" + "=" * 80)

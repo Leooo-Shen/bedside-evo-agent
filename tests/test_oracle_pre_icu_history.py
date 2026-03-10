@@ -207,6 +207,10 @@ def test_pre_icu_fallback_uses_previous_72h_events_only():
     first = windows[0]
     assert first["pre_icu_history_source"] == "events_fallback"
     assert first["pre_icu_history_items"] == len(first["history_events"])
+    fallback_content = first["pre_icu_history"]["content"]
+    assert fallback_content is not None
+    assert "[2024-" not in fallback_content
+    assert "LAB_TEST Lactate =7.20" in fallback_content
 
     earliest = enter - timedelta(hours=72)
     for event in first["history_events"]:
@@ -320,4 +324,7 @@ def test_pre_icu_baseline_snapshot_includes_all_lab_and_vital_events_in_window()
     assert "Heart Rate, bpm" in baseline_content
     assert "Non Invasive Blood Pressure mean, mmHg" in baseline_content
     assert "Lactic Acid, mmol/L" not in baseline_content
+    assert "[2024-" not in baseline_content
+    assert "=2.30" in baseline_content
+    assert "=8.50" in baseline_content
     assert first["pre_icu_history"]["baseline_events_count"] == 4

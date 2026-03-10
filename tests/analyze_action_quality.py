@@ -168,9 +168,13 @@ def main() -> None:
 
     print(f"\nAnalyzing results from: {results_dir}")
 
-    for mode in ["unblinded", "blinded"]:
+    mode_labels = {
+        "with_outcome": "WITH ICU OUTCOME IN PROMPT",
+        "without_outcome": "WITHOUT ICU OUTCOME IN PROMPT",
+    }
+    for mode in ["with_outcome", "without_outcome"]:
         print(f"\n{'=' * 80}")
-        print(f"ANALYZING {mode.upper()} ORACLE")
+        print(f"ANALYZING ORACLE: {mode_labels.get(mode, mode.upper())}")
         print("=" * 80)
 
         died_file, surv_file = find_report_files(results_dir, mode)
@@ -195,7 +199,7 @@ def main() -> None:
             died_data,
             surv_data,
             output_path,
-            title_suffix=f" ({mode.capitalize()})",
+            title_suffix=f" ({mode_labels.get(mode, mode)})",
         )
 
         print("\n" + "=" * 80)

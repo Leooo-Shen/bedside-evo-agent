@@ -168,6 +168,20 @@ class Config:
         return self.get("oracle_context.use_discharge_summary", False)
 
     @property
+    def oracle_context_include_icu_outcome_in_prompt(self) -> bool:
+        """Whether Oracle prompt context should include explicit ICU outcome (survived/died)."""
+        value = self.get("oracle_context.include_icu_outcome_in_prompt", True)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"true", "1", "yes", "y", "on"}:
+                return True
+            if text in {"false", "0", "no", "n", "off"}:
+                return False
+        return bool(value)
+
+    @property
     def oracle_context_top_k_recommendations(self) -> int:
         """Top-k recommendation count requested in Oracle prompt output."""
         value = self.get("oracle_context.top_k_recommendations", 3)

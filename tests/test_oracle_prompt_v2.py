@@ -45,11 +45,11 @@ def test_format_oracle_prompt_contains_required_blocks():
     )
 
     assert "PATIENT ICU CONTEXT WINDOW" in prompt
-    assert "CURRENT OBSERVATION WINDOW FOR EVALUATION" in prompt
+    assert "## CURRENT OBSERVATION WINDOW FOR EVALUATION" not in prompt
     assert "{top_k}" not in prompt
     assert "{window_time}" not in prompt
+    assert "{events}" not in prompt
     assert "top 4 recommendations" in prompt
-    assert "CW1." in prompt
     assert "Total ICU Stay: 120.0 hours" in prompt
     assert "Current Hour Since ICU Admission: 1.0" in prompt
     assert "ICU Outcome: Died after ICU" in prompt
@@ -80,3 +80,22 @@ def test_format_oracle_prompt_with_missing_pre_icu_history():
 
     assert "## PRE-ICU HISTORY" in prompt
     assert "No pre-ICU history provided." in prompt
+
+
+def test_format_oracle_prompt_can_hide_icu_outcome():
+    window_data = {
+        "hours_since_admission": 2.0,
+        "current_window_start": "2024-01-01T02:00:00",
+        "current_window_end": "2024-01-01T02:30:00",
+        "patient_metadata": {"age": 70.0, "total_icu_duration_hours": 24.0, "survived": True},
+        "current_events": [],
+    }
+
+    prompt = format_oracle_prompt(
+        window_data=window_data,
+        context_block="Context",
+        context_mode="raw_local_trajectory_icu_events_only",
+        include_icu_outcome=False,
+    )
+
+    assert "ICU Outcome:" not in prompt

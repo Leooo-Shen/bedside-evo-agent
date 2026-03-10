@@ -101,6 +101,22 @@ def _build_trajectory() -> dict:
     }
 
 
+def _build_trajectory_with_leaky_discharge_summary() -> dict:
+    trajectory = _build_trajectory()
+    for event in trajectory["events"]:
+        if event.get("code") != "NOTE_DISCHARGESUMMARY":
+            continue
+        event["code_specifics"] = "Expired note"
+        event["text_value"] = (
+            "Brief Hospital Course: Patient required escalating support. "
+            "Discharge Disposition: Expired "
+            "Discharge Diagnosis: Septic shock and multi-organ failure. "
+            "Discharge Condition: Deceased. "
+            "Post-ICU comments: comfort measures were discussed and family noted patient passed away."
+        )
+    return trajectory
+
+
 def test_context_window_uses_current_window_start_anchor(monkeypatch):
     monkeypatch.setattr(oracle_module, "LLMClient", FakeLLMClient)
     oracle = oracle_module.MetaOracle(
@@ -128,9 +144,11 @@ def test_context_window_uses_current_window_start_anchor(monkeypatch):
     assert "MAP_101h" not in context["context_text"]
     assert "## HISTORY EVENTS OF CURRENT WINDOW" in context["context_text"]
     assert "## CURRENT OBSERVATION WINDOW FOR EVALUATION" in context["context_text"]
+    assert "Current window duration (hours): 0.50" in context["context_text"]
     assert "## FUTURE EVENTS" in context["context_text"]
     assert "MAP_1h" in context["context_text"]
-    assert "Norepinephrine" not in context["context_text"]
+    assert "CW1." in context["context_text"]
+    assert "Norepinephrine" in context["context_text"]
     assert "META_DEATH" in context["context_text"]
     assert "NOTE_DISCHARGESUMMARY" not in context["context_text"]
 
@@ -164,6 +182,56 @@ def test_use_discharge_summary_can_include_summary_block(monkeypatch):
     assert "Discharge summary scope: [2024-01-01T00:00:00, 2024-01-06T00:00:00]" in context["context_text"]
     assert "## HISTORY EVENTS OF CURRENT WINDOW" in context["context_text"]
     assert "## CURRENT OBSERVATION WINDOW FOR EVALUATION" in context["context_text"]
+    assert "Current window duration (hours): 0.50" in context["context_text"]
     assert "## FUTURE EVENTS" in context["context_text"]
-    assert "Norepinephrine" not in context["context_text"]
+    assert "CW1." in context["context_text"]
+    assert "Norepinephrine" in context["context_text"]
     assert "Discharge summary outside bounded context window." in context["context_text"]
+
+
+def test_discharge_summary_not_filtered_when_outcome_is_in_prompt(monkeypatch):
+    monkeypatch.setattr(oracle_module, "LLMClient", FakeLLMClient)
+    oracle = oracle_module.MetaOracle(
+        provider="openai",
+        model="fake-model",
+        use_discharge_summary=True,
+        include_icu_outcome_in_prompt=True,
+        history_context_hours=48,
+        future_context_hours=48,
+    )
+    trajectory = _build_trajectory_with_leaky_discharge_summary()
+    window_data = {
+        "current_window_start": "2024-01-02T06:00:00",
+        "current_window_end": "2024-01-02T06:30:00",
+    }
+
+    context = oracle.prepare_context(trajectory, window_data)
+
+    assert "Discharge Disposition: Expired" in context["context_text"]
+    assert "Discharge Condition: Deceased" in context["context_text"]
+    assert "[OUTCOME_MASKED]" not in context["context_text"]
+
+
+def test_discharge_summary_is_filtered_when_outcome_hidden(monkeypatch):
+    monkeypatch.setattr(oracle_module, "LLMClient", FakeLLMClient)
+    oracle = oracle_module.MetaOracle(
+        provider="openai",
+        model="fake-model",
+        use_discharge_summary=True,
+        include_icu_outcome_in_prompt=False,
+        history_context_hours=48,
+        future_context_hours=48,
+    )
+    trajectory = _build_trajectory_with_leaky_discharge_summary()
+    window_data = {
+        "current_window_start": "2024-01-02T06:00:00",
+        "current_window_end": "2024-01-02T06:30:00",
+    }
+
+    context = oracle.prepare_context(trajectory, window_data)
+
+    assert "Discharge Disposition:" not in context["context_text"]
+    assert "Discharge Condition:" not in context["context_text"]
+    assert "[OUTCOME_MASKED]" in context["context_text"]
+    assert "passed away" not in context["context_text"].lower()
+    assert "comfort measures" not in context["context_text"].lower()

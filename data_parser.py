@@ -198,6 +198,29 @@ class PreICUHistoryProcessor:
 
         return selected
 
+    @staticmethod
+    def _format_numeric_value(value: Any) -> str:
+        """Match ICU event numeric formatting in prompt lines."""
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    @classmethod
+    def _format_pre_icu_event_line(cls, event: Dict[str, Any]) -> str:
+        """Format pre-ICU fallback/baseline events consistently with ICU event style."""
+        pieces = [str(event.get("code") or "UNKNOWN")]
+        specifics = event.get("code_specifics")
+        if specifics:
+            pieces.append(str(specifics))
+        if event.get("numeric_value") is not None:
+            pieces.append(f"={cls._format_numeric_value(event.get('numeric_value'))}")
+        if event.get("text_value"):
+            pieces.append(str(event["text_value"]))
+
+        time_text = str(event.get("time", "unknown"))
+        return f"{time_text} {' '.join(pieces)}".strip()
+
     def extract_fallback_events(
         self,
         trajectory: Dict,
@@ -245,16 +268,7 @@ class PreICUHistoryProcessor:
             )
         ]
         for idx, event in enumerate(pre_icu_fallback_history_events, start=1):
-            pieces = [str(event.get("code") or "UNKNOWN")]
-            specifics = event.get("code_specifics")
-            if specifics:
-                pieces.append(str(specifics))
-            if event.get("numeric_value") is not None:
-                pieces.append(f"={event['numeric_value']}")
-            if event.get("text_value"):
-                pieces.append(str(event["text_value"]))
-            time_text = event.get("time", "unknown")
-            lines.append(f"P{idx}. [{time_text}] {' '.join(pieces)}")
+            lines.append(f"P{idx}. {PreICUHistoryProcessor._format_pre_icu_event_line(event)}")
         return "\n".join(lines)
 
     def extract_pre_icu_vital_lab_events(
@@ -305,16 +319,7 @@ class PreICUHistoryProcessor:
             )
         ]
         for idx, event in enumerate(pre_icu_baseline_events, start=1):
-            pieces = [str(event.get("code") or "UNKNOWN")]
-            specifics = event.get("code_specifics")
-            if specifics:
-                pieces.append(str(specifics))
-            if event.get("numeric_value") is not None:
-                pieces.append(f"={event['numeric_value']}")
-            if event.get("text_value"):
-                pieces.append(str(event["text_value"]))
-            time_text = event.get("time", "unknown")
-            lines.append(f"B{idx}. [{time_text}] {' '.join(pieces)}")
+            lines.append(f"B{idx}. {PreICUHistoryProcessor._format_pre_icu_event_line(event)}")
         return "\n".join(lines)
 
     def build_history_context(
