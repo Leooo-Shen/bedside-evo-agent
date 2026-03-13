@@ -98,8 +98,6 @@ def _build_observer_cache_metadata(config, subject_id: int, icu_stay_id: int, wi
         "data_source": {
             "events_path": config.events_path,
             "icu_stay_path": config.icu_stay_path,
-            "de_identify": config.get("data.de_identify", False),
-            "de_identify_seed": config.get("data.de_identify_seed", None),
         },
         "window_signature": window_signature,
     }

@@ -145,7 +145,7 @@ def plot_patient_status_trajectory(patient_results: Dict, output_path: Optional[
     severity_numeric = [severity_map.get(s, 0.0) for s in severity_categories]
 
     # Convert trajectory to numeric
-    trajectory_map = {"improving": 1, "stable": 0, "deteriorating": -1, "unknown": 0}
+    trajectory_map = {"improving": 1, "stable": 0.5, "deteriorating": -1, "unknown": 0}
     trajectory_numeric = [trajectory_map.get(t, 0) for t in trajectories]
 
     # Create figure

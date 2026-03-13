@@ -46,6 +46,7 @@ class LLMClient:
         max_retries: int = 3,
         retry_base_delay_seconds: float = 1.0,
         retry_max_delay_seconds: float = 30.0,
+        request_timeout_seconds: float = 300.0,
     ):
         """
         Initialize LLM client.
@@ -59,6 +60,7 @@ class LLMClient:
             max_retries: Maximum number of retries for transient API errors
             retry_base_delay_seconds: Base backoff delay in seconds
             retry_max_delay_seconds: Maximum backoff delay in seconds
+            request_timeout_seconds: Per-request timeout for provider API calls
         """
         self.provider = provider.lower()
         self.temperature = temperature
@@ -66,6 +68,7 @@ class LLMClient:
         self.max_retries = max_retries
         self.retry_base_delay_seconds = retry_base_delay_seconds
         self.retry_max_delay_seconds = retry_max_delay_seconds
+        self.request_timeout_seconds = request_timeout_seconds
 
         if self.provider == "anthropic":
             self.model = model or "claude-3-5-sonnet-20241022"
@@ -89,7 +92,13 @@ class LLMClient:
                 raise ValueError("GOOGLE_API_KEY (or GEMINI_API_KEY) not found in environment")
             if google_genai_sdk is not None:
                 self.google_sdk = "google_genai"
-                self.client = google_genai_sdk.Client(api_key=api_key)
+                client_kwargs: Dict[str, Any] = {"api_key": api_key}
+                timeout_seconds = self._resolve_timeout_seconds()
+                if timeout_seconds is not None and hasattr(google_genai_sdk, "types"):
+                    # google-genai HttpOptions.timeout is in milliseconds.
+                    timeout_millis = max(int(timeout_seconds * 1000.0), 10_000)
+                    client_kwargs["http_options"] = google_genai_sdk.types.HttpOptions(timeout=timeout_millis)
+                self.client = google_genai_sdk.Client(**client_kwargs)
             elif google_generativeai_sdk is not None:
                 self.google_sdk = "google_generativeai"
                 google_generativeai_sdk.configure(api_key=api_key)
@@ -117,6 +126,7 @@ class LLMClient:
         Returns:
             Dictionary with 'content' and optionally 'parsed' (for JSON responses)
         """
+
         def _single_attempt() -> Dict[str, Any]:
             if self.provider == "anthropic":
                 return self._chat_anthropic(prompt, system_prompt, response_format, **kwargs)
@@ -158,6 +168,9 @@ class LLMClient:
             "too many requests",
             "resource_exhausted",
             "high demand",
+            "deadline exceeded",
+            "timed out",
+            "timeout",
             "please try again later",
             "temporarily unavailable",
             "service unavailable",
@@ -165,6 +178,18 @@ class LLMClient:
             '"status": "unavailable"',
         )
         return any(marker in message for marker in retry_markers)
+
+    def _resolve_timeout_seconds(self, **kwargs) -> Optional[float]:
+        timeout_value = kwargs.get("timeout_seconds", kwargs.get("timeout", self.request_timeout_seconds))
+        if timeout_value is None:
+            return None
+        try:
+            timeout_seconds = float(timeout_value)
+        except (TypeError, ValueError):
+            return None
+        if timeout_seconds <= 0:
+            return None
+        return timeout_seconds
 
     def _extract_status_code(self, error: Exception) -> Optional[int]:
         """Extract HTTP status code from SDK exceptions when available."""
@@ -252,6 +277,10 @@ class LLMClient:
             request_params["max_completion_tokens"] = max_tokens_value
         else:
             request_params["max_tokens"] = max_tokens_value
+
+        timeout_seconds = self._resolve_timeout_seconds(**kwargs)
+        if timeout_seconds is not None:
+            request_params["timeout"] = timeout_seconds
 
         # Add JSON mode if requested
         if response_format == "json":
@@ -359,9 +388,16 @@ class LLMClient:
         else:
             model = self.client.GenerativeModel(model_name=self.model)
 
+        generate_content_kwargs: Dict[str, Any] = {
+            "generation_config": generation_config,
+        }
+        timeout_seconds = self._resolve_timeout_seconds(**kwargs)
+        if timeout_seconds is not None:
+            generate_content_kwargs["request_options"] = {"timeout": timeout_seconds}
+
         response = model.generate_content(
             prompt,
-            generation_config=generation_config,
+            **generate_content_kwargs,
         )
 
         content = ""

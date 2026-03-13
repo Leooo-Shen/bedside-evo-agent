@@ -37,7 +37,13 @@ def test_format_oracle_prompt_contains_required_blocks():
 
     prompt = format_oracle_prompt(
         window_data=window_data,
-        context_block="Context type: full raw trajectory\nCTX1. ...",
+        context_block=(
+            "## CURRENT DISCHARGE SUMMARY\n"
+            "(No ICU-stay-matched discharge summary found)\n\n"
+            "## ICU TRAJECTORY CONTEXT WINDOW\n"
+            "Context type: full raw trajectory\n"
+            "CTX1. ..."
+        ),
         context_mode="raw_local_trajectory_icu_events_only",
         history_hours=12,
         future_hours=6,
@@ -49,16 +55,22 @@ def test_format_oracle_prompt_contains_required_blocks():
     assert "{top_k}" not in prompt
     assert "{window_time}" not in prompt
     assert "{events}" not in prompt
-    assert "top 4 recommendations" in prompt
+    assert "top 4 clinical recommendations" in prompt
     assert "Total ICU Stay: 120.0 hours" in prompt
     assert "Current Hour Since ICU Admission: 1.0" in prompt
     assert "ICU Outcome: Died after ICU" in prompt
     assert "Context Mode: raw_local_trajectory_icu_events_only" in prompt
-    assert "## PRE-ICU HISTORY" in prompt
+    assert prompt.count("## CURRENT DISCHARGE SUMMARY") == 1
+    assert "(No ICU-stay-matched discharge summary found)" in prompt
+    assert "## HISTORICAL PRE-ICU REPORTS" in prompt
     assert "--- Report 1: Discharge Summary ---" in prompt
     assert "prior admission summary" in prompt
     assert "## PRE-ICU BASELINE SNAPSHOT" in prompt
     assert "Baseline labs ..." in prompt
+    assert prompt.index("## PATIENT ICU CONTEXT WINDOW") < prompt.index("## Patient Context")
+    assert prompt.index("## Patient Context") < prompt.index("## HISTORICAL PRE-ICU REPORTS")
+    assert prompt.index("## HISTORICAL PRE-ICU REPORTS") < prompt.index("## PRE-ICU BASELINE SNAPSHOT")
+    assert prompt.index("## PRE-ICU BASELINE SNAPSHOT") < prompt.index("## CURRENT DISCHARGE SUMMARY")
     assert '"action_evaluations"' in prompt
     assert '"overall_window_summary"' in prompt
 
@@ -74,12 +86,20 @@ def test_format_oracle_prompt_with_missing_pre_icu_history():
 
     prompt = format_oracle_prompt(
         window_data=window_data,
-        context_block="Context type: full raw trajectory\n(No ICU trajectory events)",
+        context_block=(
+            "## CURRENT DISCHARGE SUMMARY\n"
+            "(No ICU-stay-matched discharge summary found)\n\n"
+            "## ICU TRAJECTORY CONTEXT WINDOW\n"
+            "Context type: full raw trajectory\n"
+            "(No ICU trajectory events)"
+        ),
         context_mode="raw_local_trajectory_icu_events_only",
     )
 
-    assert "## PRE-ICU HISTORY" in prompt
-    assert "No pre-ICU history provided." in prompt
+    assert prompt.count("## CURRENT DISCHARGE SUMMARY") == 1
+    assert "(No ICU-stay-matched discharge summary found)" in prompt
+    assert "## HISTORICAL PRE-ICU REPORTS" in prompt
+    assert "No historical pre-ICU reports provided." in prompt
 
 
 def test_format_oracle_prompt_can_hide_icu_outcome():

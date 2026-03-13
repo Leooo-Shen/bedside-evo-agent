@@ -1,5 +1,4 @@
 import json
-import random
 import re
 import sys
 from datetime import datetime, timedelta
@@ -8,6 +7,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import pandas as pd
 
 sys.path.append("..")  # Add parent directory to path for imports
+from utils.discharge_summary_selector import select_discharge_summaries_for_icu_stays
 
 VITAL_CODE = "VITALS"
 
@@ -141,8 +141,17 @@ class PreICUHistoryProcessor:
             report_code = str(report.get("code") or "UNKNOWN")
             report_title = "Discharge Summary" if report_code == "NOTE_DISCHARGESUMMARY" else report_code
             hours_before = report.get("hours_before_current_icu")
-            hours_text = f"{float(hours_before):.1f}" if isinstance(hours_before, (int, float)) else "unknown"
-            days_text = f"{float(hours_before) / 24.0:.1f}" if isinstance(hours_before, (int, float)) else "unknown"
+            relation_text = "relative to ICU admission: unknown"
+            if isinstance(hours_before, (int, float)):
+                signed_hours = float(hours_before)
+                if signed_hours >= 0:
+                    relation_text = (
+                        f"{signed_hours / 24.0:.1f} days / {signed_hours:.1f} hours before ICU admission"
+                    )
+                else:
+                    relation_text = (
+                        f"{abs(signed_hours) / 24.0:.1f} days / {abs(signed_hours):.1f} hours after ICU admission"
+                    )
 
             timestamp_text = "unknown"
             raw_time = report.get("time")
@@ -159,7 +168,7 @@ class PreICUHistoryProcessor:
             lines.append(
                 (
                     f"--- Report {i}: {report_title} "
-                    f"(timestamp: {timestamp_text}; {days_text} days / {hours_text} hours before ICU admission) ---"
+                    f"(timestamp: {timestamp_text}; {relation_text}) ---"
                 )
             )
 
@@ -361,12 +370,16 @@ class PreICUHistoryProcessor:
             report_candidates,
             per_code_cap=per_code_cap,
         )
+        historical_discharge_summary_items = int(
+            sum(1 for report in selected_reports if str(report.get("code") or "").strip() == "NOTE_DISCHARGESUMMARY")
+        )
 
         if selected_reports:
             content = self.format_reports_content(selected_reports)
             return {
                 "source": "reports",
                 "items": len(selected_reports),
+                "historical_discharge_summary_items": historical_discharge_summary_items,
                 "content": content,
                 "fallback_history_events": [],
                 "per_code_cap": per_code_cap,
@@ -388,6 +401,7 @@ class PreICUHistoryProcessor:
             return {
                 "source": "events_fallback",
                 "items": len(pre_icu_fallback_history_events),
+                "historical_discharge_summary_items": 0,
                 "content": content,
                 "fallback_history_events": pre_icu_fallback_history_events,
                 "per_code_cap": per_code_cap,
@@ -399,6 +413,7 @@ class PreICUHistoryProcessor:
         return {
             "source": "none",
             "items": 0,
+            "historical_discharge_summary_items": 0,
             "content": None,
             "fallback_history_events": [],
             "per_code_cap": per_code_cap,
@@ -420,8 +435,8 @@ class MIMICDataParser:
         self,
         events_path: str,
         icu_stay_path: str,
-        de_identify: bool = False,
-        de_identify_seed: Optional[int] = None,
+        discharge_summary_max_days_after_leave: float = 7.0,
+        require_discharge_summary_for_icu_stays: bool = True,
     ):
         """
         Initialize the parser with paths to MIMIC-demo data files.
@@ -429,27 +444,80 @@ class MIMICDataParser:
         Args:
             events_path: Path to events parquet file (e.g., data/mimic-demo/events/data_0.parquet)
             icu_stay_path: Path to ICU stay parquet file (e.g., data/mimic-demo/icu_stay/data_0.parquet)
-            de_identify: If True, de-identify patient IDs and shift timestamps to prevent data memorization
-            de_identify_seed: Random seed for de-identification (for reproducibility)
+            discharge_summary_max_days_after_leave: Selector window for post-ICU discharge summary matching.
+            require_discharge_summary_for_icu_stays: Keep only ICU stays with selector-linked discharge
+                summary available. ICU stays without extractable summary are skipped.
         """
+        if discharge_summary_max_days_after_leave <= 0:
+            raise ValueError("discharge_summary_max_days_after_leave must be > 0")
+
         self.events_path = events_path
         self.icu_stay_path = icu_stay_path
         self.events_df = None
         self.icu_stay_df = None
 
-        # De-identification settings
-        self.de_identify = de_identify
-        self.de_identify_seed = de_identify_seed
-        self._deidentify_mappings = {}  # Store mappings for consistency
-        self._timestamp_shift = None  # Will be set when first patient is processed
         self._relevant_vitals_cache: Dict[int, Dict[str, List[str]]] = {}
+        self.discharge_summary_max_days_after_leave = float(discharge_summary_max_days_after_leave)
+        self.require_discharge_summary_for_icu_stays = bool(require_discharge_summary_for_icu_stays)
+        self.discharge_summary_selection_df: Optional[pd.DataFrame] = None
+        self._selected_discharge_summary_map: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self.pre_icu_history_processor = PreICUHistoryProcessor(
             events_df_getter=lambda: self.events_df,
             clean_events_fn=self._clean_events_list,
         )
 
-        if self.de_identify and self.de_identify_seed is not None:
-            random.seed(self.de_identify_seed)
+    def _compute_discharge_summary_selection(self, icu_stay_df: pd.DataFrame) -> pd.DataFrame:
+        """Run discharge-summary selector for a given ICU-stay table."""
+        if self.events_df is None:
+            return pd.DataFrame()
+        if icu_stay_df is None or len(icu_stay_df) == 0:
+            return pd.DataFrame()
+
+        selection_df = select_discharge_summaries_for_icu_stays(
+            events_df=self.events_df,
+            icu_stay_df=icu_stay_df,
+            max_days_after_leave=self.discharge_summary_max_days_after_leave,
+        ).copy()
+        if len(selection_df) == 0:
+            return selection_df
+
+        selection_df["subject_id"] = pd.to_numeric(selection_df["subject_id"], errors="coerce").astype("Int64")
+        selection_df["icu_stay_id"] = pd.to_numeric(selection_df["icu_stay_id"], errors="coerce").astype("Int64")
+        selection_df["enter_time"] = pd.to_datetime(selection_df["enter_time"], errors="coerce")
+        selection_df["leave_time"] = pd.to_datetime(selection_df["leave_time"], errors="coerce")
+        selection_df["selected_note_time"] = pd.to_datetime(selection_df["selected_note_time"], errors="coerce")
+        selection_df["stay_hosp_stay_id"] = pd.to_numeric(selection_df["stay_hosp_stay_id"], errors="coerce").astype(
+            "Int64"
+        )
+        selection_df["selected_note_hosp_stay_id"] = pd.to_numeric(
+            selection_df["selected_note_hosp_stay_id"], errors="coerce"
+        ).astype("Int64")
+        return selection_df
+
+    def _build_selected_discharge_summary_map(self) -> None:
+        """Build (subject_id, icu_stay_id) -> selected discharge summary lookup map."""
+        self._selected_discharge_summary_map = {}
+        if self.discharge_summary_selection_df is None or len(self.discharge_summary_selection_df) == 0:
+            return
+
+        selected_rows = self.discharge_summary_selection_df[self.discharge_summary_selection_df["selected"] == True]  # noqa: E712
+        for _, row in selected_rows.iterrows():
+            if pd.isna(row.get("subject_id")) or pd.isna(row.get("icu_stay_id")):
+                continue
+            key = (int(row["subject_id"]), int(row["icu_stay_id"]))
+            note_time = row.get("selected_note_time")
+            self._selected_discharge_summary_map[key] = {
+                "time": note_time.isoformat() if pd.notna(note_time) else None,
+                "text_value": row.get("selected_note_text_value"),
+                "code_specifics": row.get("selected_note_code_specifics"),
+                "hosp_stay_id": row.get("selected_note_hosp_stay_id"),
+                "selection_rule": row.get("selection_rule"),
+                "delta_hours_after_leave": row.get("selected_note_delta_hours_after_leave"),
+            }
+
+    def _selected_discharge_summary_for_stay(self, subject_id: int, icu_stay_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch selected discharge summary metadata for one ICU stay."""
+        return self._selected_discharge_summary_map.get((int(subject_id), int(icu_stay_id)))
 
     def load_data(self):
         """Load the MIMIC-demo datasets into memory."""
@@ -485,79 +553,49 @@ class MIMICDataParser:
         # Sort by subject_id and enter_time for consistent ordering
         self.icu_stay_df = self.icu_stay_df.sort_values(["subject_id", "enter_time"]).reset_index(drop=True)
 
+        selection_df = self._compute_discharge_summary_selection(self.icu_stay_df)
+        if self.require_discharge_summary_for_icu_stays:
+            selected_pairs = {
+                (int(row["subject_id"]), int(row["icu_stay_id"]))
+                for _, row in selection_df.iterrows()
+                if row.get("selected") == True  # noqa: E712
+                and pd.notna(row.get("subject_id"))
+                and pd.notna(row.get("icu_stay_id"))
+            }
+
+            before_require_filter = len(self.icu_stay_df)
+            if selected_pairs:
+                self.icu_stay_df = self.icu_stay_df[
+                    self.icu_stay_df.apply(
+                        lambda stay: (int(stay["subject_id"]), int(stay["icu_stay_id"])) in selected_pairs,
+                        axis=1,
+                    )
+                ].reset_index(drop=True)
+            else:
+                self.icu_stay_df = self.icu_stay_df.iloc[0:0].copy()
+
+            removed_without_summary = before_require_filter - len(self.icu_stay_df)
+            if removed_without_summary > 0:
+                print(f"Filtered out {removed_without_summary} ICU stays without extractable discharge summary")
+
+            if len(selection_df) > 0:
+                selection_df = selection_df[selection_df["selected"] == True].reset_index(drop=True)  # noqa: E712
+
         # Count patients with multiple ICU stays
         multiple_stays = self.icu_stay_df.groupby("subject_id").size()
         patients_with_multiple_stays = (multiple_stays > 1).sum()
         total_stays = len(self.icu_stay_df)
         unique_patients = len(multiple_stays)
 
+        self.discharge_summary_selection_df = selection_df
+        self._build_selected_discharge_summary_map()
+        selected_summaries = len(self._selected_discharge_summary_map)
+
         print(
             f"Loaded {len(self.events_df)} events and {total_stays} ICU stays from {unique_patients} unique patients"
         )
         print(f"  - Patients with multiple ICU stays: {patients_with_multiple_stays}")
-
-    def _generate_timestamp_shift(self) -> timedelta:
-        """
-        Generate a random timestamp shift for de-identification.
-
-        Shifts timestamps by a random number of years (±3-7 years) and days (±0-364 days)
-        to prevent potential data memorization while preserving relative time differences.
-
-        Returns:
-            timedelta object representing the shift
-        """
-        if self._timestamp_shift is None:
-            # Shift by 3-7 years (randomly positive or negative)
-            years_shift = random.randint(3, 7) * random.choice([-1, 1])
-            # Add random days (0-364)
-            days_shift = random.randint(0, 364)
-
-            total_days = years_shift * 365 + days_shift
-            self._timestamp_shift = timedelta(days=total_days)
-
-            if self.de_identify:
-                print(f"  De-identification: Shifting timestamps by {years_shift} years and {days_shift} days")
-
-        return self._timestamp_shift
-
-    def _deidentify_patient_id(self, patient_id: int, id_type: str = "subject") -> int:
-        """
-        De-identify a patient ID by generating a consistent random ID.
-
-        Args:
-            patient_id: Original patient ID
-            id_type: Type of ID ("subject" or "icu_stay")
-
-        Returns:
-            De-identified patient ID
-        """
-        key = f"{id_type}_{patient_id}"
-
-        if key not in self._deidentify_mappings:
-            # Generate a random ID in a different range to avoid collisions
-            # Use hash to ensure consistency if seed is set
-            if self.de_identify_seed is not None:
-                # Deterministic based on original ID and seed
-                hash_val = hash((patient_id, id_type, self.de_identify_seed))
-                self._deidentify_mappings[key] = abs(hash_val) % 90000000 + 10000000
-            else:
-                # Random ID
-                self._deidentify_mappings[key] = random.randint(10000000, 99999999)
-
-        return self._deidentify_mappings[key]
-
-    def _deidentify_timestamp(self, timestamp: datetime) -> datetime:
-        """
-        De-identify a timestamp by applying a consistent shift.
-
-        Args:
-            timestamp: Original timestamp
-
-        Returns:
-            Shifted timestamp
-        """
-        shift = self._generate_timestamp_shift()
-        return timestamp + shift
+        print(f"  - ICU stays with selected discharge summary: {selected_summaries}")
 
     def get_patient_trajectory(
         self,
@@ -614,32 +652,18 @@ class MIMICDataParser:
         if len(gender_events) > 0:
             gender = gender_events.iloc[0].get("code_specifics", None)
 
-        # Apply de-identification if enabled
-        if self.de_identify:
-            deidentified_subject_id = self._deidentify_patient_id(subject_id, "subject")
-            deidentified_icu_stay_id = self._deidentify_patient_id(icu_stay_id, "icu_stay")
-            enter_time_deidentified = self._deidentify_timestamp(icu_stay["enter_time"])
-            leave_time_deidentified = self._deidentify_timestamp(icu_stay["leave_time"])
-            death_time_deidentified = (
-                self._deidentify_timestamp(icu_stay["death_time"]) if pd.notna(icu_stay["death_time"]) else None
-            )
-        else:
-            deidentified_subject_id = int(subject_id)
-            deidentified_icu_stay_id = int(icu_stay_id)
-            enter_time_deidentified = icu_stay["enter_time"]
-            leave_time_deidentified = icu_stay["leave_time"]
-            death_time_deidentified = icu_stay["death_time"] if pd.notna(icu_stay["death_time"]) else None
+        death_time = icu_stay["death_time"] if pd.notna(icu_stay["death_time"]) else None
 
         trajectory = {
-            "subject_id": deidentified_subject_id,
-            "icu_stay_id": deidentified_icu_stay_id,
-            "enter_time": enter_time_deidentified.isoformat(),
-            "leave_time": leave_time_deidentified.isoformat(),
+            "subject_id": int(subject_id),
+            "icu_stay_id": int(icu_stay_id),
+            "enter_time": icu_stay["enter_time"].isoformat(),
+            "leave_time": icu_stay["leave_time"].isoformat(),
             "age_at_admission": float(age_at_admission),
             "gender": gender,
             "icu_duration_hours": float(icu_stay["icu_duration_hours"]),
             "survived": bool(icu_stay["survived"]),
-            "death_time": death_time_deidentified.isoformat() if death_time_deidentified else None,
+            "death_time": death_time.isoformat() if death_time is not None else None,
             "readmission": pd.notna(icu_stay["readm_time"]),
             "readm_duration_hours": (
                 float(icu_stay["readm_duration_hours"]) if pd.notna(icu_stay["readm_duration_hours"]) else None
@@ -675,9 +699,6 @@ class MIMICDataParser:
             # Format time as YYYY-MM-DD HH:MM:SS to preserve second-level precision.
             try:
                 time_dt = pd.to_datetime(event["time"])
-                # Apply de-identification if enabled
-                if self.de_identify:
-                    time_dt = self._deidentify_timestamp(time_dt)
                 cleaned["time"] = time_dt.strftime("%Y-%m-%d %H:%M:%S")
             except:
                 cleaned["time"] = str(event["time"])
@@ -686,9 +707,6 @@ class MIMICDataParser:
             # Format end time as YYYY-MM-DD HH:MM:SS to preserve second-level precision.
             try:
                 end_dt = pd.to_datetime(event["end"])
-                # Apply de-identification if enabled
-                if self.de_identify:
-                    end_dt = self._deidentify_timestamp(end_dt)
                 cleaned["end_time"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
             except:
                 cleaned["end_time"] = str(event["end"])
@@ -989,7 +1007,8 @@ class MIMICDataParser:
         Each window contains:
         - History: All events before current window start
           If include_pre_icu_data is True, includes pre-ICU hospital events
-          If use_discharge_summary_for_history is True, uses discharge summary instead
+          If use_discharge_summary_for_history is True, uses pre-ICU report history
+          (including historical pre-ICU discharge summaries) instead of raw history events
         - Current: Events from current_start to (current_start + current_window_hours)
         - Metadata: Patient info and outcome
 
@@ -1007,9 +1026,10 @@ class MIMICDataParser:
                                          When set, only creates windows within the first N hours after ICU admission
                                          Example: use_first_n_hours_after_icu=12 uses only first 12 hours
                                          When None, uses the full ICU duration (or until outcome event)
-            use_discharge_summary_for_history: Use NOTE_DISCHARGESUMMARY content as history context
-                                               instead of history events (default False)
-                                               Falls back to pre-ICU events if no prioritized reports found
+            use_discharge_summary_for_history: Use pre-ICU report content as history context
+                                               instead of raw history events (default False).
+                                               Current ICU-stay-matched discharge summary is always
+                                               exposed separately in `current_discharge_summary`.
             num_discharge_summaries: Maximum number of prioritized pre-ICU reports to
                                      include per NOTE_* code (default 2). With
                                      NOTE_DISCHARGESUMMARY and NOTE_RADIOLOGYREPORT,
@@ -1085,6 +1105,30 @@ class MIMICDataParser:
         pre_icu_baseline_content = None
         pre_icu_baseline_events_count = 0
         pre_icu_history_hours_applied = float(pre_icu_history_hours)
+        selected_discharge_summary = self._selected_discharge_summary_for_stay(
+            subject_id=int(trajectory["subject_id"]),
+            icu_stay_id=int(trajectory["icu_stay_id"]),
+        )
+        current_discharge_summary = None
+        if isinstance(selected_discharge_summary, dict):
+            selected_time = pd.to_datetime(selected_discharge_summary.get("time"), errors="coerce")
+            hours_since_icu_admission = None
+            hours_after_icu_leave = None
+            if pd.notna(selected_time):
+                if pd.notna(enter_time):
+                    hours_since_icu_admission = float((selected_time - enter_time).total_seconds() / 3600.0)
+                if pd.notna(leave_time):
+                    hours_after_icu_leave = float((selected_time - leave_time).total_seconds() / 3600.0)
+
+            current_discharge_summary = {
+                "time": selected_discharge_summary.get("time"),
+                "text_value": selected_discharge_summary.get("text_value"),
+                "code_specifics": selected_discharge_summary.get("code_specifics"),
+                "selection_rule": selected_discharge_summary.get("selection_rule"),
+                "delta_hours_after_leave": selected_discharge_summary.get("delta_hours_after_leave"),
+                "hours_since_icu_admission": hours_since_icu_admission,
+                "hours_after_icu_leave": hours_after_icu_leave,
+            }
 
         if include_pre_icu_data and use_discharge_summary_for_history:
             pre_icu_context = self.pre_icu_history_processor.build_history_context(
@@ -1095,6 +1139,7 @@ class MIMICDataParser:
             )
             pre_icu_history_source = str(pre_icu_context.get("source") or "none")
             pre_icu_history_items = int(pre_icu_context.get("items") or 0)
+            historical_discharge_summary_items = int(pre_icu_context.get("historical_discharge_summary_items") or 0)
             pre_icu_history_content = pre_icu_context.get("content")
             pre_icu_fallback_history_events = pre_icu_context.get("fallback_history_events") or []
             per_code_cap = int(pre_icu_context.get("per_code_cap") or 0)
@@ -1104,9 +1149,10 @@ class MIMICDataParser:
 
             if pre_icu_history_source == "reports" and pre_icu_history_content:
                 print(
-                    "  Using pre-ICU prioritized reports as history context "
+                    "  Using historical pre-ICU reports as history context "
                     f"({pre_icu_history_items} report(s), max {per_code_cap} per code, "
-                    f"{len(pre_icu_history_content)} characters)"
+                    f"{len(pre_icu_history_content)} characters, "
+                    f"historical discharge summaries: {historical_discharge_summary_items})"
                 )
             elif pre_icu_history_source == "events_fallback":
                 print(
@@ -1121,6 +1167,8 @@ class MIMICDataParser:
                     "  Added pre-ICU baseline LAB/VITAL snapshot "
                     f"({pre_icu_baseline_events_count} event(s) from previous {pre_icu_history_hours_applied:.1f}h)"
                 )
+        else:
+            historical_discharge_summary_items = 0
 
         # Convert events to DataFrame for easier manipulation
         events_df = pd.DataFrame(trajectory["events"])
@@ -1202,6 +1250,7 @@ class MIMICDataParser:
                         "death_time": trajectory["death_time"],
                         "total_icu_duration_hours": trajectory["icu_duration_hours"],
                     },
+                    "current_discharge_summary": (dict(current_discharge_summary) if current_discharge_summary else None),
                     "history_events": cleaned_history,
                     "current_events": cleaned_current,
                     "num_history_events": len(cleaned_history),
@@ -1209,6 +1258,7 @@ class MIMICDataParser:
                     "pre_icu_history": {
                         "source": pre_icu_history_source,
                         "items": pre_icu_history_items,
+                        "historical_discharge_summary_items": historical_discharge_summary_items,
                         "content": pre_icu_history_content,
                         "history_hours": float(pre_icu_history_hours_applied),
                         "fallback_hours": float(pre_icu_history_hours_applied),
@@ -1226,10 +1276,12 @@ class MIMICDataParser:
 
     def extract_discharge_summary(self, trajectory: Dict, k: int = 1) -> Optional[List[Dict]]:
         """
-        Extract the k most recent NOTE_DISCHARGESUMMARY events from BEFORE the current ICU stay.
+        Extract discharge summary(ies) for the current ICU stay.
 
-        This provides historical context from previous hospital visits/ICU stays.
-        Useful for understanding patient's medical history without information leakage.
+        Primary path:
+        - Use selector-linked discharge summary for this ICU stay (rule1/rule2).
+        Fallback path (when selector map is unavailable):
+        - Use most recent pre-ICU NOTE_DISCHARGESUMMARY events.
 
         Args:
             trajectory: Patient trajectory from get_patient_trajectory()
@@ -1237,10 +1289,31 @@ class MIMICDataParser:
 
         Returns:
             List of discharge summary dictionaries sorted by time (most recent first),
-            or None if no discharge summaries found before current ICU enter time
+            or None if no discharge summaries found
         """
         if k <= 0:
             return None
+
+        subject_id = int(trajectory["subject_id"])
+        icu_stay_id = int(trajectory["icu_stay_id"])
+        selected = self._selected_discharge_summary_for_stay(subject_id, icu_stay_id)
+        if selected is not None:
+            selected_time = pd.to_datetime(selected.get("time"), errors="coerce")
+            current_enter_time = pd.to_datetime(trajectory.get("enter_time"), errors="coerce")
+            hours_before_current_icu = None
+            if pd.notna(selected_time) and pd.notna(current_enter_time):
+                hours_before_current_icu = (current_enter_time - selected_time).total_seconds() / 3600.0
+
+            return [
+                {
+                    "subject_id": subject_id,
+                    "time": selected.get("time"),
+                    "text_value": selected.get("text_value"),
+                    "code_specifics": selected.get("code_specifics"),
+                    "hours_before_current_icu": hours_before_current_icu,
+                    "selection_rule": selected.get("selection_rule"),
+                }
+            ][:k]
 
         report_candidates = self.pre_icu_history_processor.extract_report_candidates(
             trajectory,

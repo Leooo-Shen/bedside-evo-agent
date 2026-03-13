@@ -20,7 +20,6 @@ def check_patient_outcome_codes(patient_id: int) -> None:
     parser = MIMICDataParser(
         events_path="data/mimic-demo/events/data_0.parquet",
         icu_stay_path="data/mimic-demo/icu_stay/data_0.parquet",
-        de_identify=False,
     )
 
     print("Loading data...")

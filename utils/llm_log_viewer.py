@@ -6,12 +6,10 @@ from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-STATUS_SCORE_MAP: Dict[str, float] = {
-    "deteriorating": -1.0,
-    "fluctuating": -0.5,
-    "stable": 0.0,
-    "improving": 1.0,
-}
+try:
+    from utils.status_scoring import STATUS_SCORE_MAP
+except ImportError:  # pragma: no cover - script execution fallback
+    from status_scoring import STATUS_SCORE_MAP
 
 ACTION_SCORE_MAP: Dict[str, float] = {
     "potentially_harmful": -1.0,
@@ -661,9 +659,7 @@ def _build_oracle_trend_section(calls: List[Dict[str, Any]], output_dir: Optiona
         count for label, count in action_counter.items() if label in NON_SCORABLE_ACTION_LABELS
     )
 
-    status_mapping_text = (
-        "deteriorating=-1, fluctuating=-0.5, stable=0, improving=1"
-    )
+    status_mapping_text = "deteriorating=-1, fluctuating=-0.5, stable=0.5, improving=1"
     action_mapping_text = (
         "potentially_harmful=-1, suboptimal/non_adherent=-0.5, "
         "neutral=0, appropriate/adherent/optimal=1"

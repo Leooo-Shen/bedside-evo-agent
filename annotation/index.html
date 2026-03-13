@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Oracle Annotation Tool</title>
+    <link rel="stylesheet" href="styles.css?v=20260312b" />
+  </head>
+  <body>
+    <div id="app">
+      <section id="loader-view" class="loader-view">
+        <h1>ICU Oracle Annotation Tool</h1>
+        <p>
+          Load <code>oracle_predictions.json</code>. Optionally load
+          <code>window_contexts.json</code> (context/events source).
+        </p>
+
+        <div class="file-row">
+          <label for="predictions-file">Oracle predictions</label>
+          <input id="predictions-file" type="file" accept="application/json" />
+        </div>
+
+        <div class="file-row">
+          <label for="window-context-file">Window contexts (optional)</label>
+          <input id="window-context-file" type="file" accept="application/json" />
+        </div>
+
+        <div class="loader-actions">
+          <button id="load-btn" type="button">Load Files</button>
+        </div>
+
+        <div id="loader-message" class="message"></div>
+      </section>
+
+      <section id="workspace-view" class="hidden">
+        <header class="top-bar">
+          <div id="run-meta" class="run-meta"></div>
+          <div class="top-actions">
+            <button id="prev-window-btn" type="button">Previous</button>
+            <select id="window-select"></select>
+            <button id="next-window-btn" type="button">Next</button>
+            <button id="export-btn" type="button">Export Annotated JSON</button>
+          </div>
+        </header>
+
+        <div id="global-message" class="message"></div>
+
+        <div class="workspace-grid">
+          <aside id="left-panel" class="panel"></aside>
+          <main id="center-panel" class="panel"></main>
+          <section id="right-panel" class="panel"></section>
+        </div>
+      </section>
+    </div>
+
+    <script src="app.js?v=20260312b"></script>
+  </body>
+</html>

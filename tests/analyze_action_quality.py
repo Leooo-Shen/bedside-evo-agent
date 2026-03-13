@@ -18,7 +18,7 @@ import pandas as pd
 STATUS_TO_NUM = {
     "deteriorating": -1.0,
     "fluctuating": -0.5,
-    "stable": 0.0,
+    "stable": 0.5,
     "improving": 1.0,
     "insufficient_data": 0.0,
 }

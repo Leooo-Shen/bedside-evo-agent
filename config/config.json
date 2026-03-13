@@ -3,8 +3,6 @@
     "events_path": "data/mimic-demo/events/data_0.parquet",
     "icu_stay_path": "data/mimic-demo/icu_stay/data_0.parquet",
     "output_dir": "oracle_results",
-    "de_identify": false,
-    "de_identify_seed": 42,
     "max_patients": null
   },
   "data_loading": {
@@ -12,8 +10,8 @@
     "oracle_observation_hours": null
   },
   "oracle_time_windows": {
-    "current_window_hours": 0.5,
-    "window_step_hours": 0.5,
+    "current_window_hours": 1,
+    "window_step_hours": 2,
     "include_pre_icu_data": true,
     "use_discharge_summary_for_history": true,
     "num_discharge_summaries": 2,
@@ -27,19 +25,19 @@
     "history_hours": 1,
     "future_hours": 3,
     "use_discharge_summary": true,
-    "include_icu_outcome_in_prompt": false,
+    "include_icu_outcome_in_prompt": true,
     "top_k_recommendations": 3
   },
   "agent_time_windows": {
-    "current_window_hours": 1,
-    "window_step_hours": 1,
-    "include_pre_icu_data": false,
+    "current_window_hours": 0.5,
+    "window_step_hours": 0.5,
+    "include_pre_icu_data": true,
     "use_discharge_summary_for_history": false,
     "num_discharge_summaries": 3
   },
   "llm": {
-    "provider": "google",
-    "model": "gemini-3-flash-preview",
+    "provider": "openai",
+    "model": "gpt-5-mini",
     "temperature": 1.0,
     "max_tokens": 128000
   },

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
@@ -176,6 +177,9 @@ def _build_patient_predictions_payload(
 
     window_outputs = []
     for idx, window in enumerate(windows, start=1):
+        raw_current_events = window.get("current_events")
+        if not isinstance(raw_current_events, list):
+            raw_current_events = []
         window_outputs.append(
             {
                 "window_index": idx,
@@ -191,6 +195,7 @@ def _build_patient_predictions_payload(
                     "pre_icu_history_source": window.get("pre_icu_history_source"),
                     "pre_icu_history_items": window.get("pre_icu_history_items"),
                 },
+                "raw_current_events": raw_current_events,
                 "oracle_output": parsed_outputs_by_window_index.get(
                     idx - 1,
                     parsed_outputs_by_window_index.get(idx, {}),
@@ -247,6 +252,143 @@ def _build_oracle_llm_calls_payload(
         "pipeline_agents": pipeline_agents,
         "total_calls": len(sorted_calls),
         "calls": sorted_calls,
+    }
+
+
+PROMPT_SECTION_HEADINGS = {
+    "icu_discharge_summary": "## CURRENT DISCHARGE SUMMARY",
+    "icu_trajectory_context_window": "## ICU TRAJECTORY CONTEXT WINDOW",
+    "history_events_current_window": "## HISTORY EVENTS OF CURRENT WINDOW",
+    "current_observation_window": "## CURRENT OBSERVATION WINDOW FOR EVALUATION",
+}
+
+
+def _extract_prompt_section(prompt_text: str, heading: str) -> str:
+    if not isinstance(prompt_text, str) or not prompt_text.strip():
+        return ""
+    if not isinstance(heading, str) or not heading.strip():
+        return ""
+    escaped_heading = re.escape(heading.strip())
+    match = re.search(rf"{escaped_heading}\n([\s\S]*?)(?=\n##\s+|\Z)", prompt_text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return str(match.group(1) or "").strip()
+
+
+def _extract_prompt_sections(prompt_text: str) -> Dict[str, str]:
+    return {
+        key: _extract_prompt_section(prompt_text, heading)
+        for key, heading in PROMPT_SECTION_HEADINGS.items()
+    }
+
+
+def _build_prompt_sections_by_window_index(llm_calls: List[Dict[str, Any]]) -> Dict[int, Dict[str, str]]:
+    sections_by_index: Dict[int, Dict[str, str]] = {}
+    for call in _sort_llm_calls(llm_calls):
+        if not isinstance(call, dict):
+            continue
+        if str(call.get("step_type")) != "oracle_evaluator":
+            continue
+        prompt_text = call.get("prompt")
+        if not isinstance(prompt_text, str) or not prompt_text.strip():
+            continue
+        try:
+            window_index = int(call.get("window_index"))
+        except (TypeError, ValueError):
+            continue
+        sections_by_index[window_index] = _extract_prompt_sections(prompt_text)
+    return sections_by_index
+
+
+def _resolve_prompt_sections_for_window(
+    *,
+    window_index: int,
+    sections_by_window_index: Dict[int, Dict[str, str]],
+) -> tuple[Dict[str, str], Optional[int]]:
+    empty = {key: "" for key in PROMPT_SECTION_HEADINGS}
+    if not sections_by_window_index:
+        return empty, None
+
+    # LLM call window_index may be 0-based while predictions are 1-based.
+    for candidate in (window_index - 1, window_index):
+        if candidate in sections_by_window_index:
+            sections = sections_by_window_index[candidate]
+            return (
+                {
+                    key: str(sections.get(key) or "")
+                    for key in PROMPT_SECTION_HEADINGS
+                },
+                candidate,
+            )
+    return empty, None
+
+
+def _build_window_contexts_payload(
+    *,
+    run_id: str,
+    trajectory: Dict[str, Any],
+    windows: List[Dict[str, Any]],
+    llm_calls: List[Dict[str, Any]],
+    history_hours: Optional[float] = None,
+) -> Dict[str, Any]:
+    sections_by_window_index = _build_prompt_sections_by_window_index(llm_calls)
+    window_contexts: List[Dict[str, Any]] = []
+
+    for idx, raw_window in enumerate(windows, start=1):
+        window = raw_window if isinstance(raw_window, dict) else {}
+        current_events = window.get("current_events")
+        if not isinstance(current_events, list):
+            current_events = []
+        history_events = window.get("history_events")
+        if not isinstance(history_events, list):
+            history_events = []
+
+        prompt_sections, llm_window_index = _resolve_prompt_sections_for_window(
+            window_index=idx,
+            sections_by_window_index=sections_by_window_index,
+        )
+
+        window_contexts.append(
+            {
+                "window_index": idx,
+                "llm_window_index": llm_window_index,
+                "window_metadata": {
+                    "subject_id": window.get("subject_id"),
+                    "icu_stay_id": window.get("icu_stay_id"),
+                    "window_start_time": window.get("current_window_start"),
+                    "window_end_time": window.get("current_window_end"),
+                    "hours_since_admission": window.get("hours_since_admission"),
+                    "current_window_hours": window.get("current_window_hours"),
+                    "num_history_events": window.get("num_history_events"),
+                    "num_current_events": window.get("num_current_events"),
+                    "pre_icu_history_source": window.get("pre_icu_history_source"),
+                    "pre_icu_history_items": window.get("pre_icu_history_items"),
+                    "current_discharge_summary_selection_rule": (
+                        window.get("current_discharge_summary", {}) or {}
+                    ).get("selection_rule")
+                    if isinstance(window.get("current_discharge_summary"), dict)
+                    else None,
+                    "history_hours": history_hours,
+                },
+                "history_events": history_events,
+                "current_events": current_events,
+                "prompt_sections": prompt_sections,
+                "current_discharge_summary": (
+                    window.get("current_discharge_summary")
+                    if isinstance(window.get("current_discharge_summary"), dict)
+                    else None
+                ),
+                "pre_icu_history": window.get("pre_icu_history") if isinstance(window.get("pre_icu_history"), dict) else None,
+            }
+        )
+
+    return {
+        "run_id": run_id,
+        "generated_at": datetime.now().isoformat(),
+        "subject_id": trajectory.get("subject_id"),
+        "icu_stay_id": trajectory.get("icu_stay_id"),
+        "history_hours": history_hours,
+        "window_contexts": window_contexts,
     }
 
 
@@ -460,6 +602,17 @@ def process_batch_for_oracle(
                 json.dump(llm_payload, f, indent=2, ensure_ascii=False, default=json_default)
             save_llm_calls_html(llm_payload, patient_dir / "llm_calls.html")
 
+            window_contexts_payload = _build_window_contexts_payload(
+                run_id=run_id,
+                trajectory=trajectory,
+                windows=windows,
+                llm_calls=llm_calls,
+                history_hours=float(config.oracle_context_history_hours),
+            )
+            window_contexts_path = patient_dir / "window_contexts.json"
+            with open(window_contexts_path, "w", encoding="utf-8") as f:
+                json.dump(window_contexts_payload, f, indent=2, ensure_ascii=False, default=json_default)
+
             summary_stats["total_windows_evaluated"] += len(reports)
             summary_stats["patients_processed"] += 1
 
@@ -498,6 +651,7 @@ def process_batch_for_oracle(
     print(f"\nOutputs saved to: {run_dir}")
     print(f"  - Summary: {summary_file.name}")
     print("  - Per-patient predictions: patients/<subject_id>_<icu_stay_id>/oracle_predictions.json")
+    print("  - Per-patient window context: patients/<subject_id>_<icu_stay_id>/window_contexts.json")
 
     print(f"\n{'=' * 80}")
     print("PROCESSING COMPLETE")

@@ -5,9 +5,12 @@ This module provides functions for:
 - Calculating vital sign trends over time
 - Classifying vital signs against clinical guidelines
 - Formatting vital sign data for display
+- Selecting plottable numeric vital labels for one patient trajectory
 """
 
-from typing import Dict, List
+import math
+import re
+from typing import Dict, List, Optional
 
 # Clinical guideline ranges for vital signs
 VITAL_GUIDELINES = {
@@ -17,6 +20,146 @@ VITAL_GUIDELINES = {
     "Respiratory Rate, insp/min": {"low": 12, "high": 20, "unit": "insp/min"},
     "O2 saturation pulseoxymetry, %": {"low": 95, "high": 100, "unit": "%"},
 }
+
+# Numeric vital labels that are generally suitable for line-trend visualization.
+# This favors physiologic trends (HR/BP/SpO2/temperature/ventilation/hemodynamics)
+# and avoids many purely categorical VITALS fields.
+PLOTTABLE_VITAL_LABEL_PATTERNS = (
+    r"\bheart rate\b",
+    r"\brespiratory rate\b",
+    r"\bo2 saturation\b",
+    r"\bspo2\b",
+    r"\bblood pressure\b",
+    r"\bart bp\b",
+    r"\bmean arterial pressure\b",
+    r"\bmap\b",
+    r"\btemperature\b",
+    r"\bfi[o0]2\b",
+    r"\binspired o2 fraction\b",
+    r"\bo2 flow\b",
+    r"\btidal volume\b",
+    r"\bminute volume\b",
+    r"\bairway pressure\b",
+    r"\bpeep\b",
+    r"\betco2\b",
+    r"\bco2 pressure\b",
+    r"\bo2 pressure\b",
+    r"\bcentral venous pressure\b",
+    r"\bpulmonary artery pressure\b",
+    r"\bintra cranial pressure\b",
+    r"\bcerebral perfusion pressure\b",
+    r"\bsv[o0]2\b",
+)
+
+
+def _safe_float(value: object) -> Optional[float]:
+    """Parse finite float values; return None for invalid/NaN/inf."""
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _label_matches_patterns(label: str, patterns: List[str]) -> bool:
+    normalized = str(label or "").strip().lower()
+    if not normalized:
+        return False
+    for pattern in patterns:
+        if re.search(pattern, normalized):
+            return True
+    return False
+
+
+def select_plottable_vitals(
+    trajectory: Dict,
+    min_points: int = 1,
+    max_vitals: int = -1,
+    prefer_physiologic_labels: bool = True,
+) -> List[str]:
+    """
+    Automatically select numeric vital labels suitable for line-trend plots.
+
+    Selection rules:
+    - code == "VITALS"
+    - numeric_value can be parsed as a finite float
+    - label has at least `min_points` numeric observations
+    - rank by data density (more points, more timestamps, non-constant values)
+    - if `prefer_physiologic_labels=True`, keep labels matching
+      `PLOTTABLE_VITAL_LABEL_PATTERNS`; if that yields nothing, fallback to all numeric labels.
+
+    Args:
+        trajectory: Patient trajectory dict containing an "events" list.
+        min_points: Minimum numeric points per label required for plotting.
+        max_vitals: Maximum number of labels to return (<=0 means no limit).
+        prefer_physiologic_labels: Prefer physiologic labels via regex allowlist.
+
+    Returns:
+        Ordered list of vital `code_specifics` labels.
+    """
+    if min_points < 1:
+        raise ValueError("min_points must be >= 1")
+
+    events = trajectory.get("events", [])
+    if not isinstance(events, list) or not events:
+        return []
+
+    values_by_label: Dict[str, List[float]] = {}
+    times_by_label: Dict[str, set] = {}
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("code") != "VITALS":
+            continue
+
+        label = str(event.get("code_specifics") or "").strip()
+        if not label:
+            continue
+
+        value = _safe_float(event.get("numeric_value"))
+        if value is None:
+            continue
+
+        time_value = event.get("time")
+        values_by_label.setdefault(label, []).append(value)
+        times_by_label.setdefault(label, set()).add(str(time_value) if time_value is not None else "")
+
+    if not values_by_label:
+        return []
+
+    def build_ranked(labels: List[str]) -> List[str]:
+        ranked: List[tuple] = []
+        for label in labels:
+            values = values_by_label.get(label, [])
+            if len(values) < min_points:
+                continue
+            unique_times = len(times_by_label.get(label, set()))
+            if unique_times < 2:
+                continue
+            value_span = max(values) - min(values) if values else 0.0
+            # Density-first ranking with a light bonus for non-flat series.
+            score = (len(values) * 10) + unique_times + (1 if value_span > 0 else 0)
+            ranked.append((score, len(values), unique_times, label))
+
+        ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
+        labels_sorted = [item[3] for item in ranked]
+        if max_vitals > 0:
+            return labels_sorted[:max_vitals]
+        return labels_sorted
+
+    all_labels = list(values_by_label.keys())
+    if prefer_physiologic_labels:
+        preferred = [
+            label for label in all_labels if _label_matches_patterns(label, list(PLOTTABLE_VITAL_LABEL_PATTERNS))
+        ]
+        selected = build_ranked(preferred)
+        if selected:
+            return selected
+
+    return build_ranked(all_labels)
 
 
 def get_vital_names():

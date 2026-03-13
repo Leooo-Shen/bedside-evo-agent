@@ -152,23 +152,38 @@ class MetaOracle:
         api_key: Optional[str] = None,
         temperature: float = 0.3,
         max_tokens: int = 4096,
+        request_timeout_seconds: float = 300.0,
         log_dir: Optional[str] = None,
         use_discharge_summary: bool = False,
         include_icu_outcome_in_prompt: bool = True,
+        mask_discharge_summary_outcome_terms: bool = False,
         history_context_hours: float = 48.0,
         future_context_hours: float = 48.0,
         top_k_recommendations: int = 3,
     ):
-        self.llm_client = LLMClient(
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        try:
+            self.llm_client = LLMClient(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                request_timeout_seconds=request_timeout_seconds,
+            )
+        except TypeError:
+            # Backward-compatible path for tests or legacy LLM client wrappers
+            # that do not yet accept request_timeout_seconds.
+            self.llm_client = LLMClient(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
         self.use_discharge_summary = bool(use_discharge_summary)
         self.include_icu_outcome_in_prompt = bool(include_icu_outcome_in_prompt)
+        self.mask_discharge_summary_outcome_terms = bool(mask_discharge_summary_outcome_terms)
         self.history_context_hours = float(history_context_hours)
         self.future_context_hours = float(future_context_hours)
         if self.history_context_hours < 0 or self.future_context_hours < 0:
@@ -183,6 +198,7 @@ class MetaOracle:
         self.evaluation_count = 0
         self.total_tokens_used = 0
         self.total_llm_calls = 0
+        self.request_timeout_seconds = float(request_timeout_seconds)
 
         self._stats_lock = Lock()
         self._trajectory_logs: List[Dict[str, Any]] = []
@@ -198,9 +214,11 @@ class MetaOracle:
             "Oracle context config: "
             f"use_discharge_summary={self.use_discharge_summary}, "
             f"include_icu_outcome_in_prompt={self.include_icu_outcome_in_prompt}, "
+            f"mask_discharge_summary_outcome_terms={self.mask_discharge_summary_outcome_terms}, "
             f"history_hours={self.history_context_hours}, "
             f"future_hours={self.future_context_hours}, "
-            f"top_k_recommendations={self.top_k_recommendations}"
+            f"top_k_recommendations={self.top_k_recommendations}, "
+            f"request_timeout_seconds={self.request_timeout_seconds:.1f}"
         )
 
     def _save_log(
@@ -437,18 +455,16 @@ class MetaOracle:
             context_start = context_end
 
         context_events_all = _slice_events_by_time(raw_events, context_start, context_end)
-        if self.use_discharge_summary:
-            # Include all ICU discharge summaries from the full ICU trajectory, independent
-            # from bounded history/future event slicing.
-            discharge_summary_scope_events = raw_events
-            discharge_summary_scope_start = enter_time
-            discharge_summary_scope_end = leave_time
-        else:
-            discharge_summary_scope_events = context_events_all
-            discharge_summary_scope_start = context_start
-            discharge_summary_scope_end = context_end
-
-        icu_discharge_summaries = _extract_icu_discharge_summaries_from_events(discharge_summary_scope_events)
+        current_discharge_summary = (
+            window_data.get("current_discharge_summary")
+            if isinstance(window_data.get("current_discharge_summary"), dict)
+            else None
+        )
+        if current_discharge_summary is None:
+            current_discharge_summary = _extract_current_discharge_summary_fallback(
+                raw_events,
+                leave_time=leave_time,
+            )
         # NOTE_DISCHARGESUMMARY must not appear in raw ICU events context.
         context_events = _exclude_discharge_summary_events(context_events_all)
         history_events, current_window_events, future_events = _partition_events_relative_to_window(
@@ -470,21 +486,28 @@ class MetaOracle:
             future_hours=self.future_context_hours,
         )
 
-        discharge_summary_context_text = _build_icu_discharge_summary_context_text(
-            icu_discharge_summaries,
-            context_start=discharge_summary_scope_start,
-            context_end=discharge_summary_scope_end,
-            sanitize_for_outcome=(self.use_discharge_summary and not self.include_icu_outcome_in_prompt),
+        current_discharge_summary_text = _build_current_discharge_summary_context_text(
+            current_discharge_summary,
+            sanitize_for_outcome=(
+                self.use_discharge_summary
+                and (not self.include_icu_outcome_in_prompt or self.mask_discharge_summary_outcome_terms)
+            ),
         )
 
         if self.use_discharge_summary:
-            context_text = "\n\n".join([discharge_summary_context_text, events_context_text]).strip()
+            context_text = "\n\n".join([current_discharge_summary_text, events_context_text]).strip()
             context_mode = "raw_local_trajectory_with_icu_discharge_summary"
         else:
             context_text = events_context_text
             context_mode = "raw_local_trajectory_icu_events_only"
 
         context_tokens = self._estimate_tokens(context_text)
+        has_current_discharge_summary = bool(current_discharge_summary)
+        current_discharge_summary_selection_rule = (
+            _safe_text(current_discharge_summary.get("selection_rule"))
+            if isinstance(current_discharge_summary, dict)
+            else ""
+        ) or None
         return {
             "mode": context_mode,
             "context_text": context_text,
@@ -499,8 +522,11 @@ class MetaOracle:
             "context_window_end": context_end.isoformat() if context_end else None,
             "history_hours": self.history_context_hours,
             "future_hours": self.future_context_hours,
-            "has_icu_discharge_summary": len(icu_discharge_summaries) > 0,
-            "icu_discharge_summary_count": len(icu_discharge_summaries),
+            "has_current_discharge_summary": has_current_discharge_summary,
+            "current_discharge_summary_selection_rule": current_discharge_summary_selection_rule,
+            # Backward-compatible aliases for existing analytics.
+            "has_icu_discharge_summary": has_current_discharge_summary,
+            "icu_discharge_summary_count": 1 if has_current_discharge_summary else 0,
         }
 
     def _estimate_tokens(self, text: str) -> int:
@@ -549,7 +575,11 @@ class MetaOracle:
         call_logged = False
         evaluation_number: Optional[int] = None
         try:
-            response = self.llm_client.chat(prompt=prompt, response_format="json")
+            response = self.llm_client.chat(
+                prompt=prompt,
+                response_format="json",
+                timeout_seconds=self.request_timeout_seconds,
+            )
 
             with self._stats_lock:
                 self.evaluation_count += 1
@@ -587,7 +617,12 @@ class MetaOracle:
                     "context_window_end": context_info.get("context_window_end"),
                     "pre_icu_history_source": window_data.get("pre_icu_history_source"),
                     "pre_icu_history_items": window_data.get("pre_icu_history_items"),
+                    "current_discharge_summary_selection_rule": context_info.get(
+                        "current_discharge_summary_selection_rule"
+                    ),
+                    "has_current_discharge_summary": context_info.get("has_current_discharge_summary", False),
                     "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
+                    "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
                     "parse_source": parse_source,
                 },
             )
@@ -609,7 +644,12 @@ class MetaOracle:
                     "history_hours": context_info.get("history_hours"),
                     "future_hours": context_info.get("future_hours"),
                     "use_discharge_summary": context_info.get("use_discharge_summary", self.use_discharge_summary),
+                    "has_current_discharge_summary": context_info.get("has_current_discharge_summary", False),
+                    "current_discharge_summary_selection_rule": context_info.get(
+                        "current_discharge_summary_selection_rule"
+                    ),
                     "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
+                    "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
                     "has_icu_discharge_summary": context_info.get("has_icu_discharge_summary", False),
                     "icu_discharge_summary_count": context_info.get("icu_discharge_summary_count", 0),
                 },
@@ -635,9 +675,7 @@ class MetaOracle:
                     prompt=prompt,
                     response=response if isinstance(response, dict) else {},
                     parsed_response=(
-                        _best_effort_parse_json(response.get("content", ""))
-                        if isinstance(response, dict)
-                        else None
+                        _best_effort_parse_json(response.get("content", "")) if isinstance(response, dict) else None
                     ),
                     window_data=window_data,
                     metadata={
@@ -647,7 +685,12 @@ class MetaOracle:
                         "use_discharge_summary": context_info.get("use_discharge_summary", self.use_discharge_summary),
                         "pre_icu_history_source": window_data.get("pre_icu_history_source"),
                         "pre_icu_history_items": window_data.get("pre_icu_history_items"),
+                        "current_discharge_summary_selection_rule": context_info.get(
+                            "current_discharge_summary_selection_rule"
+                        ),
+                        "has_current_discharge_summary": context_info.get("has_current_discharge_summary", False),
                         "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
+                        "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
                         "error": str(e),
                     },
                 )
@@ -664,7 +707,12 @@ class MetaOracle:
                     "context_current_window_event_count": context_info.get("context_current_window_event_count"),
                     "context_future_event_count": context_info.get("context_future_event_count"),
                     "use_discharge_summary": context_info.get("use_discharge_summary", self.use_discharge_summary),
+                    "has_current_discharge_summary": context_info.get("has_current_discharge_summary", False),
+                    "current_discharge_summary_selection_rule": context_info.get(
+                        "current_discharge_summary_selection_rule"
+                    ),
                     "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
+                    "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
                     "context_anchor_time": context_info.get("context_anchor_time"),
                     "context_window_start": context_info.get("context_window_start"),
                     "context_window_end": context_info.get("context_window_end"),
@@ -734,18 +782,16 @@ class MetaOracle:
             for future in as_completed(future_to_index):
                 index = future_to_index[future]
                 window = windows_with_index[index]
+                window_hour = _format_window_hour(window)
 
                 try:
                     report = future.result()
                     results[index] = report
                     completed_count += 1
                     if show_progress:
-                        print(
-                            f"Completed window {completed_count}/{len(windows)} "
-                            f"(Hour {window['hours_since_admission']:.1f})"
-                        )
+                        print(f"Completed window {completed_count}/{len(windows)} " f"(Hour {window_hour})")
                 except Exception as e:
-                    print(f"Error evaluating window {index} (Hour {window['hours_since_admission']:.1f}): {e}")
+                    print(f"Error evaluating window {index} (Hour {window_hour}): {e}")
                     results[index] = OracleReport(
                         patient_status=_normalize_patient_status({}),
                         doctor_actions=[],
@@ -792,6 +838,7 @@ class MetaOracle:
             ),
             "use_discharge_summary": self.use_discharge_summary,
             "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
+            "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
             "history_context_hours": self.history_context_hours,
             "future_context_hours": self.future_context_hours,
             "top_k_recommendations": self.top_k_recommendations,
@@ -851,6 +898,13 @@ def _usage_tokens(usage: Dict[str, Any]) -> int:
     if not isinstance(usage, dict):
         return 0
     return int(_safe_float(usage.get("input_tokens"))) + int(_safe_float(usage.get("output_tokens")))
+
+
+def _format_window_hour(window: Dict[str, Any]) -> str:
+    try:
+        return f"{float(window.get('hours_since_admission')):.1f}"
+    except (TypeError, ValueError):
+        return "unknown"
 
 
 def _parse_time(value: Any) -> Optional[datetime]:
@@ -1055,30 +1109,34 @@ def _build_raw_context_text(
     return "\n".join(lines)
 
 
-def _extract_icu_discharge_summaries_from_events(context_events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    summaries: List[Dict[str, Any]] = []
-    for event in context_events:
-        if _safe_text(event.get("code")) != "NOTE_DISCHARGESUMMARY":
-            continue
-        summaries.append(
-            {
-                "time": event.get("time"),
-                "code_specifics": event.get("code_specifics"),
-                "text_value": event.get("text_value"),
-                "_event_time": event.get("_event_time"),
-            }
-        )
-
-    summaries.sort(key=lambda item: (item.get("_event_time") is None, item.get("_event_time") or datetime.max))
-    for item in summaries:
-        item.pop("_event_time", None)
-    return summaries
-
-
 def _mask_outcome_terms(text: str) -> str:
     if not text:
         return ""
     return OUTCOME_LEAK_TERMS_PATTERN.sub(OUTCOME_MASK_TOKEN, text)
+
+
+def _extract_current_discharge_summary_fallback(
+    raw_events: List[Dict[str, Any]],
+    *,
+    leave_time: Optional[datetime],
+) -> Optional[Dict[str, Any]]:
+    discharge_summaries = [event for event in raw_events if _safe_text(event.get("code")) == "NOTE_DISCHARGESUMMARY"]
+    if not discharge_summaries:
+        return None
+
+    selected = discharge_summaries[-1]
+    event_time = selected.get("_event_time")
+    hours_after_icu_leave = None
+    if isinstance(event_time, datetime) and isinstance(leave_time, datetime):
+        hours_after_icu_leave = float((event_time - leave_time).total_seconds() / 3600.0)
+
+    return {
+        "time": selected.get("time"),
+        "code_specifics": selected.get("code_specifics"),
+        "text_value": selected.get("text_value"),
+        "selection_rule": "trajectory_event_fallback",
+        "hours_after_icu_leave": hours_after_icu_leave,
+    }
 
 
 def _remove_summary_section(text: str, section_header: str) -> str:
@@ -1087,13 +1145,9 @@ def _remove_summary_section(text: str, section_header: str) -> str:
 
     section_start = re.escape(section_header)
     section_end_candidates = "|".join(
-        re.escape(header)
-        for header in DISCHARGE_SUMMARY_SECTION_HEADERS
-        if header.lower() != section_header.lower()
+        re.escape(header) for header in DISCHARGE_SUMMARY_SECTION_HEADERS if header.lower() != section_header.lower()
     )
-    pattern = re.compile(
-        rf"(?is){section_start}\s*.*?(?=(?:{section_end_candidates})|$)"
-    )
+    pattern = re.compile(rf"(?is){section_start}\s*.*?(?=(?:{section_end_candidates})|$)")
     return pattern.sub("", text)
 
 
@@ -1108,41 +1162,40 @@ def _sanitize_discharge_summary_text(text: str) -> str:
     return sanitized
 
 
-def _build_icu_discharge_summary_context_text(
-    discharge_summaries: List[Dict[str, Any]],
+def _build_current_discharge_summary_context_text(
+    current_discharge_summary: Optional[Dict[str, Any]],
     *,
-    context_start: Optional[datetime],
-    context_end: Optional[datetime],
     sanitize_for_outcome: bool = False,
 ) -> str:
-    start_text = context_start.isoformat() if context_start else "unknown"
-    end_text = context_end.isoformat() if context_end else "unknown"
     lines = [
-        "## ICU DISCHARGE SUMMARY",
-        f"Discharge summary scope: [{start_text}, {end_text}]",
-        f"Total ICU discharge summaries in scope: {len(discharge_summaries)}",
-        "",
-        "ICU discharge summaries:",
+        "## CURRENT DISCHARGE SUMMARY",
     ]
 
-    if not discharge_summaries:
-        lines.append("(No ICU discharge summary found in this context window)")
+    if not isinstance(current_discharge_summary, dict) or not current_discharge_summary:
+        lines.append("(No ICU-stay-matched discharge summary found)")
         return "\n".join(lines)
 
-    for idx, item in enumerate(discharge_summaries, start=1):
-        time_text = _safe_text(item.get("time")) or "unknown"
-        lines.append(f"DS{idx}. [{time_text}] NOTE_DISCHARGESUMMARY")
-        specifics = _safe_text(item.get("code_specifics"))
-        if sanitize_for_outcome:
-            specifics = _mask_outcome_terms(specifics)
-        if specifics:
-            lines.append(f"Details: {specifics}")
-        summary_text = _safe_text(item.get("text_value"))
-        if sanitize_for_outcome:
-            summary_text = _sanitize_discharge_summary_text(summary_text)
-        lines.append(summary_text if summary_text else "(No discharge summary text)")
-        lines.append("")
+    summary_time = _safe_text(current_discharge_summary.get("time")) or "unknown"
+    selection_rule = _safe_text(current_discharge_summary.get("selection_rule")) or "unknown"
+    lines.append(f"Summary time: {summary_time}")
+    lines.append(f"Selection rule: {selection_rule}")
 
+    hours_after_leave = current_discharge_summary.get("hours_after_icu_leave")
+    if isinstance(hours_after_leave, (int, float)):
+        lines.append(f"Hours after ICU leave: {float(hours_after_leave):.2f}")
+
+    details = _safe_text(current_discharge_summary.get("code_specifics"))
+    if sanitize_for_outcome:
+        details = _mask_outcome_terms(details)
+    if details:
+        lines.append(f"Details: {details}")
+
+    summary_text = _safe_text(current_discharge_summary.get("text_value"))
+    if sanitize_for_outcome:
+        summary_text = _sanitize_discharge_summary_text(summary_text)
+
+    lines.append("")
+    lines.append(summary_text if summary_text else "(No discharge summary text)")
     return "\n".join(lines).strip()
 
 

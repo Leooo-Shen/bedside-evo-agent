@@ -229,20 +229,30 @@ def test_process_batch_for_oracle(monkeypatch, tmp_path):
     predictions_file = patient_dir / "oracle_predictions.json"
     llm_calls_json = patient_dir / "llm_calls.json"
     llm_calls_html = patient_dir / "llm_calls.html"
+    window_contexts_json = patient_dir / "window_contexts.json"
     assert predictions_file.exists()
     assert llm_calls_json.exists()
     assert llm_calls_html.exists()
+    assert window_contexts_json.exists()
 
     predictions = json.loads(predictions_file.read_text())
     assert predictions.get("subject_id") == 123
     assert predictions.get("icu_stay_id") == 456
     assert predictions.get("window_outputs")
     first = predictions["window_outputs"][0]["oracle_output"]
+    first_raw_events = predictions["window_outputs"][0]["raw_current_events"]
     assert "patient_status" in first
     assert "action_evaluations" in first
     assert "overall_window_summary" in first
     assert "doctor_actions" not in first
     assert "clinical_quality" not in first
+    assert first_raw_events == [
+        {
+            "time": "2024-01-01 00:10:00",
+            "code": "DRUG_START",
+            "code_specifics": "Norepinephrine",
+        }
+    ]
 
     llm_calls = json.loads(llm_calls_json.read_text())
     assert llm_calls.get("patient_id") == "123_456"
@@ -264,6 +274,24 @@ def test_process_batch_for_oracle(monkeypatch, tmp_path):
         call.get("metadata", {}).get("parse_source") == "best_effort_json"
         for call in llm_calls.get("calls", [])
     )
+
+    window_contexts = json.loads(window_contexts_json.read_text())
+    assert window_contexts.get("subject_id") == 123
+    assert window_contexts.get("icu_stay_id") == 456
+    assert window_contexts.get("history_hours") == 48.0
+    assert window_contexts.get("window_contexts")
+    first_context_window = window_contexts["window_contexts"][0]
+    assert first_context_window.get("window_index") == 1
+    assert first_context_window.get("window_metadata", {}).get("history_hours") == 48.0
+    assert first_context_window.get("current_events") == first_raw_events
+    assert first_context_window.get("history_events") == []
+    sections = first_context_window.get("prompt_sections", {})
+    assert set(sections.keys()) == {
+        "icu_discharge_summary",
+        "icu_trajectory_context_window",
+        "history_events_current_window",
+        "current_observation_window",
+    }
 
     parser_kwargs = FakeParser.last_create_time_windows_kwargs
     assert parser_kwargs is not None
@@ -337,3 +365,4 @@ def test_process_batch_for_oracle_balanced_sampling(monkeypatch, tmp_path):
     for patient_dir in patient_dirs:
         assert (patient_dir / "oracle_predictions.json").exists()
         assert (patient_dir / "llm_calls.json").exists()
+        assert (patient_dir / "window_contexts.json").exists()

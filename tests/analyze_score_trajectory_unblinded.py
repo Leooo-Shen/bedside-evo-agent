@@ -18,7 +18,7 @@ from data_parser import MIMICDataParser
 STATUS_TO_NUM = {
     "deteriorating": -1.0,
     "fluctuating": -0.5,
-    "stable": 0.0,
+    "stable": 0.5,
     "improving": 1.0,
     "insufficient_data": 0.0,
 }
@@ -128,7 +128,7 @@ def plot_status_trajectories(died_reports: List[OracleReport], survived_reports:
     plt.text(
         0.02,
         0.98,
-        "Mapping: deteriorating=-1, fluctuating=-0.5, stable=0, improving=1",
+        "Mapping: deteriorating=-1, fluctuating=-0.5, stable=0.5, improving=1",
         transform=plt.gca().transAxes,
         fontsize=9,
         verticalalignment="top",

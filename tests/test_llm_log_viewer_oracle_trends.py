@@ -31,7 +31,7 @@ def test_build_oracle_trend_rows_scores_actions_and_status() -> None:
     row = rows[0]
     assert row["window_index"] == 1
     assert row["status_label"] == "stable"
-    assert row["status_score"] == 0.0
+    assert row["status_score"] == 0.5
     assert row["action_total"] == 3
     assert row["action_scorable"] == 2
     assert row["action_score"] == 0.25
@@ -132,7 +132,7 @@ def test_save_llm_calls_html_sorts_by_window_index(tmp_path) -> None:
     first_window_position = html.index("window 1")
     second_window_position = html.index("window 2")
     assert first_window_position < second_window_position
-    assert "Avg patient-status score: <strong>-0.50</strong>" in html
+    assert "Avg patient-status score: <strong>-0.25</strong>" in html
     assert "Avg doctor-action score: <strong>-0.17</strong>" in html
     assert "Doctor-action label source used for scoring" in html
     assert (tmp_path / "oracle_patient_status_trend.png").exists()

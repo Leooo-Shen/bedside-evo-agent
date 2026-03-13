@@ -26,13 +26,13 @@ For each domain and the overall status, choose exactly one of:
 - deteriorating: indicators trending toward worsening or decompensation relative to the provided context.
 - insufficient_data: available information is not sufficient to make a reliable judgment (e.g., sparse events, conflicting signals).
 
-Synthesize the overall label by reasoning about the relative clinical weight of each domain for this specific patient — do not apply a fixed rule.
+Synthesize the overall label by reasoning about the relative clinical weight of each domain for this specific patient. 
 
 Important nuances:
-- Do NOT conflate outcome with care quality. A patient may be deteriorating despite excellent care (e.g., terminal illness, refractory septic shock managed correctly).
+- Do NOT conflate outcome with care quality. A patient may be deteriorating despite excellent care. 
 - A patient may be labelled stable or improving even if they eventually die, if the trajectory at this window genuinely reflects that direction.
 
-## PART 2 — DOCTOR ACTION EVALUATION AND RECOMMENDATIONS
+## PART 2 — DOCTOR ACTION EVALUATION
 You will be given a list of clinical actions taken during the {window_time} window.
 Evaluate EACH action individually on two dimensions:
 
@@ -40,15 +40,19 @@ A. Guideline adherence — does this action follow established ICU clinical guid
 Labels: adherent | non_adherent | not_applicable | guideline_unclear
 
 B. Contextual appropriateness — given THIS patient's specific condition, trajectory, comorbidities, and the eventual outcome known to you, was this action appropriate?
-Labels: appropriate | suboptimal | potentially_harmful | not_enough_context
+Labels: appropriate | suboptimal | potentially_harmful | insufficient_data
 
 Use your hindsight knowledge from the provided context to inform contextual appropriateness, but be fair: judge the action against what the context reveals, not against impossible foresight.
 If an action was reasonable at the time but later context revealed a missed diagnosis, note this nuance.
 
-After evaluating all actions, provide maximum top {top_k} recommendations for what the clinical team should have prioritised at this window, grounded in hindsight knowledge of the trajectory.
-Each recommendation must be concrete and actionable (e.g., "Increase norepinephrine dose — MAP trending below 65 despite fluid resuscitation over the next 4 hours"), and must reference specific trajectory evidence that justifies it. Do not recommend actions already taken correctly. 
-If no further recommendations can be made, write null.
+## PART3 — CLINICAL RECOMMENDATIONS
+The doctor's actions at current window may be correct, wrong, or missing key interventions.
 
+After evaluating all actions, provide maximum top {top_k} clinical recommendations for what the clinical team should have prioritised at this window, grounded in hindsight knowledge of the trajectory.
+Each recommendation must be concrete and actionable (e.g., "Increase norepinephrine dose — MAP trending below 65 despite fluid resuscitation over the next 4 hours"), and must reference specific trajectory evidence that justifies it. 
+
+You can include existing actions if they were appropriate, or new actions that were missing but would have been impactful based on your hindsight knowledge. If no clear recommendations can be made, write null. 
+Also include an urgency label for each recommendation. 
 
 ## OUTPUT FORMAT
 Output your structured response inside <response></response> tags as valid JSON:
@@ -77,12 +81,12 @@ Output your structured response inside <response></response> tags as valid JSON:
         "rationale": "<1–2 sentences>"
       },
       "contextual_appropriateness": {
-        "label": "<appropriate | suboptimal | potentially_harmful | not_enough_context>",
+        "label": "<appropriate | suboptimal | potentially_harmful | insufficient_data>",
         "rationale": "<1–3 sentences referencing patient-specific trajectory evidence>",
         "hindsight_caveat": "<note if hindsight changes the interpretation vs. real-time judgment, or null>",
       },
       "overall": {
-        "label": "<appropriate | suboptimal | potentially_harmful | not_enough_context>",
+        "label": "<appropriate | suboptimal | potentially_harmful | insufficient_data>",
         "rationale": "<1–3 sentence synthesis of the above evaluations, grounded in trajectory evidence>"
       }
     }
@@ -93,7 +97,7 @@ Output your structured response inside <response></response> tags as valid JSON:
       "action": "<a short name of the recommended action>",
       "action_description": "<1-2 sentences of the concrete, actionable clinical recommendation>",
       "rationale": "<1–2 sentences grounded in specific hindsight trajectory evidence>",
-      "urgency": "<immediate | within_1h | longterm | optional>"
+      "urgency": "<immediate | within_1h | routine | optional>"
     }, // Or null if no recommendations
   ],
   "overall_window_summary": "<2–4 sentence synthesis of the window: patient direction, care quality, and any critical observations>"
@@ -141,7 +145,9 @@ def format_oracle_prompt(
         patient_context.insert(4, f"- ICU Outcome: {outcome_text}")
     pre_icu_history_lines = _format_pre_icu_history_lines(window_data.get("pre_icu_history"))
 
-    patient_trajectory = "\n".join([*patient_context, *pre_icu_history_lines, "", context_block]).strip()
+    patient_trajectory = "\n".join(
+        [*patient_context, *pre_icu_history_lines, "", context_block]
+    ).strip()
 
     prompt = ORACLE_PROMPT_TEMPLATE
     prompt = prompt.replace("{history_hours}", history_hours_text)
@@ -155,10 +161,10 @@ def format_oracle_prompt(
 
 
 def _format_pre_icu_history_lines(pre_icu_history: Any) -> List[str]:
-    lines = ["## PRE-ICU HISTORY"]
+    lines = ["## HISTORICAL PRE-ICU REPORTS"]
 
     if not isinstance(pre_icu_history, dict):
-        lines.append("No pre-ICU history provided.")
+        lines.append("No historical pre-ICU reports provided.")
         return lines
 
     source = str(pre_icu_history.get("source") or "").strip().lower()
@@ -167,15 +173,15 @@ def _format_pre_icu_history_lines(pre_icu_history: Any) -> List[str]:
     fallback_hours = _safe_float(pre_icu_history.get("fallback_hours"))
 
     if source in {"", "none", "disabled"}:
-        lines.append("No pre-ICU history provided.")
+        lines.append("No historical pre-ICU reports provided.")
     elif source == "reports":
-        lines.append(content if content else "No pre-ICU history provided.")
+        lines.append(content if content else "No historical pre-ICU reports provided.")
     elif source == "events_fallback":
         lines.append(f"({items} item(s) from previous {fallback_hours:.1f} hours)")
-        lines.append(content if content else "No pre-ICU history provided.")
+        lines.append(content if content else "No historical pre-ICU reports provided.")
     else:
         lines.append(f"Source: {source} ({items} item(s))")
-        lines.append(content if content else "No pre-ICU history provided.")
+        lines.append(content if content else "No historical pre-ICU reports provided.")
 
     baseline_content = str(pre_icu_history.get("baseline_content") or "").strip()
     baseline_events_count = int(_safe_float(pre_icu_history.get("baseline_events_count")))

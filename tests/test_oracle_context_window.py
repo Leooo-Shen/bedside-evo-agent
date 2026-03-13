@@ -178,8 +178,8 @@ def test_use_discharge_summary_can_include_summary_block(monkeypatch):
     assert context["context_future_event_count"] == 3
     assert context["has_icu_discharge_summary"] is True
     assert context["icu_discharge_summary_count"] == 1
-    assert "## ICU DISCHARGE SUMMARY" in context["context_text"]
-    assert "Discharge summary scope: [2024-01-01T00:00:00, 2024-01-06T00:00:00]" in context["context_text"]
+    assert "## CURRENT DISCHARGE SUMMARY" in context["context_text"]
+    assert "Selection rule: trajectory_event_fallback" in context["context_text"]
     assert "## HISTORY EVENTS OF CURRENT WINDOW" in context["context_text"]
     assert "## CURRENT OBSERVATION WINDOW FOR EVALUATION" in context["context_text"]
     assert "Current window duration (hours): 0.50" in context["context_text"]
@@ -235,3 +235,28 @@ def test_discharge_summary_is_filtered_when_outcome_hidden(monkeypatch):
     assert "[OUTCOME_MASKED]" in context["context_text"]
     assert "passed away" not in context["context_text"].lower()
     assert "comfort measures" not in context["context_text"].lower()
+
+
+def test_discharge_summary_is_filtered_when_mask_flag_enabled(monkeypatch):
+    monkeypatch.setattr(oracle_module, "LLMClient", FakeLLMClient)
+    oracle = oracle_module.MetaOracle(
+        provider="openai",
+        model="fake-model",
+        use_discharge_summary=True,
+        include_icu_outcome_in_prompt=True,
+        mask_discharge_summary_outcome_terms=True,
+        history_context_hours=48,
+        future_context_hours=48,
+    )
+    trajectory = _build_trajectory_with_leaky_discharge_summary()
+    window_data = {
+        "current_window_start": "2024-01-02T06:00:00",
+        "current_window_end": "2024-01-02T06:30:00",
+    }
+
+    context = oracle.prepare_context(trajectory, window_data)
+
+    assert "Discharge Disposition:" not in context["context_text"]
+    assert "Discharge Condition:" not in context["context_text"]
+    assert "[OUTCOME_MASKED]" in context["context_text"]
+    assert "passed away" not in context["context_text"].lower()
