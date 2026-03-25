@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,7 +12,8 @@ import pandas as pd
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from data_parser import MIMICDataParser
+from data_parser import MIMICDataParser, PreICUHistoryProcessor
+from prompts.oracle_prompt import format_event_line as format_prompt_event_line
 
 
 def _build_trajectory(subject_id: int = 1) -> dict:
@@ -37,6 +39,17 @@ def _build_trajectory(subject_id: int = 1) -> dict:
         "icu_duration_hours": 12.0,
         "events": events,
     }
+
+
+def test_pre_icu_event_formatter_reuses_prompt_event_logic():
+    event = {
+        "time": "2024-01-01 12:34:56",
+        "code": "LAB_TEST",
+        "code_specifics": "Creatinine, mg/dL",
+        "numeric_value": 1.23,
+        "text_value": "final",
+    }
+    assert format_prompt_event_line(event) == PreICUHistoryProcessor._format_pre_icu_event_line(event)
 
 
 def test_pre_icu_report_priority_includes_discharge_and_relative_codes():
@@ -85,8 +98,12 @@ def test_pre_icu_report_priority_includes_discharge_and_relative_codes():
     first = windows[0]
     assert first["pre_icu_history_source"] == "reports"
     assert first["pre_icu_history_items"] == 3
-    assert "Discharge Summary" in first["pre_icu_history"]["content"]
-    assert "NOTE_RADIOLOGYREPORT" in first["pre_icu_history"]["content"]
+    report_content = str(first["pre_icu_history"]["content"] or "")
+    assert "Discharge Summary" in report_content
+    assert "NOTE_RADIOLOGYREPORT" in report_content
+    # Report headers should keep minute precision only.
+    assert re.search(r"timestamp:\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2};", report_content) is not None
+    assert re.search(r"timestamp:\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2};", report_content) is None
     assert first["history_events"][0]["type"] == "pre_icu_reports"
 
 
@@ -325,6 +342,9 @@ def test_pre_icu_baseline_snapshot_includes_all_lab_and_vital_events_in_window()
     assert "Non Invasive Blood Pressure mean, mmHg" in baseline_content
     assert "Lactic Acid, mmol/L" not in baseline_content
     assert "[2024-" not in baseline_content
+    # Baseline event lines should keep minute precision only.
+    assert re.search(r"B1\.\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+LAB_TEST", baseline_content) is not None
+    assert re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+LAB_TEST", baseline_content) is None
     assert "=2.30" in baseline_content
     assert "=8.50" in baseline_content
     assert first["pre_icu_history"]["baseline_events_count"] == 4

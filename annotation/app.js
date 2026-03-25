@@ -62,31 +62,47 @@ const VITAL_GUIDELINE_RULES = [
 ];
 
 const STATUS_CORRECTION_OPTIONS = ["improving", "stable", "deteriorating", "insufficient_data"];
-const ACTION_CORRECTION_OPTIONS = ["appropriate", "suboptimal", "potentially_harmful", "not_enough_context"];
-const ACTION_DISAGREE_REASONS = [
-  "Oracle missed a patient-specific contraindication",
-  "Oracle over-relies on hindsight",
-  "Incorrect dose or rate judgment",
-  "Poor timing",
-  "No reasonable alternative was available",
-  "Oracle's underlying patient status assessment is wrong",
-  "Other",
+const ACTION_CORRECTION_OPTIONS = ["appropriate", "suboptimal", "potentially_harmful", "insufficient_data"];
+const RECOMMENDATION_AGREED_URGENCY_OPTIONS = [
+  { value: "urgent", label: "Urgent" },
+  { value: "nice_to_have", label: "Nice to have" },
 ];
-const RECOMMENDATION_DISAGREE_REASONS = [
-  "Poor timing",
-  "Not a high enough priority",
-  "Contraindicated in this patient",
-  "Already being performed",
-  "Other",
+const RECOMMENDATION_AGREED_DOSE_OPTIONS = [
+  { value: "low", label: "low" },
+  { value: "standard", label: "standard" },
+  { value: "slightly_high", label: "slightly high" },
+  { value: "very_high", label: "very high" },
 ];
-const OMISSION_CATEGORIES = [
-  "Fluid management",
-  "Vasopressor adjustment",
-  "Enhanced monitoring",
-  "Consultation",
-  "Goal-directed therapy",
-  "Other",
+const FREE_TEXT_CONFIDENCE_OPTIONS = [
+  { value: "high", label: "high" },
+  { value: "medium", label: "medium" },
+  { value: "low", label: "low" },
 ];
+const ICU_ACTION_CATEGORIES = [
+  "Observation / No Immediate Action",
+  "Further Assessment & Diagnostics",
+  "Respiratory Support",
+  "Hemodynamic & Fluid Management",
+  "Infection & Antimicrobial Management",
+  "Sedation, Analgesia & Neurological Management",
+  "Renal Support",
+  "Metabolic & Nutritional Management",
+  "Transfusion & Blood Products",
+  "Procedures & Surgical Interventions",
+  "Preventive Care",
+  "Escalation & Goals of Care",
+  "Others",
+];
+const EVIDENCE_EVENT_ID_PREFIXES = new Set(["CW", "HX", "FX", "B"]);
+const MIN_ADDITIONAL_ACTION_EVIDENCE_IDS = 1;
+const MAX_ADDITIONAL_ACTION_EVIDENCE_IDS = 5;
+const VERDICT_VALUES = new Set(["agree", "disagree", "uncertain"]);
+const STATUS_CORRECTION_VALUES = new Set(STATUS_CORRECTION_OPTIONS);
+const ACTION_CORRECTION_VALUES = new Set(ACTION_CORRECTION_OPTIONS);
+const RECOMMENDATION_URGENCY_VALUES = new Set(RECOMMENDATION_AGREED_URGENCY_OPTIONS.map((option) => option.value));
+const RECOMMENDATION_DOSE_VALUES = new Set(RECOMMENDATION_AGREED_DOSE_OPTIONS.map((option) => option.value));
+const AUTO_SAVE_DEBOUNCE_MS = 900;
+const DRAFT_STORAGE_PREFIX = "oracle_annotation_draft_v1";
 
 const state = {
   loaded: false,
@@ -103,6 +119,9 @@ const state = {
   currentEventTypeFilter: "all",
   historyEventTypeFilter: "all",
   loadedAtMs: 0,
+  draftKey: null,
+  autoSaveTimerId: null,
+  autoSaveErrorShown: false,
   errorHighlights: {},
   globalMessage: {
     type: "",
@@ -125,6 +144,7 @@ let rightPanelEl = null;
 let windowSelectEl = null;
 let prevWindowBtn = null;
 let nextWindowBtn = null;
+let draftFileInputEl = null;
 
 window.addEventListener("DOMContentLoaded", () => {
   loaderView = document.getElementById("loader-view");
@@ -138,31 +158,53 @@ window.addEventListener("DOMContentLoaded", () => {
   windowSelectEl = document.getElementById("window-select");
   prevWindowBtn = document.getElementById("prev-window-btn");
   nextWindowBtn = document.getElementById("next-window-btn");
+  draftFileInputEl = document.getElementById("draft-file-input");
 
-  document.getElementById("load-btn").addEventListener("click", onLoadFiles);
+  document.getElementById("load-folder-btn").addEventListener("click", onLoadFolder);
+  document.getElementById("import-draft-btn").addEventListener("click", onImportDraftClick);
+  document.getElementById("export-draft-btn").addEventListener("click", onExportDraft);
   document.getElementById("export-btn").addEventListener("click", onExport);
   prevWindowBtn.addEventListener("click", () => stepWindow(-1));
   nextWindowBtn.addEventListener("click", () => stepWindow(1));
   windowSelectEl.addEventListener("change", onWindowSelectChange);
+  draftFileInputEl.addEventListener("change", onDraftFileSelected);
 
+  workspaceView.addEventListener("click", onWorkspaceClick);
   workspaceView.addEventListener("change", onWorkspaceChange);
   workspaceView.addEventListener("input", onWorkspaceInput);
+  window.addEventListener("beforeunload", () => {
+    flushAutoSaveNow();
+  });
 });
 
-async function onLoadFiles() {
-  const predictionsInput = document.getElementById("predictions-file");
-  const windowContextInput = document.getElementById("window-context-file");
-
-  const predictionsFile = predictionsInput.files && predictionsInput.files[0] ? predictionsInput.files[0] : null;
-  const windowContextFile = windowContextInput.files && windowContextInput.files[0] ? windowContextInput.files[0] : null;
-
-  if (!predictionsFile) {
-    setLoaderMessage("Please select oracle_predictions.json.", "warn");
+async function onLoadFolder() {
+  const folderInput = document.getElementById("case-folder-file");
+  const selectedFiles = folderInput && folderInput.files ? Array.from(folderInput.files) : [];
+  if (selectedFiles.length === 0) {
+    setLoaderMessage("Please select a case folder first.", "warn");
     return;
   }
 
+  const predictionsFile = resolvePredictionsFileFromFolder(selectedFiles);
+  if (!predictionsFile) {
+    setLoaderMessage(
+      "Could not find oracle_predictions.json (or *_annotated.json) in selected folder.",
+      "warn"
+    );
+    return;
+  }
+
+  const windowContextFile = resolveWindowContextsFileFromFolder(selectedFiles, predictionsFile);
+  await loadSessionFromFiles({
+    predictionsFile,
+    windowContextFile,
+    loadingMessage: "Loading case folder...",
+  });
+}
+
+async function loadSessionFromFiles({ predictionsFile, windowContextFile = null, loadingMessage = "Loading files..." }) {
   try {
-    setLoaderMessage("Loading files...", "info");
+    setLoaderMessage(loadingMessage, "info");
     const predictionsData = await readJsonFile(predictionsFile);
     const windowContextsData = windowContextFile ? await readJsonFile(windowContextFile) : null;
 
@@ -170,14 +212,73 @@ async function onLoadFiles() {
       predictionsData,
       windowContextsData,
       sourceFiles: {
-        oracle_predictions: predictionsFile.name,
-        window_contexts: windowContextFile ? windowContextFile.name : null,
+        oracle_predictions: fileDisplayName(predictionsFile),
+        window_contexts: windowContextFile ? fileDisplayName(windowContextFile) : null,
       },
     });
     setLoaderMessage("", "");
   } catch (error) {
     setLoaderMessage(`Failed to load JSON: ${error.message}`, "warn");
   }
+}
+
+function resolvePredictionsFileFromFolder(files) {
+  const allFiles = Array.isArray(files) ? files : [];
+  if (allFiles.length === 0) {
+    return null;
+  }
+
+  const exact = allFiles.filter((file) => safeString(file.name) === "oracle_predictions.json");
+  if (exact.length > 0) {
+    return pickBestRelativePathFile(exact);
+  }
+
+  const annotated = allFiles.filter((file) => /_annotated\.json$/i.test(safeString(file.name)));
+  if (annotated.length > 0) {
+    return pickBestRelativePathFile(annotated);
+  }
+  return null;
+}
+
+function resolveWindowContextsFileFromFolder(files, predictionsFile) {
+  const allFiles = Array.isArray(files) ? files : [];
+  const candidates = allFiles.filter((file) => safeString(file.name) === "window_contexts.json");
+  if (candidates.length === 0) {
+    return null;
+  }
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  const predictionsParent = fileParentPath(predictionsFile);
+  if (!predictionsParent) {
+    return pickBestRelativePathFile(candidates);
+  }
+
+  const sameParent = candidates.find((file) => fileParentPath(file) === predictionsParent);
+  return sameParent || pickBestRelativePathFile(candidates);
+}
+
+function fileParentPath(file) {
+  const relative = fileDisplayName(file);
+  const slashIndex = relative.lastIndexOf("/");
+  return slashIndex >= 0 ? relative.slice(0, slashIndex) : "";
+}
+
+function fileDisplayName(file) {
+  if (!file) {
+    return "";
+  }
+  return safeString(file.webkitRelativePath) || safeString(file.name);
+}
+
+function pickBestRelativePathFile(files) {
+  const safeFiles = Array.isArray(files) ? files.slice() : [];
+  if (safeFiles.length === 0) {
+    return null;
+  }
+  safeFiles.sort((a, b) => fileDisplayName(a).localeCompare(fileDisplayName(b), undefined, { sensitivity: "base" }));
+  return safeFiles[0];
 }
 
 function initializeSession({ predictionsData, windowContextsData, sourceFiles }) {
@@ -188,11 +289,14 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
     throw new Error("oracle_predictions.json is missing window_outputs[].");
   }
 
+  flushAutoSaveNow();
+  clearAutoSaveTimer();
   const windowContextByIndex = buildWindowContextByIndex(windowContextsData);
 
   const rounds = [];
   const invalidWindows = [];
   const annotations = {};
+  let importedAnnotationCount = 0;
 
   predictionsData.window_outputs.forEach((windowOutput, arrayIndex) => {
     const windowIndex = toInt(windowOutput && windowOutput.window_index, arrayIndex + 1);
@@ -244,7 +348,11 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
     };
 
     rounds.push(round);
-    annotations[arrayIndex] = buildInitialAnnotation(round);
+    const rawImportedAnnotation = isObject(windowOutput.annotation) ? windowOutput.annotation : null;
+    if (rawImportedAnnotation) {
+      importedAnnotationCount += 1;
+    }
+    annotations[arrayIndex] = normalizeAnnotationForRound(round, rawImportedAnnotation);
   });
 
   if (rounds.length === 0) {
@@ -262,13 +370,29 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
   state.currentEventTypeFilter = "all";
   state.historyEventTypeFilter = "all";
   state.loadedAtMs = Date.now();
+  state.draftKey = buildDraftStorageKey(predictionsData);
+  state.autoSaveErrorShown = false;
   state.errorHighlights = {};
   state.vitalPlotStats = buildStayVitalPlotStats(rounds);
+  state.currentRoundIndex = 0;
 
-  const invalidText = invalidWindows.length
+  let restoredDraftCount = 0;
+  if (importedAnnotationCount === 0) {
+    restoredDraftCount = restoreDraftFromLocalStorage();
+  }
+  persistDraftToLocalStorage();
+
+  const statusMessages = [];
+  statusMessages.push(invalidWindows.length
     ? `Loaded ${rounds.length} valid windows; skipped ${invalidWindows.length} invalid window(s).`
-    : `Loaded ${rounds.length} valid windows.`;
-  setGlobalMessage(invalidText, invalidWindows.length ? "warn" : "info");
+    : `Loaded ${rounds.length} valid windows.`);
+  if (importedAnnotationCount > 0) {
+    statusMessages.push(`Recovered existing annotations from file for ${importedAnnotationCount} window(s).`);
+  }
+  if (restoredDraftCount > 0) {
+    statusMessages.push(`Auto-restored local draft for ${restoredDraftCount} window(s).`);
+  }
+  setGlobalMessage(statusMessages.join(" "), invalidWindows.length ? "warn" : "info");
 
   loaderView.classList.add("hidden");
   workspaceView.classList.remove("hidden");
@@ -499,22 +623,115 @@ function buildInitialAnnotation(round) {
       action_id: action.action_id,
       verdict: null,
       correction_label: null,
-      disagree_reasons: [],
       comment: null,
     })),
     task3_recommendations: round.recommendations.map((rec) => ({
       rank: rec.rank,
       position_index: rec.position_index,
       verdict: null,
-      disagree_reasons: [],
-      comment: null,
+      agreed_urgency: null,
+      agreed_dose: null,
     })),
-    task3_omission: {
-      has_omission: null,
-      categories: [],
-      description: null,
+    task3_additional_recommendations: {
+      has_additional: null,
+      actions: [],
+    },
+    task3_red_flag_actions: {
+      actions: [],
+    },
+    task4_patient_insights: {
+      insights: [],
     },
   };
+}
+
+function normalizeAnnotationForRound(round, rawAnnotation) {
+  const normalized = buildInitialAnnotation(round);
+  if (!isObject(rawAnnotation)) {
+    return normalized;
+  }
+
+  const rawTask1 = isObject(rawAnnotation.task1_status) ? rawAnnotation.task1_status : {};
+  normalized.task1_status.verdict = normalizeEnumValue(rawTask1.verdict, VERDICT_VALUES);
+  normalized.task1_status.correction_label = normalizeEnumValue(rawTask1.correction_label, STATUS_CORRECTION_VALUES);
+  normalized.task1_status.correction_domains = Array.isArray(rawTask1.correction_domains)
+    ? rawTask1.correction_domains.map((item) => safeString(item)).filter((item) => item.length > 0)
+    : [];
+  normalized.task1_status.comment = safeString(rawTask1.comment) || null;
+
+  const rawTask2 = Array.isArray(rawAnnotation.task2_actions) ? rawAnnotation.task2_actions : [];
+  const rawTask2ByActionId = new Map();
+  rawTask2.forEach((entry) => {
+    if (!isObject(entry)) {
+      return;
+    }
+    const actionId = safeString(entry.action_id);
+    if (actionId) {
+      rawTask2ByActionId.set(actionId, entry);
+    }
+  });
+  normalized.task2_actions = normalized.task2_actions.map((entry, index) => {
+    const rawEntry = rawTask2ByActionId.get(entry.action_id) || (isObject(rawTask2[index]) ? rawTask2[index] : null);
+    if (!rawEntry) {
+      return entry;
+    }
+    return {
+      ...entry,
+      verdict: normalizeEnumValue(rawEntry.verdict, VERDICT_VALUES),
+      correction_label: normalizeEnumValue(rawEntry.correction_label, ACTION_CORRECTION_VALUES),
+      comment: safeString(rawEntry.comment) || null,
+    };
+  });
+
+  const rawTask3 = Array.isArray(rawAnnotation.task3_recommendations) ? rawAnnotation.task3_recommendations : [];
+  normalized.task3_recommendations = normalized.task3_recommendations.map((entry, index) => {
+    const rawEntry = isObject(rawTask3[index]) ? rawTask3[index] : null;
+    if (!rawEntry) {
+      return entry;
+    }
+    return {
+      ...entry,
+      verdict: normalizeEnumValue(rawEntry.verdict, VERDICT_VALUES),
+      agreed_urgency: normalizeEnumValue(rawEntry.agreed_urgency, RECOMMENDATION_URGENCY_VALUES),
+      agreed_dose: normalizeEnumValue(rawEntry.agreed_dose, RECOMMENDATION_DOSE_VALUES),
+    };
+  });
+
+  const rawAdditional = isObject(rawAnnotation.task3_additional_recommendations)
+    ? rawAnnotation.task3_additional_recommendations
+    : {};
+  normalized.task3_additional_recommendations.has_additional = normalizeNullableBoolean(rawAdditional.has_additional);
+  normalized.task3_additional_recommendations.actions = getTextConfidenceItems(rawAdditional.actions);
+
+  const rawRedFlags = isObject(rawAnnotation.task3_red_flag_actions) ? rawAnnotation.task3_red_flag_actions : {};
+  normalized.task3_red_flag_actions.actions = getTextConfidenceItems(rawRedFlags.actions);
+
+  const rawInsights = isObject(rawAnnotation.task4_patient_insights) ? rawAnnotation.task4_patient_insights : {};
+  normalized.task4_patient_insights.insights = getTextConfidenceItems(rawInsights.insights);
+
+  return normalized;
+}
+
+function normalizeEnumValue(value, allowedValues) {
+  const text = safeString(value);
+  if (!text) {
+    return null;
+  }
+  return allowedValues instanceof Set && allowedValues.has(text) ? text : null;
+}
+
+function normalizeNullableBoolean(value) {
+  if (value === true || value === false) {
+    return value;
+  }
+  const normalized = normalizeLabel(value);
+  if (["true", "1", "yes", "y"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "no", "n"].includes(normalized)) {
+    return false;
+  }
+  return null;
 }
 
 function renderWorkspace() {
@@ -572,9 +789,10 @@ function renderLeftPanel() {
   const dischargeSummaryText = safeString(round.contextSections.icu_discharge_summary);
   const promptHistoryView = parsePromptHistorySection(round.contextSections.history_events_current_window);
   const historyHours = resolveHistoryHours(round, promptHistoryView.historyHours);
-  const historyEventsForDisplay = promptHistoryView.hasSection
+  const historyEventsForDisplayBase = promptHistoryView.hasSection
     ? promptHistoryView.events
     : (Array.isArray(round.historyEvents) ? round.historyEvents : []);
+  const historyEventsForDisplay = withOracleEventIds(historyEventsForDisplayBase, "HX");
   const filteredHistoryEvents = filterEventsByType(historyEventsForDisplay, state.historyEventTypeFilter);
   const historyTypeCounts = getEventTypeCounts(historyEventsForDisplay);
   const historyWindowLabel = historyHours !== null
@@ -619,7 +837,8 @@ function renderLeftPanel() {
         <div class="stat-pill">Task 1: ${stats.task1Done ? "Reviewed" : "Pending"}</div>
         <div class="stat-pill">Actions: ${stats.reviewedActions}/${stats.totalActions}</div>
         <div class="stat-pill">Recs: ${stats.reviewedRecs}/${stats.totalRecs}</div>
-        <div class="stat-pill">Omission Q: ${stats.omissionDone ? "Answered" : "Pending"}</div>
+        <div class="stat-pill">Extra recs Q: ${stats.additionalRecommendationsDone ? "Answered" : "Pending"}</div>
+        <div class="stat-pill">Task 4: ${stats.task4Done ? "Reviewed" : "Pending"}</div>
       </div>
     </div>
   `;
@@ -629,8 +848,14 @@ function renderCenterPanel() {
   const round = getCurrentRound();
   const currentEvents = Array.isArray(round.events) ? round.events : [];
   const rawEvents = Array.isArray(round.rawEvents) ? round.rawEvents : [];
-  const eventsForDisplay = rawEvents.length > 0 ? rawEvents : currentEvents;
-  const eventsSourceForDisplay = rawEvents.length > 0 ? round.rawEventSource : round.eventSource;
+  const promptCurrentView = parsePromptCurrentSection(round.contextSections.current_observation_window);
+  const eventsForDisplayBase = promptCurrentView.hasSection
+    ? promptCurrentView.events
+    : (rawEvents.length > 0 ? rawEvents : currentEvents);
+  const eventsForDisplay = withOracleEventIds(eventsForDisplayBase, "CW");
+  const eventsSourceForDisplay = promptCurrentView.hasSection
+    ? "window_contexts.prompt_sections.current_observation_window"
+    : (rawEvents.length > 0 ? round.rawEventSource : round.eventSource);
   const historyEvents = getPlotHistoryEvents(state.currentRoundIndex);
   const timelineStartMs = getTimelineStartMs();
 
@@ -660,18 +885,21 @@ function renderCenterPanel() {
 
   centerPanelEl.innerHTML = `
     <h2>Current Observation Window</h2>
-    <div class="summary-card">
-      <strong>Window summary</strong>
-      <div>${escapeHtml(safeString(round.oracleOutput.overall_window_summary) || "-")}</div>
+    <div class="current-window-grid">
+      <section class="current-window-section">
+        <h3 class="subsection-title">Vital trends</h3>
+        <div class="inline-meta">Vital plots include all prior-window history (grey) and current-window points (blue).</div>
+        <div class="sparkline-grid">${sparklineHtml}</div>
+      </section>
+      <section class="current-window-section">
+        <div class="section-header-row">
+          <h3 class="subsection-title">Current events</h3>
+          ${renderEventTypeFilter({ counts: eventTypeCounts, scope: "current", compact: true })}
+        </div>
+        <div class="inline-meta">Source: ${escapeHtml(sourceLabel)} | Events: ${eventsForDisplay.length}</div>
+        <div class="timeline-list">${eventListHtml}</div>
+      </section>
     </div>
-    <div class="inline-meta">Vital plots include all prior-window history (grey) and current-window points (blue).</div>
-    <div class="sparkline-grid">${sparklineHtml}</div>
-    <div class="section-header-row">
-      <h3 class="subsection-title">Current events</h3>
-      ${renderEventTypeFilter({ counts: eventTypeCounts, scope: "current", compact: true })}
-    </div>
-    <div class="inline-meta">Source: ${escapeHtml(sourceLabel)} | Events: ${eventsForDisplay.length}</div>
-    <div class="timeline-list">${eventListHtml}</div>
   `;
 }
 
@@ -684,10 +912,12 @@ function renderTimelineEvents(events, emptyHtml) {
     .map((event) => {
       const eventType = classifyEventType(event);
       const eventValue = formatEventValue(event);
+      const eventId = resolveEventEvidenceId(event);
       return `
         <article class="timeline-event event-${eventType}">
           <div class="event-top">
             <span class="time">${escapeHtml(formatTime(event.time || event.start_time || ""))}</span>
+            ${eventId ? `<span class="event-id">${escapeHtml(eventId)}</span>` : ""}
             <span class="code">${escapeHtml(safeString(event.code) || "UNKNOWN")}</span>
           </div>
           <div>${escapeHtml(formatEventDescription(event))}</div>
@@ -707,32 +937,19 @@ function renderRightPanel() {
 
   rightPanelEl.innerHTML = `
     <h2>Annotation Tasks</h2>
-    ${renderTask1(patientStatus, overall, annotation)}
+    ${renderTask1(overall, annotation)}
     ${renderTask2(round, annotation, task1Locked)}
     ${renderTask3(round, annotation, task1Locked)}
+    ${renderTask4(annotation, task1Locked)}
   `;
 }
 
-function renderTask1(patientStatus, overall, annotation) {
+function renderTask1(overall, annotation) {
   const task1 = annotation.task1_status;
-  const domains = isObject(patientStatus.domains) ? patientStatus.domains : {};
   const overallLabel = normalizeLabel(overall.label) || "unknown";
   const overallTone = overallToneClass(overallLabel);
   const verdictErrorClass = hasCurrentHighlight("task1.verdict") ? "error-highlight" : "";
   const correctionErrorClass = hasCurrentHighlight("task1.correction_label") ? "error-highlight" : "";
-
-  const domainCards = DOMAIN_KEYS.map((domainKey) => {
-    const domain = isObject(domains[domainKey]) ? domains[domainKey] : {};
-    const label = normalizeLabel(domain.label) || "unknown";
-    const keySignals = Array.isArray(domain.key_signals) ? domain.key_signals.join("; ") : "";
-    return `
-      <div class="domain-card">
-        <div><strong>${escapeHtml(domainKey)}</strong> <span class="badge badge-${escapeHtml(label)}">${escapeHtml(label)}</span></div>
-        <div class="inline-meta">${escapeHtml(safeString(keySignals))}</div>
-        <div>${escapeHtml(safeString(domain.rationale) || "-")}</div>
-      </div>
-    `;
-  }).join("");
 
   const disagreeFields = task1.verdict === "disagree"
     ? `
@@ -747,24 +964,12 @@ function renderTask1(patientStatus, overall, annotation) {
         </select>
       </div>
 
-      <div class="control-group">
-        <label>Domains where you disagree</label>
-        <div class="tag-grid">
-          ${DOMAIN_KEYS.map((domainKey) => {
-            const checked = task1.correction_domains.includes(domainKey) ? "checked" : "";
-            return `
-              <label class="tag-item">
-                <input type="checkbox" data-task1-domain="${domainKey}" ${checked} />
-                ${escapeHtml(domainKey)}
-              </label>
-            `;
-          }).join("")}
-        </div>
-      </div>
-
+      
       <div class="control-group">
         <label for="task1-comment">Comment</label>
-        <textarea id="task1-comment" placeholder="Optional">${escapeHtml(safeString(task1.comment))}</textarea>
+        <textarea id="task1-comment" placeholder="Briefly explain why you chose this label.">${escapeHtml(
+          safeString(task1.comment)
+        )}</textarea>
       </div>
     `
     : "";
@@ -778,11 +983,6 @@ function renderTask1(patientStatus, overall, annotation) {
         )}</span></div>
         <div>${escapeHtml(safeString(overall.rationale) || "-")}</div>
       </div>
-
-      <details>
-        <summary><strong>View domain details</strong></summary>
-        ${domainCards}
-      </details>
 
       <div class="verdict-row ${verdictErrorClass}">
         ${renderVerdictChips("task1-verdict", task1.verdict)}
@@ -799,8 +999,7 @@ function renderTask2(round, annotation, locked) {
       const actionAnn = annotation.task2_actions[index];
       const overallTone = overallToneClass(action.overall_label);
       const correctionErrorClass = hasCurrentHighlight(`action.${index}.correction_label`) ? "error-highlight" : "";
-      const reasonErrorClass = hasCurrentHighlight(`action.${index}.disagree_reasons`) ? "error-highlight" : "";
-      const cardErrorClass = correctionErrorClass || reasonErrorClass ? "error-highlight" : "";
+      const cardErrorClass = correctionErrorClass ? "error-highlight" : "";
       const disagreementFields = actionAnn.verdict === "disagree"
         ? `
           <div class="control-group ${correctionErrorClass}">
@@ -814,24 +1013,9 @@ function renderTask2(round, annotation, locked) {
             </select>
           </div>
 
-          <div class="control-group ${reasonErrorClass}">
-            <label>Reasons</label>
-            <div class="tag-grid">
-              ${ACTION_DISAGREE_REASONS.map((reason) => {
-                const checked = actionAnn.disagree_reasons.includes(reason) ? "checked" : "";
-                return `
-                  <label class="tag-item">
-                    <input type="checkbox" data-action-reason-index="${index}" data-reason="${escapeHtml(reason)}" ${checked} />
-                    ${escapeHtml(reason)}
-                  </label>
-                `;
-              }).join("")}
-            </div>
-          </div>
-
           <div class="control-group">
             <label for="action-comment-${index}">Comment</label>
-            <textarea id="action-comment-${index}" data-action-comment-index="${index}" placeholder="Optional">${escapeHtml(
+            <textarea id="action-comment-${index}" data-action-comment-index="${index}" placeholder="Briefly explain why you chose this label.">${escapeHtml(
               safeString(actionAnn.comment)
             )}</textarea>
           </div>
@@ -845,21 +1029,6 @@ function renderTask2(round, annotation, locked) {
             action.overall_label
           )}</span></div>
           <div>${escapeHtml(action.overall_rationale || "No rationale provided.")}</div>
-
-          <details>
-            <summary>Details</summary>
-            <div><strong>Guideline adherence:</strong> ${escapeHtml(normalizeLabel(action.guideline.label) || "-")}</div>
-            <div>${escapeHtml(safeString(action.guideline.rationale) || "-")}</div>
-            <div><strong>Reference:</strong> ${escapeHtml(safeString(action.guideline.guideline_reference) || "-")}</div>
-            <hr>
-            <div><strong>Contextual appropriateness:</strong> ${escapeHtml(
-              normalizeLabel(action.contextual.label) || "-"
-            )}</div>
-            <div>${escapeHtml(safeString(action.contextual.rationale) || "-")}</div>
-            ${safeString(action.contextual.hindsight_caveat)
-              ? `<div class="inline-meta"><em>Hindsight caveat: ${escapeHtml(action.contextual.hindsight_caveat)}</em></div>`
-              : ""}
-          </details>
 
           <div class="verdict-row">
             ${renderVerdictChips(`action-verdict-${index}`, actionAnn.verdict, {
@@ -884,43 +1053,44 @@ function renderTask2(round, annotation, locked) {
 }
 
 function renderTask3(round, annotation, locked) {
+  const additionalRecs = annotation.task3_additional_recommendations;
+  const additionalActions = getTextConfidenceItems(additionalRecs.actions);
+  const redFlagActions = getTextConfidenceItems(annotation.task3_red_flag_actions.actions);
   const recommendationCards = round.recommendations
     .map((rec, index) => {
       const recAnn = annotation.task3_recommendations[index];
-      const reasonErrorClass = hasCurrentHighlight(`recommendation.${index}.disagree_reasons`) ? "error-highlight" : "";
-      const disagreementFields = recAnn.verdict === "disagree"
+      const urgencyErrorClass = hasCurrentHighlight(`recommendation.${index}.urgency`) ? "error-highlight" : "";
+      const doseErrorClass = hasCurrentHighlight(`recommendation.${index}.dose`) ? "error-highlight" : "";
+      const cardErrorClass = urgencyErrorClass || doseErrorClass ? "error-highlight" : "";
+      const agreementFields = recAnn.verdict === "agree"
         ? `
-          <div class="control-group ${reasonErrorClass}">
-            <label>Reasons</label>
-            <div class="tag-grid">
-              ${RECOMMENDATION_DISAGREE_REASONS.map((reason) => {
-                const checked = recAnn.disagree_reasons.includes(reason) ? "checked" : "";
-                return `
-                  <label class="tag-item">
-                    <input type="checkbox" data-rec-reason-index="${index}" data-reason="${escapeHtml(reason)}" ${checked} />
-                    ${escapeHtml(reason)}
-                  </label>
-                `;
+          <div class="control-group ${urgencyErrorClass}">
+            <label for="rec-urgency-${index}">Urgency</label>
+            <select id="rec-urgency-${index}" data-rec-agree-urgency-index="${index}">
+              <option value="">Select urgency</option>
+              ${RECOMMENDATION_AGREED_URGENCY_OPTIONS.map((option) => {
+                const selected = recAnn.agreed_urgency === option.value ? "selected" : "";
+                return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
               }).join("")}
-            </div>
+            </select>
           </div>
-
-          <div class="control-group">
-            <label for="rec-comment-${index}">Comment</label>
-            <textarea id="rec-comment-${index}" data-rec-comment-index="${index}" placeholder="Optional">${escapeHtml(
-              safeString(recAnn.comment)
-            )}</textarea>
+          <div class="control-group ${doseErrorClass}">
+            <label for="rec-dose-${index}">Dose</label>
+            <select id="rec-dose-${index}" data-rec-agree-dose-index="${index}">
+              <option value="">Select dose</option>
+              ${RECOMMENDATION_AGREED_DOSE_OPTIONS.map((option) => {
+                const selected = recAnn.agreed_dose === option.value ? "selected" : "";
+                return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
+              }).join("")}
+            </select>
           </div>
         `
         : "";
 
       return `
-        <article class="rec-card ${reasonErrorClass}">
-          <div><strong>${escapeHtml(formatRecommendationRank(rec))} ${escapeHtml(rec.action)}</strong> ${rec.urgency ? `[${escapeHtml(
-            rec.urgency
-          )}]` : ""}</div>
+        <article class="rec-card ${cardErrorClass}">
+          <div><strong>${escapeHtml(formatRecommendationRank(rec))} ${escapeHtml(rec.action)}</strong></div>
           ${rec.action_description ? `<div>${escapeHtml(rec.action_description)}</div>` : ""}
-          ${rec.rationale ? `<div class="inline-meta">Rationale: ${escapeHtml(rec.rationale)}</div>` : ""}
 
           <div class="verdict-row">
             ${renderVerdictChips(`rec-verdict-${index}`, recAnn.verdict, {
@@ -928,52 +1098,87 @@ function renderTask3(round, annotation, locked) {
             })}
           </div>
 
-          ${disagreementFields}
+          ${agreementFields}
         </article>
       `;
     })
     .join("");
 
-  const omission = annotation.task3_omission;
-  const omissionBlock = `
+  const additionalRecommendationBlock = `
     <div class="summary-card">
-      <strong>Critical omission question</strong>
-      <p>Within this window, was there an important intervention that should have been performed but was not - and that Oracle also did not recommend?</p>
-      <div class="verdict-row">
-        <label class="verdict-chip"><input type="radio" name="omission-verdict" value="false" ${
-          omission.has_omission === false ? "checked" : ""
-        } /> No obvious omission</label>
-        <label class="verdict-chip"><input type="radio" name="omission-verdict" value="true" ${
-          omission.has_omission === true ? "checked" : ""
+      <strong>Any other recommended actions to add?</strong>
+      <div class="verdict-row ${hasCurrentHighlight("task3_additional_recommendations.has_additional") ? "error-highlight" : ""}">
+        <label class="verdict-chip"><input type="radio" name="additional-rec-verdict" value="true" ${
+          additionalRecs.has_additional === true ? "checked" : ""
         } /> Yes</label>
-        <label class="verdict-chip"><input type="radio" name="omission-verdict" value="null" ${
-          omission.has_omission === null ? "checked" : ""
-        } /> Not answered</label>
+        <label class="verdict-chip"><input type="radio" name="additional-rec-verdict" value="false" ${
+          additionalRecs.has_additional === false ? "checked" : ""
+        } /> No</label>
       </div>
 
       ${
-        omission.has_omission === true
+        additionalRecs.has_additional === true
           ? `
-        <div class="control-group">
-          <label>Categories</label>
-          <div class="tag-grid">
-            ${OMISSION_CATEGORIES.map((category) => {
-              const checked = omission.categories.includes(category) ? "checked" : "";
-              return `
-                <label class="tag-item">
-                  <input type="checkbox" data-omission-category="${escapeHtml(category)}" ${checked} />
-                  ${escapeHtml(category)}
-                </label>
-              `;
-            }).join("")}
+        <div class="control-group ${hasCurrentHighlight("task3_additional_recommendations.actions") ? "error-highlight" : ""}">
+          <label>Additional recommended action(s)</label>
+          <div class="inline-meta">Choose category first, then write free text. Each action also needs 1-5 evidence event IDs (e.g., CW4, HX12).</div>
+          <div class="additional-actions-list">
+            ${
+              additionalActions.map((actionItem, actionIndex) => {
+                const categoryToken = `task3_additional_recommendations.actions.${actionIndex}.category`;
+                const evidenceToken = `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`;
+                const categoryErrorClass = hasCurrentHighlight(categoryToken) ? "error-highlight" : "";
+                const evidenceErrorClass = hasCurrentHighlight(evidenceToken) ? "error-highlight" : "";
+                const categoryValue = normalizeAdditionalActionCategory(actionItem.category);
+                return `
+                  <div class="additional-action-block">
+                    <div class="additional-action-block-row">
+                      <select
+                        class="additional-action-category-select ${categoryErrorClass}"
+                        data-additional-action-category-index="${actionIndex}"
+                      >
+                        <option value="">Select category first</option>
+                        ${ICU_ACTION_CATEGORIES.map((categoryOption) => {
+                          const selected = categoryValue === categoryOption ? "selected" : "";
+                          return `<option value="${escapeHtml(categoryOption)}" ${selected}>${escapeHtml(categoryOption)}</option>`;
+                        }).join("")}
+                      </select>
+                      <select class="additional-action-confidence-select" data-additional-action-confidence-index="${actionIndex}">
+                        <option value="">confidence</option>
+                        ${FREE_TEXT_CONFIDENCE_OPTIONS.map((option) => {
+                          const selected = actionItem.confidence === option.value ? "selected" : "";
+                          return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
+                        }).join("")}
+                      </select>
+                      <button
+                        type="button"
+                        class="secondary-btn additional-action-remove-btn"
+                        data-additional-action-remove-index="${actionIndex}"
+                      >Remove block</button>
+                    </div>
+                    <div class="additional-action-block-row">
+                      <input
+                        type="text"
+                        class="additional-action-text-input"
+                        ${categoryValue ? "" : "disabled"}
+                        value="${escapeHtml(actionItem.text)}"
+                        data-additional-action-index="${actionIndex}"
+                        placeholder="${categoryValue ? "Enter one action" : "Select category first"}"
+                      />
+                      <input
+                        type="text"
+                        class="evidence-ids-input ${evidenceErrorClass}"
+                        value="${escapeHtml(actionItem.evidence_event_ids_text || "")}"
+                        data-additional-action-evidence-index="${actionIndex}"
+                        placeholder="Evidence IDs (1-5): CW4, HX12"
+                      />
+                    </div>
+                  </div>
+                `;
+              }).join("")
+            }
           </div>
-        </div>
-
-        <div class="control-group ${hasCurrentHighlight("task3_omission.description") ? "error-highlight" : ""}">
-          <label for="omission-description">Description</label>
-          <textarea id="omission-description" placeholder="Required when omission is Yes">${escapeHtml(
-            safeString(omission.description)
-          )}</textarea>
+          <button type="button" class="secondary-btn" data-additional-action-add="1">Add action</button>
         </div>
       `
           : ""
@@ -981,13 +1186,92 @@ function renderTask3(round, annotation, locked) {
     </div>
   `;
 
+  const redFlagActionsBlock = `
+    <div class="summary-card">
+      <strong>Red flag actions to avoid</strong>
+      <div class="inline-meta">Mark clear contraindications and likely harmful actions in the current window.</div>
+      <div class="control-group">
+        <label>Actions to avoid</label>
+        <div class="additional-actions-list">
+          ${
+            redFlagActions.map((actionItem, actionIndex) => {
+              return `
+                <div class="additional-action-row">
+                  <input
+                    type="text"
+                    value="${escapeHtml(actionItem.text)}"
+                    data-red-flag-action-index="${actionIndex}"
+                    placeholder="Enter one red flag action per line"
+                  />
+                  <select data-red-flag-action-confidence-index="${actionIndex}">
+                    <option value="">confidence</option>
+                    ${FREE_TEXT_CONFIDENCE_OPTIONS.map((option) => {
+                      const selected = actionItem.confidence === option.value ? "selected" : "";
+                      return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
+                    }).join("")}
+                  </select>
+                  <button type="button" class="secondary-btn" data-red-flag-action-remove-index="${actionIndex}">Remove</button>
+                </div>
+              `;
+            }).join("")
+          }
+        </div>
+        <button type="button" class="secondary-btn" data-red-flag-action-add="1">Add red flag action</button>
+      </div>
+    </div>
+  `;
+
   return `
     <section class="task-section" id="task3-section">
-      <h3 class="task-title">Task 3: Recommendation Review</h3>
+      <h3 class="task-title">Task 3: Clinical Recommendations</h3>
       <div class="review-note">Recommendations are sorted by rank; null ranks are shown last.</div>
       ${recommendationCards || `<div class="summary-card">No recommendations in this window.</div>`}
-      ${omissionBlock}
+      ${additionalRecommendationBlock}
+      ${redFlagActionsBlock}
       ${locked ? '<div class="task-locked-overlay">Complete Task 1 to unlock Task 3</div>' : ""}
+    </section>
+  `;
+}
+
+function renderTask4(annotation, locked) {
+  const insights = getTextConfidenceItems(
+    isObject(annotation.task4_patient_insights) ? annotation.task4_patient_insights.insights : []
+  );
+  const insightsErrorClass = hasCurrentHighlight("task4_patient_insights.insights") ? "error-highlight" : "";
+
+  return `
+    <section class="task-section" id="task4-section">
+      <h3 class="task-title">Task 4: Patient Insights</h3>
+      <div class="review-note">Use 1-2 sentences per item to describe what is uniquely notable about this patient vs average patients.</div>
+      <div class="control-group ${insightsErrorClass}">
+        <label>Unique patient insights</label>
+        <div class="additional-actions-list">
+          ${
+            insights.map((insightItem, index) => {
+              return `
+                <div class="additional-action-row">
+                  <input
+                    type="text"
+                    value="${escapeHtml(insightItem.text)}"
+                    data-patient-insight-index="${index}"
+                    placeholder="e.g., Most unusual feature compared with average patients"
+                  />
+                  <select data-patient-insight-confidence-index="${index}">
+                    <option value="">confidence</option>
+                    ${FREE_TEXT_CONFIDENCE_OPTIONS.map((option) => {
+                      const selected = insightItem.confidence === option.value ? "selected" : "";
+                      return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
+                    }).join("")}
+                  </select>
+                  <button type="button" class="secondary-btn" data-patient-insight-remove-index="${index}">Remove</button>
+                </div>
+              `;
+            }).join("")
+          }
+        </div>
+        <button type="button" class="secondary-btn" data-patient-insight-add="1">Add insight</button>
+      </div>
+      ${locked ? '<div class="task-locked-overlay">Complete Task 1 to unlock Task 4</div>' : ""}
     </section>
   `;
 }
@@ -996,7 +1280,7 @@ function renderVerdictChips(name, selectedVerdict, extraAttributes = {}) {
   const options = [
     { value: "agree", label: "Agree" },
     { value: "disagree", label: "Disagree" },
-    { value: "uncertain", label: "Uncertain" },
+    { value: "uncertain", label: "Not sure" },
   ];
 
   const attrs = Object.entries(extraAttributes)
@@ -1423,6 +1707,7 @@ function onWindowSelectChange(event) {
   state.currentRoundIndex = clamp(selectedIndex, 0, state.rounds.length - 1);
   state.currentEventTypeFilter = "all";
   state.historyEventTypeFilter = "all";
+  scheduleAutoSave();
   renderWorkspace();
 }
 
@@ -1430,7 +1715,75 @@ function stepWindow(offset) {
   state.currentRoundIndex = clamp(state.currentRoundIndex + offset, 0, state.rounds.length - 1);
   state.currentEventTypeFilter = "all";
   state.historyEventTypeFilter = "all";
+  scheduleAutoSave();
   renderWorkspace();
+}
+
+function onWorkspaceClick(event) {
+  if (!state.loaded) {
+    return;
+  }
+
+  const target = event.target;
+  const annotation = getCurrentAnnotation();
+  clearCurrentRoundErrorHighlights();
+  let shouldRender = false;
+
+  if (target.dataset.additionalActionAdd) {
+    const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
+    items.push(buildTextConfidenceItem());
+    shouldRender = true;
+  }
+
+  if (target.dataset.additionalActionRemoveIndex) {
+    const removeIndex = toInt(target.dataset.additionalActionRemoveIndex, null);
+    const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
+    if (removeIndex !== null && Array.isArray(items) && removeIndex >= 0 && removeIndex < items.length) {
+      items.splice(removeIndex, 1);
+      shouldRender = true;
+    }
+  }
+
+  if (target.dataset.redFlagActionAdd) {
+    if (!isObject(annotation.task3_red_flag_actions)) {
+      annotation.task3_red_flag_actions = { actions: [] };
+    }
+    const items = ensureTextConfidenceList(annotation.task3_red_flag_actions, "actions");
+    items.push(buildTextConfidenceItem());
+    shouldRender = true;
+  }
+
+  if (target.dataset.redFlagActionRemoveIndex) {
+    const removeIndex = toInt(target.dataset.redFlagActionRemoveIndex, null);
+    const items = ensureTextConfidenceList(annotation.task3_red_flag_actions, "actions");
+    if (removeIndex !== null && Array.isArray(items) && removeIndex >= 0 && removeIndex < items.length) {
+      items.splice(removeIndex, 1);
+      shouldRender = true;
+    }
+  }
+
+  if (target.dataset.patientInsightAdd) {
+    if (!isObject(annotation.task4_patient_insights)) {
+      annotation.task4_patient_insights = { insights: [] };
+    }
+    const items = ensureTextConfidenceList(annotation.task4_patient_insights, "insights");
+    items.push(buildTextConfidenceItem());
+    shouldRender = true;
+  }
+
+  if (target.dataset.patientInsightRemoveIndex) {
+    const removeIndex = toInt(target.dataset.patientInsightRemoveIndex, null);
+    const items = ensureTextConfidenceList(annotation.task4_patient_insights, "insights");
+    if (removeIndex !== null && Array.isArray(items) && removeIndex >= 0 && removeIndex < items.length) {
+      items.splice(removeIndex, 1);
+      shouldRender = true;
+    }
+  }
+
+  if (shouldRender) {
+    scheduleAutoSave();
+    renderWorkspace();
+  }
 }
 
 function onWorkspaceChange(event) {
@@ -1477,7 +1830,6 @@ function onWorkspaceChange(event) {
       annotation.task2_actions[actionIndex].verdict = target.value;
       if (target.value !== "disagree") {
         annotation.task2_actions[actionIndex].correction_label = null;
-        annotation.task2_actions[actionIndex].disagree_reasons = [];
         annotation.task2_actions[actionIndex].comment = null;
       }
       shouldRender = true;
@@ -1491,59 +1843,83 @@ function onWorkspaceChange(event) {
     }
   }
 
-  if (target.dataset.actionReasonIndex) {
-    const actionIndex = toInt(target.dataset.actionReasonIndex, null);
-    if (actionIndex !== null && annotation.task2_actions[actionIndex]) {
-      toggleSelection(
-        annotation.task2_actions[actionIndex].disagree_reasons,
-        target.dataset.reason || "",
-        target.checked
-      );
-    }
-  }
-
   if (target.name.startsWith("rec-verdict-")) {
     const recIndex = toInt(target.dataset.recIndex, null);
     if (recIndex !== null && annotation.task3_recommendations[recIndex]) {
       annotation.task3_recommendations[recIndex].verdict = target.value;
-      if (target.value !== "disagree") {
-        annotation.task3_recommendations[recIndex].disagree_reasons = [];
-        annotation.task3_recommendations[recIndex].comment = null;
+      if (target.value !== "agree") {
+        annotation.task3_recommendations[recIndex].agreed_urgency = null;
+        annotation.task3_recommendations[recIndex].agreed_dose = null;
       }
       shouldRender = true;
     }
   }
 
-  if (target.dataset.recReasonIndex) {
-    const recIndex = toInt(target.dataset.recReasonIndex, null);
+  if (target.dataset.recAgreeUrgencyIndex) {
+    const recIndex = toInt(target.dataset.recAgreeUrgencyIndex, null);
     if (recIndex !== null && annotation.task3_recommendations[recIndex]) {
-      toggleSelection(
-        annotation.task3_recommendations[recIndex].disagree_reasons,
-        target.dataset.reason || "",
-        target.checked
-      );
+      annotation.task3_recommendations[recIndex].agreed_urgency = target.value || null;
     }
   }
 
-  if (target.name === "omission-verdict") {
+  if (target.dataset.recAgreeDoseIndex) {
+    const recIndex = toInt(target.dataset.recAgreeDoseIndex, null);
+    if (recIndex !== null && annotation.task3_recommendations[recIndex]) {
+      annotation.task3_recommendations[recIndex].agreed_dose = target.value || null;
+    }
+  }
+
+  if (target.name === "additional-rec-verdict") {
     if (target.value === "true") {
-      annotation.task3_omission.has_omission = true;
+      annotation.task3_additional_recommendations.has_additional = true;
+      const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
+      if (items.length === 0) {
+        items.push(buildTextConfidenceItem());
+      }
     } else if (target.value === "false") {
-      annotation.task3_omission.has_omission = false;
-      annotation.task3_omission.categories = [];
-      annotation.task3_omission.description = null;
+      annotation.task3_additional_recommendations.has_additional = false;
+      annotation.task3_additional_recommendations.actions = [];
     } else {
-      annotation.task3_omission.has_omission = null;
-      annotation.task3_omission.categories = [];
-      annotation.task3_omission.description = null;
+      annotation.task3_additional_recommendations.has_additional = null;
+      annotation.task3_additional_recommendations.actions = [];
     }
     shouldRender = true;
   }
 
-  if (target.dataset.omissionCategory) {
-    toggleSelection(annotation.task3_omission.categories, target.dataset.omissionCategory, target.checked);
+  if (target.dataset.additionalActionConfidenceIndex) {
+    const actionIndex = toInt(target.dataset.additionalActionConfidenceIndex, null);
+    const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
+    if (actionIndex !== null && actionIndex >= 0 && actionIndex < items.length) {
+      items[actionIndex].confidence = normalizeConfidence(target.value);
+    }
   }
 
+  if (target.dataset.additionalActionCategoryIndex) {
+    const actionIndex = toInt(target.dataset.additionalActionCategoryIndex, null);
+    const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
+    if (actionIndex !== null && actionIndex >= 0 && actionIndex < items.length) {
+      items[actionIndex].category = normalizeAdditionalActionCategory(target.value);
+      shouldRender = true;
+    }
+  }
+
+  if (target.dataset.redFlagActionConfidenceIndex) {
+    const actionIndex = toInt(target.dataset.redFlagActionConfidenceIndex, null);
+    const items = ensureTextConfidenceList(annotation.task3_red_flag_actions, "actions");
+    if (actionIndex !== null && actionIndex >= 0 && actionIndex < items.length) {
+      items[actionIndex].confidence = normalizeConfidence(target.value);
+    }
+  }
+
+  if (target.dataset.patientInsightConfidenceIndex) {
+    const insightIndex = toInt(target.dataset.patientInsightConfidenceIndex, null);
+    const items = ensureTextConfidenceList(annotation.task4_patient_insights, "insights");
+    if (insightIndex !== null && insightIndex >= 0 && insightIndex < items.length) {
+      items[insightIndex].confidence = normalizeConfidence(target.value);
+    }
+  }
+
+  scheduleAutoSave();
   if (shouldRender) {
     renderWorkspace();
   }
@@ -1569,16 +1945,39 @@ function onWorkspaceInput(event) {
     }
   }
 
-  if (target.dataset.recCommentIndex) {
-    const recIndex = toInt(target.dataset.recCommentIndex, null);
-    if (recIndex !== null && annotation.task3_recommendations[recIndex]) {
-      annotation.task3_recommendations[recIndex].comment = safeString(target.value) || null;
+  if (target.dataset.additionalActionIndex) {
+    const actionIndex = toInt(target.dataset.additionalActionIndex, null);
+    const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
+    if (actionIndex !== null && Array.isArray(items) && actionIndex >= 0 && actionIndex < items.length) {
+      items[actionIndex].text = target.value;
     }
   }
 
-  if (target.id === "omission-description") {
-    annotation.task3_omission.description = safeString(target.value) || null;
+  if (target.dataset.additionalActionEvidenceIndex) {
+    const actionIndex = toInt(target.dataset.additionalActionEvidenceIndex, null);
+    const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
+    if (actionIndex !== null && Array.isArray(items) && actionIndex >= 0 && actionIndex < items.length) {
+      items[actionIndex].evidence_event_ids_text = target.value;
+    }
   }
+
+  if (target.dataset.redFlagActionIndex) {
+    const actionIndex = toInt(target.dataset.redFlagActionIndex, null);
+    const items = ensureTextConfidenceList(annotation.task3_red_flag_actions, "actions");
+    if (actionIndex !== null && Array.isArray(items) && actionIndex >= 0 && actionIndex < items.length) {
+      items[actionIndex].text = target.value;
+    }
+  }
+
+  if (target.dataset.patientInsightIndex) {
+    const insightIndex = toInt(target.dataset.patientInsightIndex, null);
+    const items = ensureTextConfidenceList(annotation.task4_patient_insights, "insights");
+    if (insightIndex !== null && Array.isArray(items) && insightIndex >= 0 && insightIndex < items.length) {
+      items[insightIndex].text = target.value;
+    }
+  }
+
+  scheduleAutoSave();
 }
 
 function onExport() {
@@ -1625,7 +2024,6 @@ function onExport() {
     const warnings = validation.windowWarnings[round.arrayIndex] || {
       unreviewed_actions: [],
       unreviewed_recommendations: [],
-      omission_unanswered: false,
     };
 
     output.window_outputs[round.arrayIndex].annotation = {
@@ -1642,20 +2040,24 @@ function onExport() {
         action_id: entry.action_id,
         verdict: entry.verdict,
         correction_label: entry.correction_label,
-        disagree_reasons: entry.disagree_reasons.slice(),
         comment: entry.comment,
       })),
       task3_recommendations: annotation.task3_recommendations.map((entry) => ({
         rank: entry.rank,
         position_index: entry.position_index,
         verdict: entry.verdict,
-        disagree_reasons: entry.disagree_reasons.slice(),
-        comment: entry.comment,
+        agreed_urgency: entry.agreed_urgency,
+        agreed_dose: entry.agreed_dose,
       })),
-      task3_omission: {
-        has_omission: annotation.task3_omission.has_omission,
-        categories: annotation.task3_omission.categories.slice(),
-        description: annotation.task3_omission.description,
+      task3_additional_recommendations: {
+        has_additional: annotation.task3_additional_recommendations.has_additional,
+        actions: exportAdditionalRecommendationItems(annotation.task3_additional_recommendations.actions),
+      },
+      task3_red_flag_actions: {
+        actions: exportTextConfidenceItems(annotation.task3_red_flag_actions.actions, "action"),
+      },
+      task4_patient_insights: {
+        insights: exportTextConfidenceItems(annotation.task4_patient_insights.insights, "insight"),
       },
       review_warnings: warnings,
     };
@@ -1673,8 +2075,194 @@ function onExport() {
 
   const filename = `${safeString(output.subject_id) || "subject"}_${safeString(output.icu_stay_id) || "stay"}_annotated.json`;
   state.errorHighlights = {};
+  flushAutoSaveNow();
   downloadJson(output, filename);
   setGlobalMessage(`Exported ${filename}`, "info");
+}
+
+function onImportDraftClick() {
+  if (!state.loaded || !draftFileInputEl) {
+    return;
+  }
+  draftFileInputEl.value = "";
+  draftFileInputEl.click();
+}
+
+async function onDraftFileSelected(event) {
+  if (!state.loaded) {
+    return;
+  }
+  const file = event && event.target && event.target.files && event.target.files[0]
+    ? event.target.files[0]
+    : null;
+  if (!file) {
+    return;
+  }
+
+  try {
+    const draftPayload = await readJsonFile(file);
+    const appliedCount = applyDraftSnapshot(draftPayload);
+    if (appliedCount <= 0) {
+      throw new Error("No draft annotations were applied to this case.");
+    }
+    persistDraftToLocalStorage();
+    renderWorkspace();
+    setGlobalMessage(`Imported draft (${appliedCount} window(s) restored).`, "info");
+  } catch (error) {
+    setGlobalMessage(`Failed to import draft: ${error.message}`, "warn");
+  } finally {
+    if (draftFileInputEl) {
+      draftFileInputEl.value = "";
+    }
+  }
+}
+
+function onExportDraft() {
+  if (!state.loaded) {
+    return;
+  }
+  const snapshot = buildDraftSnapshot();
+  const filename = `${safeString(snapshot.subject_id) || "subject"}_${safeString(snapshot.icu_stay_id) || "stay"}_annotation_draft.json`;
+  flushAutoSaveNow();
+  downloadJson(snapshot, filename);
+  setGlobalMessage(`Exported draft ${filename}`, "info");
+}
+
+function buildDraftStorageKey(predictionsData) {
+  const subjectId = safeString(predictionsData && predictionsData.subject_id) || "unknown_subject";
+  const icuStayId = safeString(predictionsData && predictionsData.icu_stay_id) || "unknown_stay";
+  const totalWindows = Array.isArray(predictionsData && predictionsData.window_outputs)
+    ? predictionsData.window_outputs.length
+    : 0;
+  return `${DRAFT_STORAGE_PREFIX}:${subjectId}:${icuStayId}:${totalWindows}`;
+}
+
+function buildDraftSnapshot() {
+  return {
+    draft_version: 1,
+    saved_at: new Date().toISOString(),
+    draft_key: state.draftKey,
+    subject_id: state.predictionsData ? safeString(state.predictionsData.subject_id) : "",
+    icu_stay_id: state.predictionsData ? safeString(state.predictionsData.icu_stay_id) : "",
+    total_windows: state.rounds.length,
+    current_round_index: state.currentRoundIndex,
+    source_files: cloneData(state.sourceFiles),
+    annotations: cloneData(state.annotations),
+  };
+}
+
+function scheduleAutoSave() {
+  if (!state.loaded || !state.draftKey) {
+    return;
+  }
+  clearAutoSaveTimer();
+  state.autoSaveTimerId = window.setTimeout(() => {
+    persistDraftToLocalStorage();
+  }, AUTO_SAVE_DEBOUNCE_MS);
+}
+
+function clearAutoSaveTimer() {
+  if (state.autoSaveTimerId !== null) {
+    window.clearTimeout(state.autoSaveTimerId);
+    state.autoSaveTimerId = null;
+  }
+}
+
+function flushAutoSaveNow() {
+  if (!state.loaded || !state.draftKey) {
+    return false;
+  }
+  clearAutoSaveTimer();
+  return persistDraftToLocalStorage();
+}
+
+function persistDraftToLocalStorage() {
+  if (!state.loaded || !state.draftKey) {
+    return false;
+  }
+  try {
+    const snapshot = buildDraftSnapshot();
+    localStorage.setItem(state.draftKey, JSON.stringify(snapshot));
+    return true;
+  } catch (error) {
+    if (!state.autoSaveErrorShown) {
+      state.autoSaveErrorShown = true;
+      setGlobalMessage(`Auto-save failed: ${error.message}`, "warn");
+    }
+    return false;
+  }
+}
+
+function restoreDraftFromLocalStorage() {
+  if (!state.draftKey) {
+    return 0;
+  }
+  try {
+    const raw = localStorage.getItem(state.draftKey);
+    if (!raw) {
+      return 0;
+    }
+    const snapshot = JSON.parse(raw);
+    return applyDraftSnapshot(snapshot);
+  } catch (error) {
+    return 0;
+  }
+}
+
+function applyDraftSnapshot(snapshot) {
+  if (!isObject(snapshot) || !isObject(snapshot.annotations)) {
+    return 0;
+  }
+  if (!isDraftCompatibleWithCurrentSession(snapshot)) {
+    throw new Error("Draft file does not match current patient/case.");
+  }
+
+  const annotationsByIndex = snapshot.annotations;
+  const annotationsByWindowKey = new Map();
+  Object.values(annotationsByIndex).forEach((entry) => {
+    if (!isObject(entry)) {
+      return;
+    }
+    const windowKey = safeString(entry.window_key);
+    if (windowKey) {
+      annotationsByWindowKey.set(windowKey, entry);
+    }
+  });
+
+  let appliedCount = 0;
+  state.rounds.forEach((round) => {
+    const rawByIndex = annotationsByIndex[round.arrayIndex] || annotationsByIndex[String(round.arrayIndex)];
+    const rawByWindowKey = annotationsByWindowKey.get(round.windowKey);
+    const rawAnnotation = isObject(rawByIndex) ? rawByIndex : (isObject(rawByWindowKey) ? rawByWindowKey : null);
+    if (!rawAnnotation) {
+      return;
+    }
+    state.annotations[round.arrayIndex] = normalizeAnnotationForRound(round, rawAnnotation);
+    appliedCount += 1;
+  });
+
+  const nextRoundIndex = toInt(snapshot.current_round_index, state.currentRoundIndex);
+  state.currentRoundIndex = clamp(nextRoundIndex, 0, state.rounds.length - 1);
+  state.errorHighlights = {};
+  return appliedCount;
+}
+
+function isDraftCompatibleWithCurrentSession(snapshot) {
+  const snapshotSubject = safeString(snapshot.subject_id);
+  const snapshotStay = safeString(snapshot.icu_stay_id);
+  const currentSubject = safeString(state.predictionsData && state.predictionsData.subject_id);
+  const currentStay = safeString(state.predictionsData && state.predictionsData.icu_stay_id);
+  if (snapshotSubject && currentSubject && snapshotSubject !== currentSubject) {
+    return false;
+  }
+  if (snapshotStay && currentStay && snapshotStay !== currentStay) {
+    return false;
+  }
+  const snapshotWindows = toInt(snapshot.total_windows, state.rounds.length);
+  if (snapshotWindows !== state.rounds.length) {
+    return false;
+  }
+  return true;
 }
 
 function collectValidationReport() {
@@ -1703,12 +2291,10 @@ function collectValidationReport() {
     const unreviewedRecommendations = annotation.task3_recommendations
       .filter((rec) => rec.verdict === null)
       .map((rec) => formatRecommendationId(rec));
-    const omissionUnanswered = annotation.task3_omission.has_omission === null;
 
     windowWarnings[round.arrayIndex] = {
       unreviewed_actions: unreviewedActions,
       unreviewed_recommendations: unreviewedRecommendations,
-      omission_unanswered: omissionUnanswered,
     };
 
     if (unreviewedActions.length > 0) {
@@ -1716,9 +2302,6 @@ function collectValidationReport() {
     }
     if (unreviewedRecommendations.length > 0) {
       warnings.push(`${labelPrefix}: unreviewed recommendations (${unreviewedRecommendations.join(", ")})`);
-    }
-    if (omissionUnanswered) {
-      warnings.push(`${labelPrefix}: critical omission question is unanswered.`);
     }
   });
 
@@ -1757,27 +2340,82 @@ function collectRoundBlockingIssues(round, annotation) {
         message: `Action ${action.action_id} disagree requires corrected label.`,
       });
     }
-    if (!Array.isArray(action.disagree_reasons) || action.disagree_reasons.length === 0) {
-      issues.push({
-        token: `action.${actionIndex}.disagree_reasons`,
-        message: `Action ${action.action_id} disagree requires at least one reason.`,
-      });
-    }
   });
 
   annotation.task3_recommendations.forEach((rec, recIndex) => {
-    if (rec.verdict === "disagree" && (!Array.isArray(rec.disagree_reasons) || rec.disagree_reasons.length === 0)) {
+    if (rec.verdict !== "agree") {
+      return;
+    }
+    if (!safeString(rec.agreed_urgency)) {
       issues.push({
-        token: `recommendation.${recIndex}.disagree_reasons`,
-        message: `Recommendation ${formatRecommendationId(rec)} disagree requires at least one reason.`,
+        token: `recommendation.${recIndex}.urgency`,
+        message: `Recommendation ${formatRecommendationId(rec)} agree requires urgency.`,
+      });
+    }
+    if (!safeString(rec.agreed_dose)) {
+      issues.push({
+        token: `recommendation.${recIndex}.dose`,
+        message: `Recommendation ${formatRecommendationId(rec)} agree requires dose.`,
       });
     }
   });
 
-  if (annotation.task3_omission.has_omission === true && !safeString(annotation.task3_omission.description)) {
+  if (annotation.task3_additional_recommendations.has_additional === null) {
     issues.push({
-      token: "task3_omission.description",
-      message: "Omission description is required when omission is Yes.",
+      token: "task3_additional_recommendations.has_additional",
+      message: "Please answer whether there are additional recommended actions.",
+    });
+  }
+
+  const additionalActions = getTextConfidenceItems(annotation.task3_additional_recommendations.actions);
+  const hasAtLeastOneAdditionalAction = additionalActions.some((item) => item.text.length > 0);
+  if (annotation.task3_additional_recommendations.has_additional === true && !hasAtLeastOneAdditionalAction) {
+    issues.push({
+      token: "task3_additional_recommendations.actions",
+      message: "At least one additional action is required when answer is Yes.",
+    });
+  }
+  if (annotation.task3_additional_recommendations.has_additional === true) {
+    additionalActions.forEach((item, actionIndex) => {
+      if (!safeString(item.text)) {
+        return;
+      }
+      const category = normalizeAdditionalActionCategory(item.category);
+      if (!category) {
+        issues.push({
+          token: `task3_additional_recommendations.actions.${actionIndex}.category`,
+          message: `Additional action ${actionIndex + 1} requires selecting a category.`,
+        });
+      }
+      const evidenceParse = parseEvidenceEventIdsInput(item.evidence_event_ids_text || "");
+      if (evidenceParse.invalid.length > 0) {
+        issues.push({
+          token: `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`,
+          message: `Additional action ${actionIndex + 1} has invalid event IDs: ${evidenceParse.invalid.join(", ")}.`,
+        });
+      }
+      if (
+        evidenceParse.valid.length < MIN_ADDITIONAL_ACTION_EVIDENCE_IDS
+        || evidenceParse.valid.length > MAX_ADDITIONAL_ACTION_EVIDENCE_IDS
+      ) {
+        issues.push({
+          token: `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`,
+          message:
+            `Additional action ${actionIndex + 1} requires `
+            + `${MIN_ADDITIONAL_ACTION_EVIDENCE_IDS}-${MAX_ADDITIONAL_ACTION_EVIDENCE_IDS} evidence event IDs.`,
+        });
+      }
+    });
+  }
+
+  const patientInsights = getTextConfidenceItems(
+    isObject(annotation.task4_patient_insights) ? annotation.task4_patient_insights.insights : []
+  );
+  const hasPatientInsight = patientInsights.some((item) => item.text.length > 0);
+  if (!hasPatientInsight) {
+    issues.push({
+      token: "task4_patient_insights.insights",
+      message: "Task 4 requires at least one patient insight (1-2 sentences).",
     });
   }
 
@@ -1809,7 +2447,11 @@ function getRoundReviewStats(round, annotation) {
     totalActions: round.actions.length,
     reviewedRecs,
     totalRecs: round.recommendations.length,
-    omissionDone: annotation.task3_omission.has_omission !== null,
+    additionalRecommendationsDone: annotation.task3_additional_recommendations.has_additional !== null,
+    task4Done: (
+      getTextConfidenceItems(isObject(annotation.task4_patient_insights) ? annotation.task4_patient_insights.insights : [])
+        .some((item) => item.text.length > 0)
+    ),
   };
 }
 
@@ -1877,24 +2519,49 @@ function parsePromptHistorySection(sectionText) {
       return;
     }
 
-    const eventMatch = line.match(/^HX\d+\.\s+(.+)$/);
+    const eventMatch = line.match(/^(HX\d+)\.\s+(.+)$/i);
     if (!eventMatch) {
       return;
     }
-    parsed.events.push(parsePromptEventLine(eventMatch[1], line));
+    parsed.events.push(parsePromptEventLine(eventMatch[2], line, eventMatch[1]));
   });
 
   return parsed;
 }
 
-function parsePromptEventLine(eventText, rawLine) {
+function parsePromptCurrentSection(sectionText) {
+  const parsed = {
+    hasSection: false,
+    events: [],
+  };
+
+  const text = safeString(sectionText);
+  if (!text) {
+    return parsed;
+  }
+
+  parsed.hasSection = true;
+  const lines = text.split("\n").map((line) => safeString(line)).filter((line) => line.length > 0);
+  lines.forEach((line) => {
+    const eventMatch = line.match(/^(CW\d+)\.\s+(.+)$/i);
+    if (!eventMatch) {
+      return;
+    }
+    parsed.events.push(parsePromptEventLine(eventMatch[2], line, eventMatch[1]));
+  });
+  return parsed;
+}
+
+function parsePromptEventLine(eventText, rawLine, eventId = "") {
   const text = safeString(eventText);
+  const normalizedEventId = normalizeEventEvidenceId(eventId);
   const fallback = {
     time: "",
     code: "UNKNOWN",
     code_specifics: text,
     text_value: null,
     numeric_value: null,
+    event_id: normalizedEventId,
     raw_line: safeString(rawLine) || text,
   };
 
@@ -1932,6 +2599,7 @@ function parsePromptEventLine(eventText, rawLine) {
     code_specifics: codeSpecifics,
     text_value: textValue,
     numeric_value: numericValue,
+    event_id: normalizedEventId,
     raw_line: safeString(rawLine) || text,
   };
 }
@@ -2298,13 +2966,108 @@ function parseEventTimeMs(event) {
   return null;
 }
 
+function withOracleEventIds(events, defaultPrefix) {
+  const safeEvents = Array.isArray(events) ? events : [];
+  const normalizedPrefix = safeString(defaultPrefix).toUpperCase();
+  return safeEvents.map((event, index) => {
+    const normalizedEvent = isObject(event) ? { ...event } : {};
+    const existingId = resolveEventEvidenceId(event);
+    normalizedEvent.event_id = existingId || `${normalizedPrefix}${index + 1}`;
+    return normalizedEvent;
+  });
+}
+
+function resolveEventEvidenceId(event) {
+  if (!isObject(event)) {
+    return "";
+  }
+  const candidates = [
+    event.event_id,
+    event.evidence_event_id,
+    event.event_ref,
+    event.event_reference,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeEventEvidenceId(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function normalizeEventEvidenceId(value) {
+  const raw = safeString(value);
+  if (!raw) {
+    return "";
+  }
+  const compact = raw
+    .replace(/[，；]/g, ",")
+    .replace(/^[([{]+|[)\].,;:]+$/g, "")
+    .replace(/\s+/g, "")
+    .toUpperCase();
+  const match = compact.match(/^([A-Z]{1,3})(\d+)(?:-([A-Z]{1,3})?(\d+))?$/);
+  if (!match) {
+    return "";
+  }
+
+  const startPrefix = match[1];
+  const startNumber = Number.parseInt(match[2], 10);
+  if (!EVIDENCE_EVENT_ID_PREFIXES.has(startPrefix) || !Number.isFinite(startNumber) || startNumber < 1) {
+    return "";
+  }
+
+  if (!match[4]) {
+    return `${startPrefix}${startNumber}`;
+  }
+
+  const endPrefix = safeString(match[3]).toUpperCase() || startPrefix;
+  const endNumber = Number.parseInt(match[4], 10);
+  if (!EVIDENCE_EVENT_ID_PREFIXES.has(endPrefix) || endPrefix !== startPrefix || !Number.isFinite(endNumber) || endNumber < startNumber) {
+    return "";
+  }
+  return `${startPrefix}${startNumber}-${endPrefix}${endNumber}`;
+}
+
+function parseEvidenceEventIdsInput(value) {
+  const raw = safeString(value);
+  if (!raw) {
+    return { valid: [], invalid: [] };
+  }
+
+  const tokens = raw
+    .split(/[\s,;，；]+/)
+    .map((token) => safeString(token))
+    .filter((token) => token.length > 0);
+
+  const valid = [];
+  const invalid = [];
+  const seen = new Set();
+
+  tokens.forEach((token) => {
+    const normalized = normalizeEventEvidenceId(token);
+    if (!normalized) {
+      invalid.push(token);
+      return;
+    }
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      valid.push(normalized);
+    }
+  });
+
+  return { valid, invalid };
+}
+
 function formatHistoryEventLine(event) {
+  const eventId = resolveEventEvidenceId(event);
   const time = formatTime(event.time || event.start_time || "");
   const code = safeString(event.code) || "UNKNOWN";
   const description = safeString(event.code_specifics) || safeString(event.text_value) || "-";
   const value = formatEventValue(event);
   const valuePart = value ? ` = ${value}` : "";
-  return `${time} ${code} ${description}${valuePart}`;
+  const idPart = eventId ? `${eventId} ` : "";
+  return `${idPart}${time} ${code} ${description}${valuePart}`;
 }
 
 function buildVitalSeries(historyEvents, currentEvents) {
@@ -2539,6 +3302,8 @@ function classifyEventType(event) {
 
 function formatEventSource(source) {
   switch (safeString(source)) {
+    case "window_contexts.prompt_sections.current_observation_window":
+      return "window_contexts.prompt_sections.current_observation_window";
     case "raw_current_events":
       return "oracle_predictions.raw_current_events";
     case "window_contexts.current_events":
@@ -2784,6 +3549,94 @@ function downloadJson(payload, fileName) {
   setTimeout(() => {
     URL.revokeObjectURL(url);
   }, 500);
+}
+
+function normalizeConfidence(value) {
+  const normalized = normalizeLabel(value);
+  if (normalized === "high" || normalized === "medium" || normalized === "low") {
+    return normalized;
+  }
+  return null;
+}
+
+function normalizeAdditionalActionCategory(value) {
+  const raw = safeString(value);
+  if (!raw) {
+    return "";
+  }
+  return ICU_ACTION_CATEGORIES.includes(raw) ? raw : "";
+}
+
+function buildTextConfidenceItem(text = "", confidence = null, evidenceEventIdsText = "", category = "") {
+  return {
+    text: safeString(text),
+    confidence: normalizeConfidence(confidence),
+    evidence_event_ids_text: safeString(evidenceEventIdsText),
+    category: normalizeAdditionalActionCategory(category),
+  };
+}
+
+function normalizeTextConfidenceItem(item) {
+  if (isObject(item)) {
+    const textValue = safeString(item.text || item.action || item.insight || item.value || item.description);
+    let evidenceEventIdsText = safeString(item.evidence_event_ids_text || "");
+    if (!evidenceEventIdsText) {
+      if (Array.isArray(item.evidence_event_ids)) {
+        evidenceEventIdsText = item.evidence_event_ids.map((id) => safeString(id)).filter((id) => id.length > 0).join(", ");
+      } else if (Array.isArray(item.event_evidence_ids)) {
+        evidenceEventIdsText = item.event_evidence_ids.map((id) => safeString(id)).filter((id) => id.length > 0).join(", ");
+      } else if (Array.isArray(item.evidence_event_refs)) {
+        evidenceEventIdsText = item.evidence_event_refs.map((id) => safeString(id)).filter((id) => id.length > 0).join(", ");
+      } else {
+        evidenceEventIdsText = safeString(item.evidence_event_ids || item.event_evidence_ids || item.evidence_event_refs || "");
+      }
+    }
+    const categoryValue = (
+      item.category
+      || item.action_category
+      || item.icu_action_category
+      || item.category_label
+    );
+    return buildTextConfidenceItem(textValue, item.confidence, evidenceEventIdsText, categoryValue);
+  }
+  return buildTextConfidenceItem(safeString(item), null, "", "");
+}
+
+function getTextConfidenceItems(items) {
+  const safeItems = Array.isArray(items) ? items : [];
+  return safeItems.map((item) => normalizeTextConfidenceItem(item));
+}
+
+function ensureTextConfidenceList(container, key) {
+  if (!isObject(container)) {
+    return [];
+  }
+  const normalized = getTextConfidenceItems(container[key]);
+  container[key] = normalized;
+  return normalized;
+}
+
+function exportTextConfidenceItems(items, keyName) {
+  return getTextConfidenceItems(items)
+    .filter((item) => item.text.length > 0)
+    .map((item) => ({
+      [keyName]: item.text,
+      confidence: item.confidence,
+    }));
+}
+
+function exportAdditionalRecommendationItems(items) {
+  return getTextConfidenceItems(items)
+    .filter((item) => item.text.length > 0)
+    .map((item) => {
+      const evidenceParse = parseEvidenceEventIdsInput(item.evidence_event_ids_text || "");
+      return {
+        icu_action_category: normalizeAdditionalActionCategory(item.category),
+        action: item.text,
+        confidence: item.confidence,
+        evidence_event_ids: evidenceParse.valid,
+      };
+    });
 }
 
 function toggleSelection(items, item, shouldInclude) {

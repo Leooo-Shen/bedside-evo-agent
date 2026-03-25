@@ -148,6 +148,8 @@ def test_context_window_uses_current_window_start_anchor(monkeypatch):
     assert "## FUTURE EVENTS" in context["context_text"]
     assert "MAP_1h" in context["context_text"]
     assert "CW1." in context["context_text"]
+    assert "CW1. 2024-01-02 06:00 " in context["context_text"]
+    assert "CW1. 2024-01-02 06:00:00 " not in context["context_text"]
     assert "Norepinephrine" in context["context_text"]
     assert "META_DEATH" in context["context_text"]
     assert "NOTE_DISCHARGESUMMARY" not in context["context_text"]
@@ -185,6 +187,8 @@ def test_use_discharge_summary_can_include_summary_block(monkeypatch):
     assert "Current window duration (hours): 0.50" in context["context_text"]
     assert "## FUTURE EVENTS" in context["context_text"]
     assert "CW1." in context["context_text"]
+    assert "CW1. 2024-01-02 06:00 " in context["context_text"]
+    assert "CW1. 2024-01-02 06:00:00 " not in context["context_text"]
     assert "Norepinephrine" in context["context_text"]
     assert "Discharge summary outside bounded context window." in context["context_text"]
 

@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import math
-from datetime import datetime
 from typing import Any, Dict, List
+
+from utils.event_format import format_event_line as format_shared_event_line
+from utils.time_format import format_timestamp_minute
 
 ORACLE_PROMPT_TEMPLATE = """
 You are Oracle, a clinical AI evaluator with hindsight access to a patient's full ICU trajectory including the ICU results.
 Your task is to evaluate a specific local observation window {window_time} using the hindsight knowledge of the ICU trajectory. Depending on the context, your hindsight can come from ICU discharge summaries or future ICU events. 
-For evaluating this observation window you must produce two assessments:
+For evaluating this observation window you must produce three tasks:
 
 ## PART 1 — PATIENT STATUS
-Using the provided local context as ground truth, assess the patient's clinical direction at the time of this window across four domains, then synthesize an overall status.
+Using the provided local context, assess the patient's clinical direction at the time of this window across four domains, then estimate an overall status.
 
 Domains:
 - Hemodynamics: heart rate, MAP, lactate, perfusion, vasopressor requirements
@@ -61,46 +62,44 @@ Output your structured response inside <response></response> tags as valid JSON:
 {
   "patient_status": {
     "domains": {
-      "hemodynamics":    {"label": "...", "key_signals": ["..."], "rationale": "..."},
-      "respiratory":     {"label": "...", "key_signals": ["..."], "rationale": "..."},
-      "renal_metabolic": {"label": "...", "key_signals": ["..."], "rationale": "..."},
-      "neurology":       {"label": "...", "key_signals": ["..."], "rationale": "..."}
+      "hemodynamics":    {"label": "...", "key_evidence": ["<1-3 event IDs as the key evidence from the observation>"]},
+      "respiratory":     {"label": "...", "key_evidence": ["..."]},
+      "renal_metabolic": {"label": "...", "key_evidence": ["..."]},
+      "neurology":       {"label": "...", "key_evidence": ["..."]}
     },
     "overall": {
       "label": "<improving | stable | deteriorating | insufficient_data>",
-      "rationale": "<1–3 sentence summary grounded in trajectory evidence>"
+      "rationale": "<1-2 sentence explaining the overall patient status grounded in trajectory evidence>"
     }
   },
   "action_evaluations": [
     {
-      "action_id": "<identifier for the action, e.g., CW1 for current window event 1>",
-      "action_description": "<brief restatement of the action for clarity>",
+      "action_id": "<identifier for the action, e.g., CW1>",
+      "action_name": "<action name corresponding to the action_id>",
       "guideline_adherence": {
         "label": "<adherent | non_adherent | not_applicable | guideline_unclear>",
         "guideline_reference": "<name or source of the relevant guideline, or null>",
-        "rationale": "<1–2 sentences>"
       },
       "contextual_appropriateness": {
         "label": "<appropriate | suboptimal | potentially_harmful | insufficient_data>",
-        "rationale": "<1–3 sentences referencing patient-specific trajectory evidence>",
-        "hindsight_caveat": "<note if hindsight changes the interpretation vs. real-time judgment, or null>",
+        "hindsight_usage": "<brief note on whether hindsight changed interpretation>",
       },
       "overall": {
         "label": "<appropriate | suboptimal | potentially_harmful | insufficient_data>",
-        "rationale": "<1–3 sentence synthesis of the above evaluations, grounded in trajectory evidence>"
+        "rationale": "<1-2 sentences integrating both dimensions>"
       }
     }
   ],
   "recommendations": [
     {
       "rank": 1,
-      "action": "<a short name of the recommended action>",
-      "action_description": "<1-2 sentences of the concrete, actionable clinical recommendation>",
-      "rationale": "<1–2 sentences grounded in specific hindsight trajectory evidence>",
-      "urgency": "<immediate | within_1h | routine | optional>"
-    }, // Or null if no recommendations
-  ],
-  "overall_window_summary": "<2–4 sentence synthesis of the window: patient direction, care quality, and any critical observations>"
+      "action_name": "<name of the recommended action>",
+      "action_description": "<short description of the concrete, actionable clinical recommendation>",
+      "urgency": "<urgent | nice_to_have | optional>",
+      "key_evidence": ["<1-3 event IDs as the key evidence from the observation>"],
+    },
+  ], // Or [] if no recommendations
+  "overall_window_summary": "<1-2 sentence covering the patient direction, care quality, and any critical observations>"
 }
 </response>
 
@@ -110,6 +109,197 @@ Output your structured response inside <response></response> tags as valid JSON:
 
 Now, evaluate the CURRENT OBSERVATION WINDOW according to the instructions above.
 """.strip()
+
+
+# ORACLE_PROMPT_TEMPLATE = """
+# You are Oracle, a clinical AI evaluator with hindsight access to a patient's full ICU trajectory, including future events and discharge outcomes.
+
+# Your task is to evaluate a specific observation window {window_time}.
+
+# You must complete three parts:
+# 1) Patient Status (NO hindsight)
+# 2) Doctor Action Evaluation (hindsight allowed)
+# 3) Clinical Recommendations (hindsight allowed)
+
+# --------------------------------------------------
+# ## INFORMATION USAGE RULES (CRITICAL)
+
+# - PART 1 (Patient Status):
+#   Use ONLY information available up to and within the current observation window.
+#   DO NOT use future events, outcomes, or discharge summaries.
+
+# - PART 2 (Action Evaluation):
+#   Use the window context for primary judgment.
+#   You MAY use hindsight to refine contextual appropriateness, but:
+#     - Do NOT penalize actions that were reasonable given available information.
+#     - Only downgrade actions if harm or error was reasonably foreseeable.
+
+# - PART 3 (Recommendations):
+#   You MAY fully use hindsight knowledge of the trajectory.
+
+# - General rule:
+#   Do NOT directly infer current status from eventual outcomes.
+
+# --------------------------------------------------
+# ## PART 1 — PATIENT STATUS
+
+# Assess the patient's short-term clinical direction (~2–6 hour horizon around the window) across four domains:
+
+# Domains:
+# - Hemodynamics: heart rate, MAP, lactate, perfusion, vasopressor requirements
+# - Respiratory: SpO2, PaO2/FiO2, respiratory rate, ventilator settings
+# - Renal/Metabolic: creatinine, urine output, electrolytes, acid-base status
+# - Neurology: GCS, mental status, RASS
+
+# For each domain and overall status, choose exactly one:
+# - improving: clinically meaningful movement toward stability/recovery
+# - stable: no meaningful directional change
+# - deteriorating: clinically meaningful worsening or decompensation
+# - insufficient_data: signal is too sparse or conflicting
+
+# Trend definition:
+# - Based on changes within the window and recent prior context
+# - Use clinically meaningful directionality (e.g., rising lactate, increasing vasopressor need)
+# - Prefer "stable" or "insufficient_data" over weak inference
+
+# Overall status:
+# - Synthesize based on relative clinical importance of domains
+# - Do NOT use outcome knowledge
+
+# --------------------------------------------------
+# ## PART 2 — DOCTOR ACTION EVALUATION
+
+# You will be given a list of actions within the window.
+# Evaluate EACH action independently.
+
+# ### A. Guideline Adherence
+# Does the action follow established ICU guidelines (e.g., Surviving Sepsis Campaign, ARDSNet, PADIS, AHA/ACC)?
+
+# Labels:
+# - adherent
+# - non_adherent
+# - not_applicable
+# - guideline_unclear
+
+# ### B. Contextual Appropriateness
+# Was the action appropriate for THIS patient at that time?
+
+# Labels:
+# - appropriate
+# - suboptimal
+# - potentially_harmful
+# - insufficient_data
+
+# Hindsight usage rule:
+# - If an action was reasonable given available information → label "appropriate"
+# - Only downgrade if:
+#   - a high-probability condition was missed
+#   - or harm was reasonably foreseeable from available signals
+
+# ### C. Overall Action Quality
+# Integrate BOTH guideline adherence and contextual appropriateness:
+
+# Labels:
+# - appropriate → appropriate OR justified deviation from guidelines
+# - suboptimal → minor issue, delay, or inefficiency
+# - potentially_harmful → clear harm or major error
+# - insufficient_data
+
+# --------------------------------------------------
+# ## PART 3 — CLINICAL RECOMMENDATIONS
+
+# Provide up to {top_k} recommendations.
+
+# Requirements:
+# - Concrete and actionable
+# - Grounded in trajectory evidence (can include hindsight)
+# - Focus on what would have most improved patient outcome
+
+# You may:
+# - Reinforce correct actions
+# - Suggest missing interventions
+# - Prioritize more impactful alternatives
+
+# Ranking criteria:
+# 1. Expected impact on outcome
+# 2. Urgency (time sensitivity)
+# 3. Strength of supporting evidence
+
+# If no meaningful recommendation exists, return an empty list [].
+
+# Urgency labels:
+# - urgent
+# - nice_to_have
+# - optional
+
+# --------------------------------------------------
+# ## OUTPUT FORMAT (STRICT JSON)
+
+# Output inside <response></response>:
+
+# <response>
+# {
+#   "patient_status": {
+#     "domains": {
+#       "hemodynamics": {
+#         "label": "...",
+#         "key_evidence": [{"type": "vital|lab|event|action", "id": "..."}]
+#       },
+#       "respiratory": {
+#         "label": "...",
+#         "key_evidence": [{"type": "...", "id": "..."}]
+#       },
+#       "renal_metabolic": {
+#         "label": "...",
+#         "key_evidence": [{"type": "...", "id": "..."}]
+#       },
+#       "neurology": {
+#         "label": "...",
+#         "key_evidence": [{"type": "...", "id": "..."}]
+#       }
+#     },
+#     "overall": {
+#       "label": "<improving | stable | deteriorating | insufficient_data>",
+#       "rationale": "<1-2 sentences based ONLY on window evidence>"
+#     }
+#   },
+#   "action_evaluations": [
+#     {
+#       "action_id": "...",
+#       "action_name": "...",
+#       "guideline_adherence": {
+#         "label": "<adherent | non_adherent | not_applicable | guideline_unclear>",
+#         "guideline_reference": "<guideline name or null>"
+#       },
+#       "contextual_appropriateness": {
+#         "label": "<appropriate | suboptimal | potentially_harmful | insufficient_data>",
+#         "hindsight_usage": "<brief note on whether hindsight changed interpretation>"
+#       },
+#       "overall": {
+#         "label": "<appropriate | suboptimal | potentially_harmful | insufficient_data>",
+#         "rationale": "<1-2 sentences integrating both dimensions>"
+#       }
+#     }
+#   ],
+#   "recommendations": [
+#     {
+#       "rank": 1,
+#       "action_name": "...",
+#       "action_description": "...",
+#       "urgency": "<urgent | nice_to_have | optional>",
+#       "key_evidence": [{"type": "vital|lab|event|action", "id": "..."}]
+#     }
+#   ],
+#   "overall_window_summary": "<1-2 sentences covering patient trajectory, care quality, and key observations>"
+# }
+# </response>
+
+# --------------------------------------------------
+# ## PATIENT ICU CONTEXT
+# {patient_icu_trajectory}
+
+# Now evaluate the CURRENT OBSERVATION WINDOW.
+# """.strip()
 
 
 def format_oracle_prompt(
@@ -145,9 +335,7 @@ def format_oracle_prompt(
         patient_context.insert(4, f"- ICU Outcome: {outcome_text}")
     pre_icu_history_lines = _format_pre_icu_history_lines(window_data.get("pre_icu_history"))
 
-    patient_trajectory = "\n".join(
-        [*patient_context, *pre_icu_history_lines, "", context_block]
-    ).strip()
+    patient_trajectory = "\n".join([*patient_context, *pre_icu_history_lines, "", context_block]).strip()
 
     prompt = ORACLE_PROMPT_TEMPLATE
     prompt = prompt.replace("{history_hours}", history_hours_text)
@@ -201,43 +389,8 @@ def _format_pre_icu_history_lines(pre_icu_history: Any) -> List[str]:
 
 
 def format_event_line(event: Dict[str, Any]) -> str:
-    """Format one event into a compact, stable line for prompts."""
-    parts: List[str] = []
-
-    time_value = event.get("time") or event.get("start_time")
-    if not _is_missing_value(time_value):
-        parts.append(_format_time(time_value))
-
-    code = event.get("code")
-    if not _is_missing_value(code):
-        parts.append(str(code))
-
-    details = event.get("code_specifics")
-    if not _is_missing_value(details):
-        parts.append(str(details))
-
-    numeric_value = event.get("numeric_value")
-    if not _is_missing_value(numeric_value):
-        parts.append(f"={_format_numeric_value(numeric_value)}")
-
-    text_value = event.get("text_value")
-    if not _is_missing_value(text_value):
-        parts.append(str(text_value))
-
-    if not parts:
-        return json.dumps(event, ensure_ascii=False, default=str)
-    return " ".join(parts)
-
-
-def _is_missing_value(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return value.strip().lower() in {"", "nan", "null", "none"}
-    try:
-        return bool(math.isnan(value))
-    except (TypeError, ValueError):
-        return False
+    """Format one event line for prompt context blocks."""
+    return format_shared_event_line(event)
 
 
 def _format_age(age: Any) -> str:
@@ -289,13 +442,6 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
-def _format_numeric_value(value: Any) -> str:
-    try:
-        return f"{float(value):.2f}"
-    except (TypeError, ValueError):
-        return str(value)
-
-
 def _format_window_time(window_data: Dict[str, Any]) -> str:
     start = window_data.get("current_window_start")
     end = window_data.get("current_window_end")
@@ -305,21 +451,4 @@ def _format_window_time(window_data: Dict[str, Any]) -> str:
 
 
 def _format_time(value: Any) -> str:
-    if value is None:
-        return "Unknown"
-    if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d %H:%M")
-
-    text = str(value).strip()
-    if not text:
-        return "Unknown"
-
-    try:
-        parsed = datetime.fromisoformat(text)
-        return parsed.strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        pass
-
-    if len(text) >= 16:
-        return text[:16]
-    return text
+    return format_timestamp_minute(value)

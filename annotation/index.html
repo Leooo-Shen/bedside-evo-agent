@@ -4,29 +4,28 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Oracle Annotation Tool</title>
-    <link rel="stylesheet" href="styles.css?v=20260312b" />
+    <link rel="stylesheet" href="styles.css?v=20260324a" />
   </head>
   <body>
     <div id="app">
       <section id="loader-view" class="loader-view">
         <h1>ICU Oracle Annotation Tool</h1>
         <p>
-          Load <code>oracle_predictions.json</code>. Optionally load
-          <code>window_contexts.json</code> (context/events source).
+          Select one case folder. The tool auto-loads
+          <code>oracle_predictions.json</code> and <code>window_contexts.json</code> from that folder.
         </p>
 
         <div class="file-row">
-          <label for="predictions-file">Oracle predictions</label>
-          <input id="predictions-file" type="file" accept="application/json" />
-        </div>
-
-        <div class="file-row">
-          <label for="window-context-file">Window contexts (optional)</label>
-          <input id="window-context-file" type="file" accept="application/json" />
+          <label for="case-folder-file">Case folder</label>
+          <input id="case-folder-file" type="file" webkitdirectory directory multiple />
+          <div class="file-help">
+            Select the patient folder that contains <code>oracle_predictions.json</code>
+            (or an exported <code>*_annotated.json</code> to continue reviewing).
+          </div>
         </div>
 
         <div class="loader-actions">
-          <button id="load-btn" type="button">Load Files</button>
+          <button id="load-folder-btn" type="button">Load From Folder</button>
         </div>
 
         <div id="loader-message" class="message"></div>
@@ -39,9 +38,13 @@
             <button id="prev-window-btn" type="button">Previous</button>
             <select id="window-select"></select>
             <button id="next-window-btn" type="button">Next</button>
+            <button id="import-draft-btn" type="button">Import Draft</button>
+            <button id="export-draft-btn" type="button">Export Draft</button>
             <button id="export-btn" type="button">Export Annotated JSON</button>
           </div>
         </header>
+
+        <input id="draft-file-input" class="hidden" type="file" accept="application/json" />
 
         <div id="global-message" class="message"></div>
 
@@ -53,6 +56,6 @@
       </section>
     </div>
 
-    <script src="app.js?v=20260312b"></script>
+    <script src="app.js?v=20260324a"></script>
   </body>
 </html>

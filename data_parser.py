@@ -8,6 +8,8 @@ import pandas as pd
 
 sys.path.append("..")  # Add parent directory to path for imports
 from utils.discharge_summary_selector import select_discharge_summaries_for_icu_stays
+from utils.event_format import format_event_line as format_shared_event_line
+from utils.time_format import format_timestamp_minute
 
 VITAL_CODE = "VITALS"
 
@@ -153,17 +155,9 @@ class PreICUHistoryProcessor:
                         f"{abs(signed_hours) / 24.0:.1f} days / {abs(signed_hours):.1f} hours after ICU admission"
                     )
 
-            timestamp_text = "unknown"
-            raw_time = report.get("time")
-            if raw_time is not None:
-                try:
-                    parsed_time = pd.to_datetime(raw_time, errors="coerce")
-                    if pd.notna(parsed_time):
-                        timestamp_text = parsed_time.strftime("%Y-%m-%d %H:%M:%S")
-                    else:
-                        timestamp_text = str(raw_time)
-                except Exception:
-                    timestamp_text = str(raw_time)
+            timestamp_text = format_timestamp_minute(report.get("time"))
+            if timestamp_text == "Unknown":
+                timestamp_text = "unknown"
 
             lines.append(
                 (
@@ -208,27 +202,15 @@ class PreICUHistoryProcessor:
         return selected
 
     @staticmethod
-    def _format_numeric_value(value: Any) -> str:
-        """Match ICU event numeric formatting in prompt lines."""
-        try:
-            return f"{float(value):.2f}"
-        except (TypeError, ValueError):
-            return str(value)
-
-    @classmethod
-    def _format_pre_icu_event_line(cls, event: Dict[str, Any]) -> str:
-        """Format pre-ICU fallback/baseline events consistently with ICU event style."""
-        pieces = [str(event.get("code") or "UNKNOWN")]
-        specifics = event.get("code_specifics")
-        if specifics:
-            pieces.append(str(specifics))
-        if event.get("numeric_value") is not None:
-            pieces.append(f"={cls._format_numeric_value(event.get('numeric_value'))}")
-        if event.get("text_value"):
-            pieces.append(str(event["text_value"]))
-
-        time_text = str(event.get("time", "unknown"))
-        return f"{time_text} {' '.join(pieces)}".strip()
+    def _format_pre_icu_event_line(event: Dict[str, Any]) -> str:
+        """Format pre-ICU fallback/baseline events with shared event formatter."""
+        return format_shared_event_line(
+            event,
+            time_keys=("time",),
+            missing_time_text="unknown",
+            missing_code_text="UNKNOWN",
+            empty_as_json=False,
+        )
 
     def extract_fallback_events(
         self,
