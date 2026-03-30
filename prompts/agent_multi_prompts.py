@@ -3,27 +3,9 @@
 from prompts.shared_prompts import get_prediction_prompt
 
 
-def get_observer_prompt(use_thinking: bool = True) -> str:
+def get_observer_prompt() -> str:
     """Prompt for the Observer Agent: pure clinical assessment.
-
-    Args:
-        use_thinking: Whether to include explicit chain of thought section
     """
-    thinking_section = (
-        """ALWAYS start with thinking first in <think></think>. Then provide your response in JSON format in <response></response>.
-<think>
-1. Physiological Snapshot: Summarize the current state based on the four focus areas.
-2. Comparative Analysis: Compare current events with the previous trajectories.
-   - Is the patient status related to any historical key events?
-   - Is there any open clinical concern resolved or newly identified?
-3. Clinical Significance: Identify only events that indicate a significant change, a key intervention, or are directly relevant to the trajectory. If there are contradictory signals, do not log them as they might be sensor noise.
-</think>
-
-"""
-        if use_thinking
-        else "Provide your response in JSON format in <response></response>.\n\n"
-    )
-
     return f"""You are a Senior ICU Clinical Decision Support Agent. Your task is to analyze the current window of patient events and produce a clinical assessment.
 
 {{context}}
@@ -38,7 +20,7 @@ Evaluate trends across these four domains:
 If no events exist for a domain in this window, set status to "insufficient_data" and description to "No relevant events in current window."
 
 ### OUTPUT SPECIFICATION
-{thinking_section}<response>
+Return valid JSON only (no XML tags, no markdown code fences):
 {{{{
   "clinical_summary": "A concise 1-2 sentence summary of the current clinical picture.",
   "critical_events": [
@@ -78,7 +60,6 @@ If no events exist for a domain in this window, set status to "insufficient_data
     "overall_status": "improving/stable/deteriorating/fluctuating/insufficient_data"
   }}}}
 }}}}
-</response>
 
 ### Critial Events
 These are events that represent significant changes in the patient's clinical course, such as new organ dysfunction, initiation of a major intervention (e.g., intubation, vasopressor start), or a critical lab result. Do not include routine events or minor fluctuations unless they represent a key turning point in the trajectory.
@@ -86,25 +67,9 @@ These are events that represent significant changes in the patient's clinical co
 """
 
 
-def get_memory_agent_prompt(use_thinking: bool = True) -> str:
+def get_memory_agent_prompt() -> str:
     """Prompt for the Memory Agent: trajectory folding decisions.
-
-    Args:
-        use_thinking: Whether to include explicit chain of thought section
     """
-    thinking_section = (
-        """ALWAYS start with thinking first in <think></think>. Then provide your response in JSON format in <response></response>.
-<think>
-1. Review the window evidence and the existing trajectory.
-2. Determine if this is a new clinical phase (APPEND) or a continuation (MERGE).
-3. If merging, identify the logical "thread" that connects these windows (e.g., "Ongoing fluid resuscitation for septic shock").
-</think>
-
-"""
-        if use_thinking
-        else "Provide your response in JSON format in <response></response>.\n\n"
-    )
-
     return f"""You are a Memory Management Agent for an ICU clinical decision support system. Your task is to decide how to integrate a new clinical observation into the patient's trajectory history.
 
 ## Current Trajectory State
@@ -130,7 +95,7 @@ You must decide how to integrate this assessment into the existing {{num_traject
 ---
 
 ### OUTPUT SPECIFICATION
-{thinking_section}<response>
+Return valid JSON only (no XML tags, no markdown code fences):
 {{{{
   "memory_management": {{{{
     "decision": "APPEND" or "MERGE",
@@ -142,7 +107,6 @@ You must decide how to integrate this assessment into the existing {{num_traject
     }}}}
   }}}}
 }}}}
-</response>
 
 ### CORE GUIDELINES
 - If you APPEND, set start_index = end_index = {{window_index}}.
@@ -151,36 +115,18 @@ You must decide how to integrate this assessment into the existing {{num_traject
 - Keep summaries concise but clinically informative."""
 
 
-def get_predictor_prompt(use_thinking: bool = True, observation_hours: float = 12.0) -> str:
+def get_predictor_prompt(observation_hours: float = 12.0) -> str:
     """Prompt for the Predictor Agent: survival prediction.
 
     Args:
-        use_thinking: Whether to include explicit chain of thought section
+        observation_hours: Number of hours observed after ICU admission
     """
-    return get_prediction_prompt(use_thinking=use_thinking, observation_hours=observation_hours)
+    return get_prediction_prompt(observation_hours=observation_hours)
 
 
-def get_reflection_agent_prompt(use_thinking: bool = True) -> str:
+def get_reflection_agent_prompt() -> str:
     """Prompt for the Reflection Agent: trajectory quality audit.
-
-    Args:
-        use_thinking: Whether to include explicit chain of thought section
     """
-    thinking_section = (
-        """ALWAYS start with thinking first in <think></think>. Then provide your response in JSON format in <response></response>.
-
-<think>
-1. Review the previous trajectory to understand the baseline clinical state
-2. Check each claim in the new summary against the raw events
-3. Identify any contradictions, unsupported claims, or missing critical information
-4. Determine if the summary needs revision
-</think>
-
-"""
-        if use_thinking
-        else "Provide your response in JSON format in <response></response>.\n\n"
-    )
-
     return f"""You are a Clinical Auditor Agent reviewing trajectory summaries for quality and accuracy. Your task is to verify that the Memory Agent's trajectory summary is clinically sound and evidence-based.
 
 ## Previous Trajectory Context
@@ -210,7 +156,7 @@ Evaluate the trajectory summary across three dimensions:
 
 ### OUTPUT SPECIFICATION
 
-{thinking_section}<response>
+Return valid JSON only (no XML tags, no markdown code fences):
 {{{{
   "audit_results": {{{{
     "temporal_consistency": {{{{
@@ -232,7 +178,6 @@ Evaluate the trajectory summary across three dimensions:
   "needs_revision": true/false,
   "revision_instructions": "Specific instructions for the Memory Agent to improve the summary. Be concrete about specific actions rather than 'improve detail'."
 }}}}
-</response>
 
 ### GUIDELINES
 - Be strict but fair: Minor omissions are acceptable if the core trajectory is correct

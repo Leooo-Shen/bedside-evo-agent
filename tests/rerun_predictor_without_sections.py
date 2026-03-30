@@ -78,7 +78,7 @@ def extract_observation_hours_from_predictor_prompt(prompt_text: str) -> Optiona
 
 
 def load_source_runtime_settings(source_experiment_dir: Path) -> Dict[str, Any]:
-    """Infer provider/model/predictor thinking/observation_hours from source logs."""
+    """Infer provider/model/observation_hours from source logs."""
     llm_files = sorted(source_experiment_dir.glob("patients/*/llm_calls.json"))
     if not llm_files:
         raise FileNotFoundError(f"No llm_calls.json found under: {source_experiment_dir / 'patients'}")
@@ -86,15 +86,6 @@ def load_source_runtime_settings(source_experiment_dir: Path) -> Dict[str, Any]:
     first_llm = json.loads(llm_files[0].read_text(encoding="utf-8"))
     provider = first_llm.get("llm_provider")
     model = first_llm.get("llm_model")
-    predictor_use_thinking = True
-
-    pipeline_agents = first_llm.get("pipeline_agents", [])
-    for agent in pipeline_agents:
-        if agent.get("name") == "predictor":
-            thinking = agent.get("thinking")
-            if isinstance(thinking, bool):
-                predictor_use_thinking = thinking
-            break
 
     # Try to recover observation_hours from stored predictor prompt.
     observation_hours = None
@@ -107,7 +98,6 @@ def load_source_runtime_settings(source_experiment_dir: Path) -> Dict[str, Any]:
     return {
         "provider": provider,
         "model": model,
-        "predictor_use_thinking": predictor_use_thinking,
         "observation_hours": observation_hours,
     }
 
@@ -172,12 +162,6 @@ def parse_args() -> argparse.Namespace:
         help="Override LLM model (default: inferred from source logs)",
     )
     parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help="Override LLM temperature (default: from config)",
-    )
-    parser.add_argument(
         "--max-tokens",
         type=int,
         default=None,
@@ -188,12 +172,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Override predictor observation_hours in prompt (default: inferred from source logs, then config)",
-    )
-    parser.add_argument(
-        "--predictor-use-thinking",
-        choices=["true", "false"],
-        default=None,
-        help="Override predictor thinking flag (default: inferred from source logs)",
     )
     return parser.parse_args()
 
@@ -211,17 +189,12 @@ def main() -> None:
 
     provider = args.provider or runtime["provider"] or cfg.llm_provider
     model = args.model or runtime["model"] or cfg.llm_model
-    temperature = args.temperature if args.temperature is not None else cfg.llm_temperature
     max_tokens = args.max_tokens if args.max_tokens is not None else cfg.llm_max_tokens
     observation_hours = (
         args.observation_hours
         if args.observation_hours is not None
         else runtime["observation_hours"] if runtime["observation_hours"] is not None else cfg.agent_observation_hours
     )
-    if args.predictor_use_thinking is None:
-        predictor_use_thinking = bool(runtime["predictor_use_thinking"])
-    else:
-        predictor_use_thinking = args.predictor_use_thinking.lower() == "true"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.output_dir is not None:
@@ -237,13 +210,11 @@ def main() -> None:
     print(f"Source experiment: {source_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Provider/model: {provider} / {model}")
-    print(f"Temperature/max_tokens: {temperature} / {max_tokens}")
+    print(f"Max tokens: {max_tokens}")
     print(f"Observation hours: {observation_hours}")
-    print(f"Predictor thinking: {predictor_use_thinking}")
     print(f"Max workers: {args.max_workers}")
     print("Removed sections: Historical Key Events, Status Trajectory")
     prompt_template = get_prediction_prompt(
-        use_thinking=predictor_use_thinking,
         observation_hours=observation_hours,
     )
 
@@ -290,7 +261,6 @@ def main() -> None:
         llm = LLMClient(
             provider=provider,
             model=model,
-            temperature=temperature,
             max_tokens=max_tokens,
         )
         response = llm.chat(prompt=prompt, response_format="text")
@@ -358,10 +328,8 @@ def main() -> None:
             "patient_id": patient_dir_name,
             "provider": provider,
             "model": model,
-            "temperature": temperature,
             "max_tokens": max_tokens,
             "observation_hours": observation_hours,
-            "predictor_use_thinking": predictor_use_thinking,
             "removed_sections": ["Historical Key Events", "Status Trajectory"],
             "context_after_removal": ablated_context,
             "prompt": prompt,
@@ -414,10 +382,8 @@ def main() -> None:
         "source_experiment_dir": str(source_dir),
         "provider": provider,
         "model": model,
-        "temperature": temperature,
         "max_tokens": max_tokens,
         "observation_hours": observation_hours,
-        "predictor_use_thinking": predictor_use_thinking,
         "removed_sections": ["Historical Key Events", "Status Trajectory"],
         "new_metrics": new_metrics,
         "source_metrics": source_metrics,

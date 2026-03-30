@@ -40,14 +40,14 @@ class Config:
         Get a configuration value using dot notation.
 
         Args:
-            key_path: Dot-separated path to config value (e.g., "oracle.temperature")
+            key_path: Dot-separated path to config value (e.g., "llm.model")
             default: Default value if key not found
 
         Returns:
             Configuration value or default
 
         Example:
-            config.get("oracle.temperature")  # Returns 0.3
+            config.get("llm.model")
             config.get("time_windows.window_size_hours")  # Returns 6.0
         """
         keys = key_path.split('.')
@@ -191,6 +191,20 @@ class Config:
             return 3
         return max(1, parsed)
 
+    @property
+    def oracle_context_compress_pre_icu_history(self) -> bool:
+        """Whether to LLM-compress pre-ICU history once per patient and reuse it across windows."""
+        value = self.get("oracle_context.compress_pre_icu_history", True)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"true", "1", "yes", "y", "on"}:
+                return True
+            if text in {"false", "0", "no", "n", "off"}:
+                return False
+        return bool(value)
+
     # ========================================================================
     # Agent Time Window Configuration
     # ========================================================================
@@ -233,11 +247,6 @@ class Config:
     def llm_model(self) -> Optional[str]:
         """Model name for LLM."""
         return self.get("llm.model")
-
-    @property
-    def llm_temperature(self) -> float:
-        """Sampling temperature for LLM."""
-        return self.get("llm.temperature")
 
     @property
     def llm_max_tokens(self) -> int:
@@ -316,26 +325,6 @@ class Config:
         return self.get("agent_multi.use_reflection_agent", False)
 
     @property
-    def agent_multi_observer_use_thinking(self) -> bool:
-        """Whether observer agent uses explicit chain of thought (default True)."""
-        return self.get("agent_multi.observer_use_thinking", True)
-
-    @property
-    def agent_multi_memory_use_thinking(self) -> bool:
-        """Whether memory agent uses explicit chain of thought (default True)."""
-        return self.get("agent_multi.memory_use_thinking", True)
-
-    @property
-    def agent_multi_reflection_use_thinking(self) -> bool:
-        """Whether reflection agent uses explicit chain of thought (default True)."""
-        return self.get("agent_multi.reflection_use_thinking", True)
-
-    @property
-    def agent_multi_predictor_use_thinking(self) -> bool:
-        """Whether predictor agent uses explicit chain of thought (default True)."""
-        return self.get("agent_multi.predictor_use_thinking", True)
-
-    @property
     def agent_multi_observer_cache_enabled(self) -> bool:
         """Whether observer-output cache is enabled for MultiAgent ablation runs."""
         return self.get("agent_multi.observer_cache.enabled", True)
@@ -346,48 +335,62 @@ class Config:
         return self.get("agent_multi.observer_cache.cache_dir", "experiment_results/observer_cache")
 
     # ========================================================================
-    # MedAgent Configuration
+    # MedEvo Configuration
     # ========================================================================
 
     @property
-    def med_agent_use_llm_static_compression(self) -> bool:
-        """Whether to compress static memory with an LLM summary."""
-        return self.get("med_agent.use_llm_static_compression", True)
+    def med_evo_max_working_windows(self) -> int:
+        """Maximum number of working windows provided to EventAgent."""
+        value = self.get("med_evo.max_working_windows", 3)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 3
 
     @property
-    def med_agent_baseline_lab_lookback_start_hours(self) -> float:
-        """Baseline lab window start (hours before ICU admission)."""
-        return self.get("med_agent.baseline_lab_lookback_start_hours", 72.0)
+    def med_evo_max_events(self) -> int:
+        """Maximum number of critical events kept in memory."""
+        value = self.get("med_evo.max_events", 100)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 100
 
     @property
-    def med_agent_baseline_lab_lookback_end_hours(self) -> float:
-        """Baseline lab window end (hours before ICU admission)."""
-        return self.get("med_agent.baseline_lab_lookback_end_hours", 24.0)
+    def med_evo_max_episodes(self) -> int:
+        """Maximum number of episodes reserved for future trajectory compression."""
+        value = self.get("med_evo.max_episodes", 20)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 20
 
     @property
-    def med_agent_max_active_problems(self) -> int:
-        """Maximum active problems in dynamic memory."""
-        return self.get("med_agent.max_active_problems", 8)
+    def med_evo_max_insights(self) -> int:
+        """Maximum number of active insights retained in memory."""
+        value = self.get("med_evo.max_insights", 5)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 5
 
     @property
-    def med_agent_max_critical_events(self) -> int:
-        """Maximum critical events in dynamic memory."""
-        return self.get("med_agent.max_critical_events", 20)
+    def med_evo_insight_recency_tau(self) -> float:
+        """Recency decay tau used by deterministic insight scoring."""
+        value = self.get("med_evo.insight_recency_tau", 4.0)
+        try:
+            return max(0.1, float(value))
+        except (TypeError, ValueError):
+            return 4.0
 
     @property
-    def med_agent_max_patterns(self) -> int:
-        """Maximum patient-specific patterns in dynamic memory."""
-        return self.get("med_agent.max_patterns", 8)
-
-    @property
-    def med_agent_memory_use_thinking(self) -> bool:
-        """Whether dynamic memory agent uses explicit chain of thought."""
-        return self.get("med_agent.memory_use_thinking", True)
-
-    @property
-    def med_agent_predictor_use_thinking(self) -> bool:
-        """Whether predictor uses explicit chain of thought."""
-        return self.get("med_agent.predictor_use_thinking", True)
+    def med_evo_insight_every_n_windows(self) -> int:
+        """Run InsightAgent once every N non-empty windows (default 1 = every window)."""
+        value = self.get("med_evo.insight_every_n_windows", 1)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 1
 
     # ========================================================================
     # Utility Methods

@@ -50,14 +50,14 @@ def test_select_wrong_action_template_priority() -> None:
     assert select_wrong_action_template(fallback_events)["template_id"] == "wrong_septic_shock_contradiction"
 
 
-def test_inject_counterfactual_current_event_adds_expected_cw_id() -> None:
+def test_inject_counterfactual_current_event_adds_expected_event_id() -> None:
     window = {
         "current_window_start": "2024-01-01T00:00:00",
         "current_window_end": "2024-01-01T01:00:00",
         "current_events": [
-            {"code": "PROCEDURE", "code_specifics": "Line placement"},
-            {"code": "DRUG_START", "code_specifics": "Norepinephrine"},
-            {"code": "TRANSFER", "code_specifics": "ICU"},
+            {"event_id": 1001, "code": "PROCEDURE", "code_specifics": "Line placement"},
+            {"event_id": 1002, "code": "DRUG_START", "code_specifics": "Norepinephrine"},
+            {"event_id": 1003, "code": "TRANSFER", "code_specifics": "ICU"},
         ],
     }
 
@@ -68,14 +68,15 @@ def test_inject_counterfactual_current_event_adds_expected_cw_id() -> None:
     )
 
     assert len(injected_window["current_events"]) == 4
-    assert expected_action_id == "CW4"
+    assert expected_action_id == "1004"
+    assert int(injected_event["event_id"]) == 1004
     assert "CFX_MARKER_TEST" in str(injected_event.get("text_value"))
 
 
 def test_identify_action_evaluation_by_action_id_and_marker_fallback() -> None:
     action_evaluations = [
         {
-            "action_id": "CW2",
+            "action_id": "1002",
             "action_description": "Titrate vasopressor",
             "overall": {"label": "appropriate"},
         },
@@ -88,15 +89,15 @@ def test_identify_action_evaluation_by_action_id_and_marker_fallback() -> None:
 
     by_id = identify_action_evaluation(
         action_evaluations,
-        expected_action_id="CW2",
+        expected_action_id="1002",
         marker_token="CFX_WRONG_ACTION_abc",
     )
     assert by_id is not None
-    assert by_id.get("action_id") == "CW2"
+    assert by_id.get("action_id") == "1002"
 
     by_marker = identify_action_evaluation(
         action_evaluations,
-        expected_action_id="CW99",
+        expected_action_id="9999",
         marker_token="CFX_WRONG_ACTION_abc",
     )
     assert by_marker is not None

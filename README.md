@@ -264,7 +264,7 @@ for report in reports:
       "time": "2024-01-01 10:12",
       "action": "Norepinephrine infusion started",
       "category": "medication_start",
-      "evidence_event_refs": ["CW4"]
+      "evidence_event_refs": ["123456"]
     }
   ],
   "context_mode": "raw_local_trajectory_icu_events_only",

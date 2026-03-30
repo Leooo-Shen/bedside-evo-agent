@@ -27,11 +27,10 @@ from datetime import datetime
 
 import pandas as pd
 
-from prompts.shared_prompts import get_prediction_prompt
-
 from config.config import get_config
 from data_parser import MIMICDataParser
 from model.llms import LLMClient
+from prompts.shared_prompts import get_prediction_prompt
 from utils.outcome_utils import evaluate_outcome_match
 from utils.patient_selection import select_balanced_patients
 
@@ -140,7 +139,7 @@ def make_baseline_prediction(
     # Get prediction from LLM
     llm_call_error = None
     try:
-        response = llm_client.chat(prompt=prompt, response_format="json")
+        response = llm_client.chat(prompt=prompt)
     except Exception as e:
         # Preserve failed calls as explicit wrong predictions instead of dropping them.
         llm_call_error = str(e)
@@ -180,14 +179,7 @@ def make_baseline_prediction(
         }
     else:
         try:
-            content = response["content"]
-            # Extract from <response> tags if present
-            import re
-
-            resp_match = re.search(r"<response>(.*?)</response>", content, re.DOTALL | re.IGNORECASE)
-            if resp_match:
-                content = resp_match.group(1).strip()
-            prediction = json.loads(content)
+            prediction = json.loads(response["content"])
         except (json.JSONDecodeError, KeyError, TypeError):
             # Fallback if JSON parsing fails
             prediction = {
@@ -253,7 +245,6 @@ def process_single_patient_baseline(
         llm_client = LLMClient(
             provider=config.llm_provider,
             model=config.llm_model,
-            temperature=config.llm_temperature,
             max_tokens=config.llm_max_tokens,
         )
 

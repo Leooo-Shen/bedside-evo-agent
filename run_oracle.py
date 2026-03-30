@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -130,6 +131,102 @@ def _safe_float(value: Any, default: float = float("inf")) -> float:
         return default
 
 
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    parsed = _safe_float(value, default=float("nan"))
+    if math.isfinite(parsed):
+        return float(parsed)
+    return None
+
+
+def _normalize_gender(value: Any) -> Optional[str]:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    normalized = text.lower()
+    if normalized in {"none", "nan", "null", "nat"}:
+        return None
+    if normalized in {"m", "male"}:
+        return "Male"
+    if normalized in {"f", "female"}:
+        return "Female"
+    return text
+
+
+def _format_icu_outcome(survived: Any, death_time: Any) -> str:
+    if survived is True:
+        return "Survived after ICU"
+    if survived is False:
+        return "Died after ICU"
+
+    survived_text = str(survived).strip().lower()
+    if survived_text in {"true", "1", "yes", "y", "survived", "alive"}:
+        return "Survived after ICU"
+    if survived_text in {"false", "0", "no", "n", "died", "dead", "deceased"}:
+        return "Died after ICU"
+
+    death_time_text = str(death_time).strip().lower() if death_time is not None else ""
+    if death_time_text and death_time_text not in {"none", "nan", "nat"}:
+        return "Died after ICU"
+    return "Unknown"
+
+
+def _get_first_window_patient_metadata(windows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    for raw_window in windows:
+        if not isinstance(raw_window, dict):
+            continue
+        metadata = raw_window.get("patient_metadata")
+        if isinstance(metadata, dict):
+            return metadata
+    return {}
+
+
+def _build_patient_context_metadata(trajectory: Dict[str, Any], windows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    first_window_metadata = _get_first_window_patient_metadata(windows)
+
+    age = _coerce_optional_float(trajectory.get("age_at_admission"))
+    if age is None:
+        age = _coerce_optional_float(first_window_metadata.get("age"))
+
+    gender = _normalize_gender(trajectory.get("gender"))
+    if gender is None:
+        gender = _normalize_gender(first_window_metadata.get("gender"))
+
+    total_icu_stay_hours = _coerce_optional_float(trajectory.get("icu_duration_hours"))
+    if total_icu_stay_hours is None:
+        total_icu_stay_hours = _coerce_optional_float(first_window_metadata.get("total_icu_duration_hours"))
+
+    survived = trajectory.get("survived")
+    if survived is None:
+        survived = first_window_metadata.get("survived")
+
+    death_time = trajectory.get("death_time")
+    if death_time is None:
+        death_time = first_window_metadata.get("death_time")
+
+    return {
+        "age": age,
+        "gender": gender,
+        "total_icu_stay_hours": total_icu_stay_hours,
+        "icu_outcome": _format_icu_outcome(survived=survived, death_time=death_time),
+    }
+
+
+def _build_trajectory_metadata(trajectory: Dict[str, Any], windows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    patient_context_metadata = _build_patient_context_metadata(trajectory, windows)
+    return {
+        "enter_time": trajectory.get("enter_time"),
+        "leave_time": trajectory.get("leave_time"),
+        "age": patient_context_metadata.get("age"),
+        "gender": patient_context_metadata.get("gender"),
+        "total_icu_stay_hours": patient_context_metadata.get("total_icu_stay_hours"),
+        "icu_duration_hours": trajectory.get("icu_duration_hours"),
+        "survived": trajectory.get("survived"),
+        "icu_outcome": patient_context_metadata.get("icu_outcome"),
+        "death_time": trajectory.get("death_time"),
+        "total_events": len(trajectory.get("events", [])),
+    }
+
+
 def _llm_call_sort_key(call: Dict[str, Any]) -> tuple[int, float, str, str]:
     window_index = _safe_int(call.get("window_index"), default=-1)
     if window_index < 0:
@@ -160,6 +257,8 @@ def _build_patient_predictions_payload(
     reports: List[Any],
     llm_calls: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    patient_context_metadata = _build_patient_context_metadata(trajectory, windows)
+    trajectory_metadata = _build_trajectory_metadata(trajectory, windows)
     parsed_outputs_by_window_index: Dict[int, Dict[str, Any]] = {}
     for call in _sort_llm_calls(llm_calls):
         if not isinstance(call, dict):
@@ -186,6 +285,10 @@ def _build_patient_predictions_payload(
                 "window_metadata": {
                     "subject_id": window.get("subject_id"),
                     "icu_stay_id": window.get("icu_stay_id"),
+                    "age": patient_context_metadata.get("age"),
+                    "gender": patient_context_metadata.get("gender"),
+                    "total_icu_stay_hours": patient_context_metadata.get("total_icu_stay_hours"),
+                    "icu_outcome": patient_context_metadata.get("icu_outcome"),
                     "window_start_time": window.get("current_window_start"),
                     "window_end_time": window.get("current_window_end"),
                     "hours_since_admission": window.get("hours_since_admission"),
@@ -208,14 +311,7 @@ def _build_patient_predictions_payload(
         "generated_at": datetime.now().isoformat(),
         "subject_id": trajectory.get("subject_id"),
         "icu_stay_id": trajectory.get("icu_stay_id"),
-        "trajectory_metadata": {
-            "enter_time": trajectory.get("enter_time"),
-            "leave_time": trajectory.get("leave_time"),
-            "icu_duration_hours": trajectory.get("icu_duration_hours"),
-            "survived": trajectory.get("survived"),
-            "death_time": trajectory.get("death_time"),
-            "total_events": len(trajectory.get("events", [])),
-        },
+        "trajectory_metadata": trajectory_metadata,
         "num_windows_requested": len(windows),
         "num_windows_evaluated": len(reports),
         "window_outputs": window_outputs,
@@ -240,6 +336,11 @@ def _build_oracle_llm_calls_payload(
 
     step_types = {str(call.get("step_type")) for call in sorted_calls if isinstance(call, dict)}
     pipeline_agents = [
+        {
+            "name": "oracle_pre_icu_history_compressor",
+            "used": "oracle_pre_icu_history_compressor" in step_types,
+            "thinking": None,
+        },
         {"name": "oracle_evaluator", "used": "oracle_evaluator" in step_types, "thinking": None},
     ]
     return {
@@ -256,30 +357,100 @@ def _build_oracle_llm_calls_payload(
 
 
 PROMPT_SECTION_HEADINGS = {
-    "icu_discharge_summary": "## CURRENT DISCHARGE SUMMARY",
-    "icu_trajectory_context_window": "## ICU TRAJECTORY CONTEXT WINDOW",
-    "history_events_current_window": "## HISTORY EVENTS OF CURRENT WINDOW",
-    "current_observation_window": "## CURRENT OBSERVATION WINDOW FOR EVALUATION",
+    "icu_discharge_summary": ("## CURRENT DISCHARGE SUMMARY",),
+    "icu_trajectory_context_window": ("## ICU TRAJECTORY CONTEXT WINDOW",),
+    # Backward-compatible heading variants.
+    "previous_events_current_window": (
+        "## HISTORY EVENTS OF CURRENT WINDOW",
+        "## PREVIOUS EVENTS OF CURRENT WINDOW",
+    ),
+    "current_observation_window": ("## CURRENT OBSERVATION WINDOW FOR EVALUATION",),
 }
 
 
-def _extract_prompt_section(prompt_text: str, heading: str) -> str:
+def _extract_prompt_section(prompt_text: str, headings: tuple[str, ...]) -> str:
     if not isinstance(prompt_text, str) or not prompt_text.strip():
         return ""
-    if not isinstance(heading, str) or not heading.strip():
+    if not isinstance(headings, tuple) or len(headings) == 0:
         return ""
-    escaped_heading = re.escape(heading.strip())
-    match = re.search(rf"{escaped_heading}\n([\s\S]*?)(?=\n##\s+|\Z)", prompt_text, flags=re.IGNORECASE)
-    if not match:
-        return ""
-    return str(match.group(1) or "").strip()
+    for heading in headings:
+        if not isinstance(heading, str) or not heading.strip():
+            continue
+        escaped_heading = re.escape(heading.strip())
+        match = re.search(rf"{escaped_heading}\n([\s\S]*?)(?=\n##\s+|\Z)", prompt_text, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1) or "").strip()
+    return ""
 
 
 def _extract_prompt_sections(prompt_text: str) -> Dict[str, str]:
-    return {
-        key: _extract_prompt_section(prompt_text, heading)
-        for key, heading in PROMPT_SECTION_HEADINGS.items()
-    }
+    return {key: _extract_prompt_section(prompt_text, heading) for key, heading in PROMPT_SECTION_HEADINGS.items()}
+
+
+def _normalize_events(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+    return normalized
+
+
+def _build_context_events_by_window_index(llm_calls: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    context_by_index: Dict[int, Dict[str, Any]] = {}
+    for call in _sort_llm_calls(llm_calls):
+        if not isinstance(call, dict):
+            continue
+        if str(call.get("step_type")) != "oracle_evaluator":
+            continue
+        try:
+            window_index = int(call.get("window_index"))
+        except (TypeError, ValueError):
+            continue
+
+        metadata = call.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+
+        history_events = _normalize_events(metadata.get("context_history_events"))
+        current_events = _normalize_events(metadata.get("context_current_window_events"))
+        future_events = _normalize_events(metadata.get("context_future_events"))
+        history_hours = _safe_float(metadata.get("history_hours"), default=float("nan"))
+        future_hours = _safe_float(metadata.get("future_hours"), default=float("nan"))
+
+        has_payload = (
+            bool(history_events)
+            or bool(current_events)
+            or bool(future_events)
+            or math.isfinite(history_hours)
+            or math.isfinite(future_hours)
+        )
+        if not has_payload:
+            continue
+
+        context_by_index[window_index] = {
+            "history_events": history_events,
+            "current_events": current_events,
+            "future_events": future_events,
+            "history_hours": history_hours if math.isfinite(history_hours) else None,
+            "future_hours": future_hours if math.isfinite(future_hours) else None,
+        }
+
+    return context_by_index
+
+
+def _resolve_context_events_for_window(
+    *,
+    window_index: int,
+    context_by_window_index: Dict[int, Dict[str, Any]],
+) -> tuple[Optional[Dict[str, Any]], Optional[int]]:
+    if not context_by_window_index:
+        return None, None
+    for candidate in (window_index - 1, window_index):
+        if candidate in context_by_window_index:
+            return context_by_window_index[candidate], candidate
+    return None, None
 
 
 def _build_prompt_sections_by_window_index(llm_calls: List[Dict[str, Any]]) -> Dict[int, Dict[str, str]]:
@@ -314,10 +485,7 @@ def _resolve_prompt_sections_for_window(
         if candidate in sections_by_window_index:
             sections = sections_by_window_index[candidate]
             return (
-                {
-                    key: str(sections.get(key) or "")
-                    for key in PROMPT_SECTION_HEADINGS
-                },
+                {key: str(sections.get(key) or "") for key in PROMPT_SECTION_HEADINGS},
                 candidate,
             )
     return empty, None
@@ -330,55 +498,127 @@ def _build_window_contexts_payload(
     windows: List[Dict[str, Any]],
     llm_calls: List[Dict[str, Any]],
     history_hours: Optional[float] = None,
+    future_hours: Optional[float] = None,
 ) -> Dict[str, Any]:
+    patient_context_metadata = _build_patient_context_metadata(trajectory, windows)
+    trajectory_metadata = _build_trajectory_metadata(trajectory, windows)
     sections_by_window_index = _build_prompt_sections_by_window_index(llm_calls)
+    context_events_by_window_index = _build_context_events_by_window_index(llm_calls)
     window_contexts: List[Dict[str, Any]] = []
+    resolved_history_hours: Optional[float] = history_hours
+    resolved_future_hours: Optional[float] = future_hours
 
     for idx, raw_window in enumerate(windows, start=1):
         window = raw_window if isinstance(raw_window, dict) else {}
         current_events = window.get("current_events")
         if not isinstance(current_events, list):
             current_events = []
-        history_events = window.get("history_events")
-        if not isinstance(history_events, list):
-            history_events = []
+        source_history_events = window.get("history_events")
+        if not isinstance(source_history_events, list):
+            source_history_events = []
 
         prompt_sections, llm_window_index = _resolve_prompt_sections_for_window(
             window_index=idx,
             sections_by_window_index=sections_by_window_index,
+        )
+        context_events_payload, context_events_llm_window_index = _resolve_context_events_for_window(
+            window_index=idx,
+            context_by_window_index=context_events_by_window_index,
+        )
+
+        oracle_context_history_events = (
+            _normalize_events(context_events_payload.get("history_events"))
+            if isinstance(context_events_payload, dict)
+            else []
+        )
+        oracle_context_current_events = (
+            _normalize_events(context_events_payload.get("current_events"))
+            if isinstance(context_events_payload, dict)
+            else []
+        )
+        oracle_context_future_events = (
+            _normalize_events(context_events_payload.get("future_events"))
+            if isinstance(context_events_payload, dict)
+            else []
+        )
+        window_history_hours = (
+            context_events_payload.get("history_hours")
+            if isinstance(context_events_payload, dict)
+            else None
+        )
+        window_future_hours = (
+            context_events_payload.get("future_hours")
+            if isinstance(context_events_payload, dict)
+            else None
+        )
+        if not isinstance(window_history_hours, (int, float)) or not math.isfinite(float(window_history_hours)):
+            window_history_hours = history_hours
+        else:
+            window_history_hours = float(window_history_hours)
+
+        if not isinstance(window_future_hours, (int, float)) or not math.isfinite(float(window_future_hours)):
+            window_future_hours = future_hours
+        else:
+            window_future_hours = float(window_future_hours)
+
+        if resolved_history_hours is None and isinstance(window_history_hours, float):
+            resolved_history_hours = window_history_hours
+        if resolved_future_hours is None and isinstance(window_future_hours, float):
+            resolved_future_hours = window_future_hours
+
+        history_events = oracle_context_history_events if isinstance(context_events_payload, dict) else source_history_events
+        context_events_source = (
+            "oracle_context_events"
+            if isinstance(context_events_payload, dict)
+            else "window_payload_history_events"
         )
 
         window_contexts.append(
             {
                 "window_index": idx,
                 "llm_window_index": llm_window_index,
+                "context_events_llm_window_index": context_events_llm_window_index,
                 "window_metadata": {
                     "subject_id": window.get("subject_id"),
                     "icu_stay_id": window.get("icu_stay_id"),
+                    "age": patient_context_metadata.get("age"),
+                    "gender": patient_context_metadata.get("gender"),
+                    "total_icu_stay_hours": patient_context_metadata.get("total_icu_stay_hours"),
+                    "icu_outcome": patient_context_metadata.get("icu_outcome"),
                     "window_start_time": window.get("current_window_start"),
                     "window_end_time": window.get("current_window_end"),
                     "hours_since_admission": window.get("hours_since_admission"),
                     "current_window_hours": window.get("current_window_hours"),
-                    "num_history_events": window.get("num_history_events"),
-                    "num_current_events": window.get("num_current_events"),
+                    "num_history_events": len(history_events),
+                    "num_current_events": len(current_events),
+                    "num_future_events": len(oracle_context_future_events),
                     "pre_icu_history_source": window.get("pre_icu_history_source"),
                     "pre_icu_history_items": window.get("pre_icu_history_items"),
                     "current_discharge_summary_selection_rule": (
-                        window.get("current_discharge_summary", {}) or {}
-                    ).get("selection_rule")
-                    if isinstance(window.get("current_discharge_summary"), dict)
-                    else None,
-                    "history_hours": history_hours,
+                        (window.get("current_discharge_summary", {}) or {}).get("selection_rule")
+                        if isinstance(window.get("current_discharge_summary"), dict)
+                        else None
+                    ),
+                    "history_hours": window_history_hours,
+                    "future_hours": window_future_hours,
                 },
                 "history_events": history_events,
                 "current_events": current_events,
+                "future_events": oracle_context_future_events,
+                "source_window_history_events": source_history_events,
+                "oracle_context_history_events": oracle_context_history_events,
+                "oracle_context_current_events": oracle_context_current_events,
+                "oracle_context_future_events": oracle_context_future_events,
+                "context_events_source": context_events_source,
                 "prompt_sections": prompt_sections,
                 "current_discharge_summary": (
                     window.get("current_discharge_summary")
                     if isinstance(window.get("current_discharge_summary"), dict)
                     else None
                 ),
-                "pre_icu_history": window.get("pre_icu_history") if isinstance(window.get("pre_icu_history"), dict) else None,
+                "pre_icu_history": (
+                    window.get("pre_icu_history") if isinstance(window.get("pre_icu_history"), dict) else None
+                ),
             }
         )
 
@@ -387,7 +627,9 @@ def _build_window_contexts_payload(
         "generated_at": datetime.now().isoformat(),
         "subject_id": trajectory.get("subject_id"),
         "icu_stay_id": trajectory.get("icu_stay_id"),
-        "history_hours": history_hours,
+        "trajectory_metadata": trajectory_metadata,
+        "history_hours": resolved_history_hours,
+        "future_hours": resolved_future_hours,
         "window_contexts": window_contexts,
     }
 
@@ -403,6 +645,7 @@ def process_batch_for_oracle(
     window_step_hours: float = 0.5,
     include_pre_icu_data: bool = True,
     use_discharge_summary: Optional[bool] = None,
+    compress_pre_icu_history: Optional[bool] = None,
     include_icu_outcome_in_prompt: Optional[bool] = None,
     max_patients: Optional[int] = None,
     n_survived: Optional[int] = None,
@@ -453,7 +696,13 @@ def process_batch_for_oracle(
     selected_use_discharge_summary = (
         config.oracle_context_use_discharge_summary if use_discharge_summary is None else bool(use_discharge_summary)
     )
+    selected_compress_pre_icu_history = (
+        bool(getattr(config, "oracle_context_compress_pre_icu_history", True))
+        if compress_pre_icu_history is None
+        else bool(compress_pre_icu_history)
+    )
     print(f"  Use ICU discharge summary in context: {selected_use_discharge_summary}")
+    print(f"  Compress pre-ICU history once per patient: {selected_compress_pre_icu_history}")
     print(f"  Include ICU outcome in prompt: {selected_include_icu_outcome_in_prompt}")
     print(f"  Context history threshold (hours): {config.oracle_context_history_hours}")
     print(f"  Context future threshold (hours): {config.oracle_context_future_hours}")
@@ -463,8 +712,10 @@ def process_batch_for_oracle(
         provider=provider,
         model=model,
         temperature=1.0,
+        max_tokens=4096,
         use_discharge_summary=selected_use_discharge_summary,
         include_icu_outcome_in_prompt=selected_include_icu_outcome_in_prompt,
+        compress_pre_icu_history=selected_compress_pre_icu_history,
         history_context_hours=config.oracle_context_history_hours,
         future_context_hours=config.oracle_context_future_hours,
         top_k_recommendations=config.oracle_context_top_k_recommendations,
@@ -608,6 +859,7 @@ def process_batch_for_oracle(
                 windows=windows,
                 llm_calls=llm_calls,
                 history_hours=float(config.oracle_context_history_hours),
+                future_hours=float(config.oracle_context_future_hours),
             )
             window_contexts_path = patient_dir / "window_contexts.json"
             with open(window_contexts_path, "w", encoding="utf-8") as f:
@@ -738,6 +990,16 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--compress-pre-icu-history",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Whether to LLM-compress pre-ICU history once per patient and reuse it across windows. "
+            "If omitted, uses config oracle_context.compress_pre_icu_history."
+        ),
+    )
+
+    parser.add_argument(
         "--include-icu-outcome-in-prompt",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -799,6 +1061,7 @@ def main() -> None:
         window_step_hours=args.window_step_hours,
         include_pre_icu_data=not args.no_pre_icu_data,
         use_discharge_summary=args.use_discharge_summary,
+        compress_pre_icu_history=args.compress_pre_icu_history,
         include_icu_outcome_in_prompt=args.include_icu_outcome_in_prompt,
         max_patients=args.max_patients,
         n_survived=args.n_survived,

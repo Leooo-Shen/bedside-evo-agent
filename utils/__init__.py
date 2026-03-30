@@ -18,6 +18,13 @@ from .discharge_summary_selector import (
     select_discharge_summaries_for_icu_stays,
     summarize_discharge_summary_selection,
 )
+from .key_window_selector import (
+    HIGH_IMPACT_EVENT_CODES,
+    compute_window_code_ratios,
+    score_windows_by_keyness,
+    select_key_windows,
+    select_windows_by_ratio_threshold,
+)
 
 __all__ = [
     "VITAL_GUIDELINES",
@@ -37,4 +44,9 @@ __all__ = [
     "nearest_primary_status",
     "select_discharge_summaries_for_icu_stays",
     "summarize_discharge_summary_selection",
+    "HIGH_IMPACT_EVENT_CODES",
+    "compute_window_code_ratios",
+    "score_windows_by_keyness",
+    "select_key_windows",
+    "select_windows_by_ratio_threshold",
 ]

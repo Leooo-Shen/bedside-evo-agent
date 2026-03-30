@@ -122,7 +122,7 @@ class RememAgent:
         provider: str = "openai",
         model: str = None,
         api_key: str = None,
-        temperature: float = 0.3,
+        temperature: Optional[float] = None,
         max_tokens: int = 4096,
         max_state_length: int = 1500,
         enable_logging: bool = False,
@@ -135,7 +135,7 @@ class RememAgent:
             provider: LLM provider ("openai", "anthropic", "google", or "gemini")
             model: Model name
             api_key: API key
-            temperature: Sampling temperature
+            temperature: Optional sampling temperature override
             max_tokens: Maximum tokens in response
             max_state_length: Maximum length of state summary
             enable_logging: Enable detailed logging of all LLM calls
@@ -402,11 +402,6 @@ class RememAgent:
         pred_match = re.search(r"<prediction>(.*?)</prediction>", response, re.DOTALL | re.IGNORECASE)
         if pred_match:
             return ("predict", pred_match.group(1).strip())
-
-        # Check for response tags (shared prediction prompt format)
-        resp_match = re.search(r"<response>(.*?)</response>", response, re.DOTALL | re.IGNORECASE)
-        if resp_match:
-            return ("predict", resp_match.group(1).strip())
 
         # Fallback: treat entire response as prediction
         return ("predict", response)

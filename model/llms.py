@@ -41,7 +41,7 @@ class LLMClient:
         provider: str = "openai",
         model: str = None,
         api_key: str = None,
-        temperature: float = 0.7,
+        temperature: Optional[float] = None,
         max_tokens: int = 4096,
         max_retries: int = 3,
         retry_base_delay_seconds: float = 1.0,
@@ -55,7 +55,7 @@ class LLMClient:
             provider: "openai", "anthropic", "google", or "gemini"
             model: Model name (e.g., "gpt-4o", "claude-3-5-sonnet-20241022", "gemini-1.5-flash")
             api_key: API key (if None, will use environment variable)
-            temperature: Sampling temperature
+            temperature: Optional sampling temperature override. If None, provider/model default is used.
             max_tokens: Maximum tokens in response
             max_retries: Maximum number of retries for transient API errors
             retry_base_delay_seconds: Base backoff delay in seconds
@@ -191,6 +191,20 @@ class LLMClient:
             return None
         return timeout_seconds
 
+    def _resolve_temperature(self, **kwargs) -> Optional[float]:
+        if "temperature" in kwargs:
+            temperature_value = kwargs.get("temperature")
+        else:
+            temperature_value = self.temperature
+
+        if temperature_value is None:
+            return None
+        try:
+            parsed = float(temperature_value)
+        except (TypeError, ValueError):
+            return None
+        return parsed
+
     def _extract_status_code(self, error: Exception) -> Optional[int]:
         """Extract HTTP status code from SDK exceptions when available."""
         status_code = getattr(error, "status_code", None)
@@ -264,10 +278,11 @@ class LLMClient:
             "messages": messages,
         }
 
-        # Handle temperature parameter
-        # Some models (gpt-5*, o1*) only support default temperature (1.0)
-        if not (self.model.startswith("gpt-5") or self.model.startswith("o1")):
-            request_params["temperature"] = kwargs.get("temperature", self.temperature)
+        # Some models (gpt-5*, o1*) only support default temperature.
+        # For other models, only set temperature when explicitly provided.
+        temperature = self._resolve_temperature(**kwargs)
+        if temperature is not None and not (self.model.startswith("gpt-5") or self.model.startswith("o1")):
+            request_params["temperature"] = temperature
 
         # Determine which token parameter to use based on model
         # Newer models (gpt-5*, o1*) use max_completion_tokens
@@ -327,9 +342,11 @@ class LLMClient:
     ) -> Dict[str, Any]:
         """Gemini implementation using the google-genai SDK."""
         config_kwargs = {
-            "temperature": 1.0,  # recommended by Google
             "max_output_tokens": kwargs.get("max_tokens", self.max_tokens),
         }
+        temperature = self._resolve_temperature(**kwargs)
+        if temperature is not None:
+            config_kwargs["temperature"] = temperature
         if response_format == "json":
             config_kwargs["response_mime_type"] = "application/json"
         if system_prompt:
@@ -374,9 +391,11 @@ class LLMClient:
     ) -> Dict[str, Any]:
         """Gemini implementation using the google-generativeai SDK."""
         generation_config = {
-            "temperature": kwargs.get("temperature", self.temperature),
             "max_output_tokens": kwargs.get("max_tokens", self.max_tokens),
         }
+        temperature = self._resolve_temperature(**kwargs)
+        if temperature is not None:
+            generation_config["temperature"] = temperature
         if response_format == "json":
             generation_config["response_mime_type"] = "application/json"
 

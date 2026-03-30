@@ -47,45 +47,53 @@ def _build_trajectory() -> dict:
     leave = enter + timedelta(hours=120)
     events = [
         {
+            "event_id": 1,
             "time": (enter - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
             "code": "VITALS",
             "code_specifics": "MAP_pre_icu",
             "numeric_value": 50,
         },
         {
+            "event_id": 2,
             "time": (enter + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"),
             "code": "VITALS",
             "code_specifics": "MAP_1h",
             "numeric_value": 62,
         },
         {
+            "event_id": 3,
             "time": (enter + timedelta(hours=30)).strftime("%Y-%m-%d %H:%M:%S"),
             "code": "DRUG_START",
             "code_specifics": "Norepinephrine",
         },
         {
+            "event_id": 4,
             "time": (enter + timedelta(hours=55)).strftime("%Y-%m-%d %H:%M:%S"),
             "code": "LAB",
             "code_specifics": "Lactate",
             "numeric_value": 4.2,
         },
         {
+            "event_id": 5,
             "time": (enter + timedelta(hours=70)).strftime("%Y-%m-%d %H:%M:%S"),
             "code": "VENT_CHANGE",
             "code_specifics": "PEEP 10",
         },
         {
+            "event_id": 6,
             "time": (enter + timedelta(hours=72)).strftime("%Y-%m-%d %H:%M:%S"),
             "code": "META_DEATH",
             "code_specifics": "Outcome event",
         },
         {
+            "event_id": 7,
             "time": (enter + timedelta(hours=110)).strftime("%Y-%m-%d %H:%M:%S"),
             "code": "NOTE_DISCHARGESUMMARY",
             "code_specifics": "ICU discharge note",
             "text_value": "Discharge summary outside bounded context window.",
         },
         {
+            "event_id": 8,
             "time": (enter + timedelta(hours=101)).strftime("%Y-%m-%d %H:%M:%S"),
             "code": "VITALS",
             "code_specifics": "MAP_101h",
@@ -147,9 +155,8 @@ def test_context_window_uses_current_window_start_anchor(monkeypatch):
     assert "Current window duration (hours): 0.50" in context["context_text"]
     assert "## FUTURE EVENTS" in context["context_text"]
     assert "MAP_1h" in context["context_text"]
-    assert "CW1." in context["context_text"]
-    assert "CW1. 2024-01-02 06:00 " in context["context_text"]
-    assert "CW1. 2024-01-02 06:00:00 " not in context["context_text"]
+    assert "[3] 2024-01-02 06:00 " in context["context_text"]
+    assert "[3] 2024-01-02 06:00:00 " not in context["context_text"]
     assert "Norepinephrine" in context["context_text"]
     assert "META_DEATH" in context["context_text"]
     assert "NOTE_DISCHARGESUMMARY" not in context["context_text"]
@@ -186,9 +193,8 @@ def test_use_discharge_summary_can_include_summary_block(monkeypatch):
     assert "## CURRENT OBSERVATION WINDOW FOR EVALUATION" in context["context_text"]
     assert "Current window duration (hours): 0.50" in context["context_text"]
     assert "## FUTURE EVENTS" in context["context_text"]
-    assert "CW1." in context["context_text"]
-    assert "CW1. 2024-01-02 06:00 " in context["context_text"]
-    assert "CW1. 2024-01-02 06:00:00 " not in context["context_text"]
+    assert "[3] 2024-01-02 06:00 " in context["context_text"]
+    assert "[3] 2024-01-02 06:00:00 " not in context["context_text"]
     assert "Norepinephrine" in context["context_text"]
     assert "Discharge summary outside bounded context window." in context["context_text"]
 

@@ -148,7 +148,15 @@ def mask_window_outcome_leakage(window: Dict[str, Any]) -> Dict[str, Any]:
     """Mask discharge-summary outcome leakage in a generated time window payload."""
     masked = copy.deepcopy(window)
 
-    for events_key in ("history_events", "current_events"):
+    for events_key in (
+        "history_events",
+        "current_events",
+        "future_events",
+        "source_window_history_events",
+        "oracle_context_history_events",
+        "oracle_context_current_events",
+        "oracle_context_future_events",
+    ):
         events = masked.get(events_key)
         if not isinstance(events, list):
             continue

@@ -10,12 +10,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from model.llms import LLMClient
-from prompts.oracle_prompt import format_event_line, format_oracle_prompt
+from prompts.oracle_prompt import (
+    format_event_lines,
+    format_oracle_prompt,
+    format_pre_icu_compression_prompt,
+)
 
 try:
     import tiktoken
@@ -28,7 +32,17 @@ VALID_STATUS = {"improving", "stable", "deteriorating", "fluctuating", "insuffic
 VALID_ACTION_CATEGORY = {"medication_start", "medication_order", "procedure", "transfer", "other"}
 VALID_QUALITY_RATING = {"optimal", "neutral", "sub_optimal"}
 VALID_GUIDELINE_ADHERENCE = {"adherent", "non_adherent", "not_applicable", "guideline_unclear"}
-VALID_CONTEXTUAL_APPROPRIATENESS = {"appropriate", "suboptimal", "potentially_harmful", "not_enough_context"}
+VALID_CONTEXTUAL_APPROPRIATENESS = {
+    "appropriate",
+    "suboptimal",
+    "potentially_harmful",
+    "insufficient_data",
+    "not_enough_context",
+}
+CONTEXTUAL_APPROPRIATENESS_ALIASES = {
+    "insufficient": "insufficient_data",
+    "not_enough_context": "insufficient_data",
+}
 OUTCOME_MASK_TOKEN = "[OUTCOME_MASKED]"
 OUTCOME_LEAK_TERMS_PATTERN = re.compile(
     r"(?i)\b(expired|deceased|dead|died|passed\s+away|death|hospice|comfort\s+measures)\b"
@@ -42,6 +56,7 @@ DISCHARGE_SUMMARY_SECTION_HEADERS = (
     "Medications on Admission:",
     "Discharge Medications:",
 )
+PRE_ICU_COMPRESSION_STEP_TYPE = "oracle_pre_icu_history_compressor"
 
 
 class OracleReport:
@@ -150,7 +165,7 @@ class MetaOracle:
         provider: str = "openai",
         model: Optional[str] = None,
         api_key: Optional[str] = None,
-        temperature: float = 0.3,
+        temperature: Optional[float] = None,
         max_tokens: int = 4096,
         request_timeout_seconds: float = 300.0,
         log_dir: Optional[str] = None,
@@ -160,6 +175,7 @@ class MetaOracle:
         history_context_hours: float = 48.0,
         future_context_hours: float = 48.0,
         top_k_recommendations: int = 3,
+        compress_pre_icu_history: bool = False,
     ):
         try:
             self.llm_client = LLMClient(
@@ -194,10 +210,13 @@ class MetaOracle:
         self.top_k_recommendations = int(top_k_recommendations)
         if self.top_k_recommendations < 1:
             self.top_k_recommendations = 1
+        self.compress_pre_icu_history = bool(compress_pre_icu_history)
 
         self.evaluation_count = 0
         self.total_tokens_used = 0
         self.total_llm_calls = 0
+        self.total_pre_icu_compression_calls = 0
+        self.total_pre_icu_compression_tokens = 0
         self.request_timeout_seconds = float(request_timeout_seconds)
 
         self._stats_lock = Lock()
@@ -218,6 +237,7 @@ class MetaOracle:
             f"history_hours={self.history_context_hours}, "
             f"future_hours={self.future_context_hours}, "
             f"top_k_recommendations={self.top_k_recommendations}, "
+            f"compress_pre_icu_history={self.compress_pre_icu_history}, "
             f"request_timeout_seconds={self.request_timeout_seconds:.1f}"
         )
 
@@ -472,6 +492,9 @@ class MetaOracle:
             current_window_start=current_window_start,
             current_window_end=current_window_end,
         )
+        history_events_for_log = _sanitize_context_events(history_events)
+        current_window_events_for_log = _sanitize_context_events(current_window_events)
+        future_events_for_log = _sanitize_context_events(future_events)
 
         events_context_text = _build_raw_context_text(
             history_events=history_events,
@@ -516,6 +539,9 @@ class MetaOracle:
             "context_history_event_count": len(history_events),
             "context_current_window_event_count": len(current_window_events),
             "context_future_event_count": len(future_events),
+            "context_history_events": history_events_for_log,
+            "context_current_window_events": current_window_events_for_log,
+            "context_future_events": future_events_for_log,
             "use_discharge_summary": self.use_discharge_summary,
             "context_anchor_time": anchor_time.isoformat() if anchor_time else None,
             "context_window_start": context_start.isoformat() if context_start else None,
@@ -528,6 +554,133 @@ class MetaOracle:
             "has_icu_discharge_summary": has_current_discharge_summary,
             "icu_discharge_summary_count": 1 if has_current_discharge_summary else 0,
         }
+
+    def compress_pre_icu_history_for_windows(self, windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Compress shared pre-ICU history once and attach to all windows."""
+        if not self.compress_pre_icu_history:
+            return None
+        if not windows:
+            return None
+
+        first_window = windows[0] if isinstance(windows[0], dict) else {}
+        pre_icu_history = first_window.get("pre_icu_history")
+        if not isinstance(pre_icu_history, dict):
+            return None
+
+        source = _safe_text(pre_icu_history.get("source")).lower()
+        raw_content = _safe_text(pre_icu_history.get("content"))
+        raw_baseline_content = _safe_text(pre_icu_history.get("baseline_content"))
+        if source == "llm_compressed" and raw_content:
+            compression_info = pre_icu_history.get("compression")
+            if isinstance(compression_info, dict):
+                return dict(compression_info)
+            return {"status": "already_compressed"}
+
+        if not raw_content and not raw_baseline_content:
+            return None
+
+        prompt = format_pre_icu_compression_prompt(pre_icu_history)
+        response: Dict[str, Any] = {}
+        parsed: Dict[str, Any] = {}
+        parse_source = "provider"
+        compression_error: Optional[str] = None
+
+        try:
+            response = self.llm_client.chat(
+                prompt=prompt,
+                timeout_seconds=self.request_timeout_seconds,
+            )
+            parsed_candidate = response.get("parsed")
+            if parsed_candidate is None:
+                parse_source = "best_effort_json"
+                parsed_candidate = _best_effort_parse_json(response.get("content", ""))
+            if isinstance(parsed_candidate, dict):
+                parsed = parsed_candidate
+        except Exception as exc:
+            compression_error = str(exc)
+            parse_source = "error_fallback"
+
+        compressed_text = _safe_text(parsed.get("compressed_pre_icu_history"))
+        if not compressed_text:
+            if parse_source == "provider":
+                parse_source = "heuristic_fallback"
+            compressed_text = _build_fallback_pre_icu_compression(pre_icu_history)
+
+        usage = response.get("usage", {}) if isinstance(response, dict) else {}
+        compression_tokens = _usage_tokens(usage)
+        with self._stats_lock:
+            self.total_pre_icu_compression_calls += 1
+            self.total_pre_icu_compression_tokens += compression_tokens
+            self.total_tokens_used += compression_tokens
+
+        original_chars = len(raw_content) + len(raw_baseline_content)
+        compression_metadata = {
+            "method": "llm",
+            "step_type": PRE_ICU_COMPRESSION_STEP_TYPE,
+            "original_source": source or "unknown",
+            "original_content_chars": len(raw_content),
+            "original_baseline_chars": len(raw_baseline_content),
+            "compressed_chars": len(compressed_text),
+            "parse_source": parse_source,
+            "error": compression_error,
+        }
+        if original_chars > 0:
+            compression_metadata["compression_ratio"] = round(len(compressed_text) / float(original_chars), 4)
+
+        response_for_log = dict(response) if isinstance(response, dict) else {}
+        parsed_for_log = parsed if isinstance(parsed, dict) else {}
+        parsed_for_log = dict(parsed_for_log)
+        if compressed_text and not _safe_text(parsed_for_log.get("compressed_pre_icu_history")):
+            parsed_for_log["compressed_pre_icu_history"] = compressed_text
+        parsed_for_log["output_source"] = parse_source
+
+        if not _safe_text(response_for_log.get("content")):
+            response_for_log["content"] = json.dumps(
+                {"compressed_pre_icu_history": compressed_text},
+                ensure_ascii=False,
+            )
+
+        self._record_llm_call(
+            step_type=PRE_ICU_COMPRESSION_STEP_TYPE,
+            subject_id=first_window.get("subject_id"),
+            icu_stay_id=first_window.get("icu_stay_id"),
+            prompt=prompt,
+            response=response_for_log,
+            parsed_response=parsed_for_log,
+            window_data=first_window,
+            metadata={
+                "window_start_time": first_window.get("current_window_start"),
+                "window_end_time": first_window.get("current_window_end"),
+                "pre_icu_history_source": first_window.get("pre_icu_history_source"),
+                "pre_icu_history_items": first_window.get("pre_icu_history_items"),
+                "original_source": source or "unknown",
+                "original_content_chars": len(raw_content),
+                "original_baseline_chars": len(raw_baseline_content),
+                "compressed_chars": len(compressed_text),
+                "compressed_pre_icu_history": compressed_text,
+                "parse_source": parse_source,
+                "error": compression_error,
+            },
+        )
+
+        compressed_pre_icu_history = dict(pre_icu_history)
+        compressed_pre_icu_history["source"] = "llm_compressed"
+        compressed_pre_icu_history["content"] = compressed_text
+        compressed_pre_icu_history["baseline_content"] = ""
+        compressed_pre_icu_history["compression"] = compression_metadata
+
+        applied_windows = 0
+        for window in windows:
+            if not isinstance(window, dict):
+                continue
+            if not isinstance(window.get("pre_icu_history"), dict):
+                continue
+            window["pre_icu_history"] = dict(compressed_pre_icu_history)
+            window["pre_icu_history_source"] = "llm_compressed"
+            applied_windows += 1
+
+        compression_metadata["applied_to_windows"] = applied_windows
+        return compression_metadata
 
     def _estimate_tokens(self, text: str) -> int:
         if not text:
@@ -577,9 +730,12 @@ class MetaOracle:
         try:
             response = self.llm_client.chat(
                 prompt=prompt,
-                response_format="json",
+                response_format="text",
                 timeout_seconds=self.request_timeout_seconds,
             )
+
+            # print("====" * 50)
+            # print(response)
 
             with self._stats_lock:
                 self.evaluation_count += 1
@@ -615,6 +771,11 @@ class MetaOracle:
                     "context_anchor_time": context_info.get("context_anchor_time"),
                     "context_window_start": context_info.get("context_window_start"),
                     "context_window_end": context_info.get("context_window_end"),
+                    "history_hours": context_info.get("history_hours"),
+                    "future_hours": context_info.get("future_hours"),
+                    "context_history_events": context_info.get("context_history_events", []),
+                    "context_current_window_events": context_info.get("context_current_window_events", []),
+                    "context_future_events": context_info.get("context_future_events", []),
                     "pre_icu_history_source": window_data.get("pre_icu_history_source"),
                     "pre_icu_history_items": window_data.get("pre_icu_history_items"),
                     "current_discharge_summary_selection_rule": context_info.get(
@@ -683,6 +844,11 @@ class MetaOracle:
                         "window_end_time": window_data.get("current_window_end"),
                         "context_mode": context_info.get("mode"),
                         "use_discharge_summary": context_info.get("use_discharge_summary", self.use_discharge_summary),
+                        "history_hours": context_info.get("history_hours"),
+                        "future_hours": context_info.get("future_hours"),
+                        "context_history_events": context_info.get("context_history_events", []),
+                        "context_current_window_events": context_info.get("context_current_window_events", []),
+                        "context_future_events": context_info.get("context_future_events", []),
                         "pre_icu_history_source": window_data.get("pre_icu_history_source"),
                         "pre_icu_history_items": window_data.get("pre_icu_history_items"),
                         "current_discharge_summary_selection_rule": context_info.get(
@@ -732,6 +898,7 @@ class MetaOracle:
 
     def evaluate_trajectory(self, windows: List[Dict[str, Any]], trajectory: Dict[str, Any]) -> List[OracleReport]:
         reports: List[OracleReport] = []
+        self.compress_pre_icu_history_for_windows(windows)
         prepared_trajectory_context = self._prepare_trajectory_context(trajectory)
 
         for i, window in enumerate(windows):
@@ -763,6 +930,7 @@ class MetaOracle:
         if show_progress:
             print(f"Starting parallel evaluation with {worker_count} workers...")
 
+        self.compress_pre_icu_history_for_windows(windows)
         prepared_trajectory_context = self._prepare_trajectory_context(trajectory)
         windows_with_index = []
         for i, window in enumerate(windows):
@@ -833,6 +1001,8 @@ class MetaOracle:
             "total_evaluations": self.evaluation_count,
             "total_llm_calls": self.total_llm_calls,
             "total_tokens_used": self.total_tokens_used,
+            "total_pre_icu_compression_calls": self.total_pre_icu_compression_calls,
+            "total_pre_icu_compression_tokens": self.total_pre_icu_compression_tokens,
             "avg_tokens_per_evaluation": (
                 self.total_tokens_used / self.evaluation_count if self.evaluation_count > 0 else 0
             ),
@@ -842,6 +1012,7 @@ class MetaOracle:
             "history_context_hours": self.history_context_hours,
             "future_context_hours": self.future_context_hours,
             "top_k_recommendations": self.top_k_recommendations,
+            "compress_pre_icu_history": self.compress_pre_icu_history,
         }
 
 
@@ -885,6 +1056,26 @@ def _safe_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_event_id(event: Mapping[str, Any]) -> Optional[int]:
+    # Preferred ID is ICU-local stable index (0-based within one ICU stay).
+    for key in ("icu_event_index", "event_index", "event_id", "event_idx", "prompt_event_id", "relative_event_id"):
+        event_id = _safe_int(event.get(key))
+        if event_id is not None:
+            return event_id
+    return None
 
 
 def _safe_float(value: Any) -> float:
@@ -960,6 +1151,9 @@ def _extract_icu_events(
             "numeric_value": event.get("numeric_value"),
             "text_value": event.get("text_value"),
         }
+        event_id = _extract_event_id(event)
+        if event_id is not None:
+            cleaned["event_id"] = event_id
         cleaned = {k: v for k, v in cleaned.items() if v is not None}
         if not cleaned:
             continue
@@ -1030,6 +1224,16 @@ def _partition_events_relative_to_window(
     return history_events, current_window_events, future_events
 
 
+def _sanitize_context_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sanitized: List[Dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        cleaned = {key: value for key, value in event.items() if not str(key).startswith("_")}
+        sanitized.append(cleaned)
+    return sanitized
+
+
 def _build_raw_context_text(
     *,
     history_events: List[Dict[str, Any]],
@@ -1069,11 +1273,7 @@ def _build_raw_context_text(
         f"History duration (hours): {history_hours:.1f}",
     ]
 
-    if history_events:
-        for idx, event in enumerate(history_events, start=1):
-            lines.append(f"HX{idx}. {format_event_line(event)}")
-    else:
-        lines.append("(No history events before current window)")
+    lines.extend(format_event_lines(history_events, empty_text="(No history events before current window)"))
 
     lines.extend(
         [
@@ -1085,11 +1285,7 @@ def _build_raw_context_text(
         ]
     )
 
-    if current_window_events:
-        for idx, event in enumerate(current_window_events, start=1):
-            lines.append(f"CW{idx}. {format_event_line(event)}")
-    else:
-        lines.append("(No events in current observation window)")
+    lines.extend(format_event_lines(current_window_events, empty_text="(No events in current observation window)"))
 
     lines.extend(
         [
@@ -1100,11 +1296,7 @@ def _build_raw_context_text(
         ]
     )
 
-    if future_events:
-        for idx, event in enumerate(future_events, start=1):
-            lines.append(f"FX{idx}. {format_event_line(event)}")
-    else:
-        lines.append("(No future events after current window)")
+    lines.extend(format_event_lines(future_events, empty_text="(No future events after current window)"))
 
     return "\n".join(lines)
 
@@ -1199,6 +1391,43 @@ def _build_current_discharge_summary_context_text(
     return "\n".join(lines).strip()
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    cleaned = _safe_text(text)
+    if max_chars <= 0 or len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _build_fallback_pre_icu_compression(pre_icu_history: Dict[str, Any]) -> str:
+    source = _safe_text(pre_icu_history.get("source")) or "unknown"
+    items = int(_safe_float(pre_icu_history.get("items")))
+    history_hours = _safe_float(pre_icu_history.get("history_hours"))
+    content = _safe_text(pre_icu_history.get("content"))
+    baseline_content = _safe_text(pre_icu_history.get("baseline_content"))
+    baseline_events_count = int(_safe_float(pre_icu_history.get("baseline_events_count")))
+
+    lines: List[str] = [
+        f"Source: {source}",
+        f"Historical items: {items}",
+    ]
+    if history_hours > 0:
+        lines.append(f"History lookback hours: {history_hours:.1f}")
+    if content:
+        lines.append("Historical reports (truncated):")
+        content_lines = [line.strip() for line in content.splitlines() if line.strip()]
+        lines.extend(content_lines[:20])
+    else:
+        lines.append("Historical reports: none")
+
+    if baseline_content:
+        lines.append("")
+        lines.append(f"Baseline labs/vitals snapshot ({baseline_events_count} event(s), truncated):")
+        baseline_lines = [line.strip() for line in baseline_content.splitlines() if line.strip()]
+        lines.extend(baseline_lines[:12])
+
+    return _truncate_text("\n".join(lines), max_chars=1800)
+
+
 def _normalize_domain_assessments(
     domains_value: Any,
     fallback_physiology: Any,
@@ -1225,9 +1454,17 @@ def _normalize_domain_assessments(
             rationale = "No rationale provided."
 
         key_signals_raw = item.get("key_signals")
+        if not isinstance(key_signals_raw, list):
+            key_signals_raw = item.get("key_evidence")
         key_signals: List[str] = []
         if isinstance(key_signals_raw, list):
-            key_signals = [_safe_text(signal) for signal in key_signals_raw if _safe_text(signal)]
+            for signal in key_signals_raw:
+                if isinstance(signal, dict):
+                    signal_text = _safe_text(signal.get("id") or signal.get("event_id") or signal.get("ref"))
+                else:
+                    signal_text = _safe_text(signal)
+                if signal_text:
+                    key_signals.append(signal_text)
 
         normalized[key] = {
             "label": label,
@@ -1344,14 +1581,27 @@ def _normalize_doctor_actions(value: Any) -> List[Dict[str, Any]]:
 
         action = _safe_text(item.get("action"))
         if not action:
+            action = _safe_text(item.get("action_name"))
+        if not action:
+            action = _safe_text(item.get("action_description"))
+        if not action:
             continue
 
         category = _safe_text(item.get("category")).lower()
         if category not in VALID_ACTION_CATEGORY:
             category = "other"
 
-        refs = item.get("evidence_event_refs") if isinstance(item.get("evidence_event_refs"), list) else []
-        refs = [_safe_text(ref) for ref in refs if _safe_text(ref)]
+        refs_raw = item.get("evidence_event_refs")
+        if not isinstance(refs_raw, list):
+            refs_raw = item.get("key_evidence") if isinstance(item.get("key_evidence"), list) else []
+        refs: List[str] = []
+        for ref in refs_raw:
+            if isinstance(ref, dict):
+                ref_text = _safe_text(ref.get("id") or ref.get("event_id") or ref.get("ref"))
+            else:
+                ref_text = _safe_text(ref)
+            if ref_text:
+                refs.append(ref_text)
 
         normalized.append(
             {
@@ -1374,11 +1624,16 @@ def _normalize_action_evaluations(value: Any) -> List[Dict[str, Any]]:
         if not isinstance(item, dict):
             continue
 
+        action_name = _safe_text(item.get("action_name"))
         action_description = _safe_text(item.get("action_description"))
+        if not action_description:
+            action_description = action_name
         if not action_description:
             action_description = _safe_text(item.get("action"))
         if not action_description:
             continue
+        if not action_name:
+            action_name = action_description
 
         action_id = _safe_text(item.get("action_id")) or f"A{index}"
 
@@ -1387,6 +1642,8 @@ def _normalize_action_evaluations(value: Any) -> List[Dict[str, Any]]:
         if guideline_label not in VALID_GUIDELINE_ADHERENCE:
             guideline_label = "guideline_unclear"
         guideline_reference = guideline.get("guideline_reference")
+        if guideline_reference is None:
+            guideline_reference = guideline.get("reference")
         if guideline_reference is not None:
             guideline_reference = _safe_text(guideline_reference) or None
         guideline_rationale = _safe_text(guideline.get("rationale"))
@@ -1396,17 +1653,28 @@ def _normalize_action_evaluations(value: Any) -> List[Dict[str, Any]]:
         contextual = (
             item.get("contextual_appropriateness") if isinstance(item.get("contextual_appropriateness"), dict) else {}
         )
-        contextual_label = _safe_text(contextual.get("label")).lower()
-        if contextual_label not in VALID_CONTEXTUAL_APPROPRIATENESS:
-            contextual_label = "not_enough_context"
+        contextual_label = _normalize_contextual_appropriateness_label(contextual.get("label"))
         contextual_rationale = _safe_text(contextual.get("rationale"))
         if not contextual_rationale:
+            contextual_rationale = _safe_text(contextual.get("hindsight_usage"))
+        if not contextual_rationale:
             contextual_rationale = "No contextual appropriateness rationale provided."
-        hindsight_caveat = _safe_text(contextual.get("hindsight_caveat")) or None
+        hindsight_caveat = _safe_text(contextual.get("hindsight_caveat")) or _safe_text(
+            contextual.get("hindsight_usage")
+        )
+        if not hindsight_caveat:
+            hindsight_caveat = None
+
+        overall = item.get("overall") if isinstance(item.get("overall"), dict) else {}
+        overall_label = _normalize_contextual_appropriateness_label(overall.get("label"))
+        overall_rationale = _safe_text(overall.get("rationale"))
+        if not overall_rationale:
+            overall_rationale = contextual_rationale
 
         normalized.append(
             {
                 "action_id": action_id,
+                "action_name": action_name,
                 "action_description": action_description,
                 "guideline_adherence": {
                     "label": guideline_label,
@@ -1417,6 +1685,11 @@ def _normalize_action_evaluations(value: Any) -> List[Dict[str, Any]]:
                     "label": contextual_label,
                     "rationale": contextual_rationale,
                     "hindsight_caveat": hindsight_caveat,
+                    "hindsight_usage": hindsight_caveat,
+                },
+                "overall": {
+                    "label": overall_label,
+                    "rationale": overall_rationale,
                 },
             }
         )
@@ -1428,17 +1701,30 @@ def _normalize_overall_window_summary(value: Any) -> str:
     return _safe_text(value)
 
 
-def _extract_cw_refs(text: Any) -> List[str]:
+def _extract_event_refs(text: Any) -> List[str]:
     candidate = _safe_text(text)
     if not candidate:
         return []
 
     refs: List[str] = []
     seen = set()
-    for ref in re.findall(r"\bCW\d+\b", candidate):
+
+    for ref in re.findall(r"\bevent_id\s*[:=]\s*(\d+)\b", candidate, flags=re.IGNORECASE):
         if ref not in seen:
             seen.add(ref)
             refs.append(ref)
+
+    for ref in re.findall(r"\[(\d+)\]", candidate):
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+
+    stripped = candidate.strip()
+    if re.fullmatch(r"[\d,\s;|]+", stripped):
+        for ref in re.findall(r"\d+", stripped):
+            if ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
     return refs
 
 
@@ -1447,11 +1733,13 @@ def _derive_doctor_actions_from_action_evaluations(action_evaluations: List[Dict
     for action in action_evaluations:
         action_description = _safe_text(action.get("action_description"))
         if not action_description:
+            action_description = _safe_text(action.get("action_name"))
+        if not action_description:
             continue
 
-        refs = _extract_cw_refs(action.get("action_id"))
+        refs = _extract_event_refs(action.get("action_id"))
         if not refs:
-            refs = _extract_cw_refs(action_description)
+            refs = _extract_event_refs(action_description)
 
         derived.append(
             {
@@ -1493,7 +1781,7 @@ def _infer_clinical_quality_from_actions(
     has_non_adherent = "non_adherent" in guideline_labels
     has_potential_harm = "potentially_harmful" in contextual_labels
     all_context_acceptable = all(
-        label in {"appropriate", "not_enough_context"} for label in contextual_labels if label
+        label in {"appropriate", "not_enough_context", "insufficient_data"} for label in contextual_labels if label
     ) and any(label == "appropriate" for label in contextual_labels)
     all_guideline_non_negative = all(
         label in {"adherent", "not_applicable", "guideline_unclear"} for label in guideline_labels if label
@@ -1568,21 +1856,18 @@ def _normalize_clinical_pearl(value: Any) -> str:
     return text
 
 
+def _normalize_contextual_appropriateness_label(value: Any) -> str:
+    label = _safe_text(value).lower().replace("-", "_").replace(" ", "_")
+    label = CONTEXTUAL_APPROPRIATENESS_ALIASES.get(label, label)
+    if label not in VALID_CONTEXTUAL_APPROPRIATENESS:
+        return "insufficient_data"
+    return label
+
+
 def _best_effort_parse_json(content: str) -> Dict[str, Any]:
     text = _safe_text(content)
     if not text:
         return {}
-
-    response_blocks = re.findall(r"<response>\s*([\s\S]*?)\s*</response>", text, re.IGNORECASE)
-    for block in response_blocks:
-        block = block.strip()
-        if not block:
-            continue
-        try:
-            parsed = json.loads(block)
-            return parsed if isinstance(parsed, dict) else {}
-        except json.JSONDecodeError:
-            pass
 
     try:
         parsed = json.loads(text)

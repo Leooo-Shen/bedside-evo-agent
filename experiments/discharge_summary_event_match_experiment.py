@@ -104,12 +104,6 @@ def _parse_args() -> argparse.Namespace:
         help="LLM model (default: gemini-3.1-flash-lite-preview).",
     )
     parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="LLM temperature (default: 0.0).",
-    )
-    parser.add_argument(
         "--response-max-tokens",
         type=int,
         default=16,
@@ -249,7 +243,6 @@ def _get_thread_llm_client(args: argparse.Namespace) -> LLMClient:
         client = LLMClient(
             provider=args.provider,
             model=args.model,
-            temperature=args.temperature,
             max_tokens=args.response_max_tokens,
         )
         _THREAD_LOCAL.llm_client = client
@@ -416,7 +409,6 @@ def _evaluate_one_case(
         response = llm_client.chat(
             prompt=prompt,
             response_format="text",
-            temperature=args.temperature,
             max_tokens=args.response_max_tokens,
         )
         response_text = _safe_text(response.get("content")).strip()

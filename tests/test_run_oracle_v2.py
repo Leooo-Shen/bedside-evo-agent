@@ -25,38 +25,37 @@ class FakeLLMClient:
         parsed_payload = {
             "patient_status": {
                 "domains": {
-                    "hemodynamics": {"label": "stable", "key_signals": ["MAP stable"], "rationale": "stable"},
-                    "respiratory": {"label": "stable", "key_signals": ["SpO2 stable"], "rationale": "stable"},
+                    "hemodynamics": {"label": "stable", "key_evidence": ["1001"], "rationale": "stable"},
+                    "respiratory": {"label": "stable", "key_evidence": ["1001"], "rationale": "stable"},
                     "renal_metabolic": {
                         "label": "insufficient_data",
-                        "key_signals": ["limited labs"],
+                        "key_evidence": ["1001"],
                         "rationale": "limited",
                     },
-                    "neurology": {"label": "stable", "key_signals": ["no change"], "rationale": "stable"},
+                    "neurology": {"label": "stable", "key_evidence": ["1001"], "rationale": "stable"},
                 },
                 "overall": {"label": "stable", "rationale": "patient remained stable"},
             },
             "action_evaluations": [
                 {
-                    "action_id": "CW1",
-                    "action_description": "Norepinephrine started",
+                    "action_id": "1001",
+                    "action_name": "Norepinephrine started",
                     "guideline_adherence": {
                         "label": "adherent",
                         "guideline_reference": "Surviving Sepsis Campaign",
-                        "rationale": "Pressor support in hypotension.",
                     },
                     "contextual_appropriateness": {
                         "label": "appropriate",
-                        "rationale": "Consistent with hemodynamic instability.",
-                        "hindsight_caveat": None,
+                        "hindsight_usage": "No reinterpretation needed with hindsight.",
                     },
+                    "overall": {"label": "appropriate", "rationale": "Appropriate for hypotension in-window."},
                 }
             ],
             "overall_window_summary": "Hemodynamics stabilized after pressor initiation.",
         }
         return {
             # Simulate provider response without native parsed JSON.
-            "content": f"<response>{json.dumps(parsed_payload)}</response>",
+            "content": json.dumps(parsed_payload),
             "parsed": None,
             "usage": {"input_tokens": 20, "output_tokens": 10},
             "model": self.model,
@@ -92,6 +91,8 @@ class FakeParser:
             {
                 "subject_id": 123,
                 "icu_stay_id": 456,
+                "age_at_admission": 70.0,
+                "gender": "F",
                 "icu_duration_hours": 30.0,
                 "survived": True,
                 "enter_time": pd.Timestamp(enter),
@@ -114,7 +115,7 @@ class FakeParser:
                 "current_window_start": "2024-01-01T00:00:00",
                 "current_window_end": "2024-01-01T00:30:00",
                 "hours_since_admission": 0.0,
-                "patient_metadata": {"age": 70, "total_icu_duration_hours": 30.0},
+                "patient_metadata": {"age": 70, "gender": "F", "survived": trajectory["survived"], "total_icu_duration_hours": 30.0},
                 "current_events": [
                     {
                         "time": "2024-01-01 00:10:00",
@@ -148,6 +149,8 @@ class FakeBalancedParser:
         return {
             "subject_id": int(subject_id),
             "icu_stay_id": int(icu_stay_id),
+            "age_at_admission": 70.0,
+            "gender": "M",
             "icu_duration_hours": 24.0,
             "survived": survived,
             "enter_time": enter.isoformat(),
@@ -163,7 +166,7 @@ class FakeBalancedParser:
                 "current_window_start": "2024-01-01T00:00:00",
                 "current_window_end": "2024-01-01T00:30:00",
                 "hours_since_admission": 0.0,
-                "patient_metadata": {"age": 70, "total_icu_duration_hours": 24.0},
+                "patient_metadata": {"age": 70, "gender": "M", "survived": trajectory["survived"], "total_icu_duration_hours": 24.0},
                 "current_events": [
                     {
                         "time": "2024-01-01 00:10:00",
@@ -238,9 +241,19 @@ def test_process_batch_for_oracle(monkeypatch, tmp_path):
     predictions = json.loads(predictions_file.read_text())
     assert predictions.get("subject_id") == 123
     assert predictions.get("icu_stay_id") == 456
+    trajectory_metadata = predictions.get("trajectory_metadata", {})
+    assert trajectory_metadata.get("age") == 70.0
+    assert trajectory_metadata.get("gender") == "Female"
+    assert trajectory_metadata.get("total_icu_stay_hours") == 30.0
+    assert trajectory_metadata.get("icu_outcome") == "Survived after ICU"
     assert predictions.get("window_outputs")
     first = predictions["window_outputs"][0]["oracle_output"]
     first_raw_events = predictions["window_outputs"][0]["raw_current_events"]
+    first_window_meta = predictions["window_outputs"][0]["window_metadata"]
+    assert first_window_meta.get("age") == 70.0
+    assert first_window_meta.get("gender") == "Female"
+    assert first_window_meta.get("total_icu_stay_hours") == 30.0
+    assert first_window_meta.get("icu_outcome") == "Survived after ICU"
     assert "patient_status" in first
     assert "action_evaluations" in first
     assert "overall_window_summary" in first
@@ -262,34 +275,49 @@ def test_process_batch_for_oracle(monkeypatch, tmp_path):
     assert llm_calls.get("calls")
     assert first == llm_calls["calls"][0]["parsed_response"]
     assert "ICU Outcome:" not in llm_calls["calls"][0]["prompt"]
+    first_call_metadata = llm_calls["calls"][0].get("metadata", {})
+    assert "context_history_events" in first_call_metadata
+    assert "context_current_window_events" in first_call_metadata
+    assert "context_future_events" in first_call_metadata
+    assert first_call_metadata.get("history_hours") == 48.0
+    assert first_call_metadata.get("future_hours") == 48.0
+    assert any(call.get("metadata", {}).get("use_discharge_summary") is False for call in llm_calls.get("calls", []))
     assert any(
-        call.get("metadata", {}).get("use_discharge_summary") is False
-        for call in llm_calls.get("calls", [])
+        call.get("metadata", {}).get("include_icu_outcome_in_prompt") is False for call in llm_calls.get("calls", [])
     )
     assert any(
-        call.get("metadata", {}).get("include_icu_outcome_in_prompt") is False
-        for call in llm_calls.get("calls", [])
-    )
-    assert any(
-        call.get("metadata", {}).get("parse_source") == "best_effort_json"
-        for call in llm_calls.get("calls", [])
+        call.get("metadata", {}).get("parse_source") == "best_effort_json" for call in llm_calls.get("calls", [])
     )
 
     window_contexts = json.loads(window_contexts_json.read_text())
     assert window_contexts.get("subject_id") == 123
     assert window_contexts.get("icu_stay_id") == 456
+    assert window_contexts.get("trajectory_metadata", {}).get("age") == 70.0
+    assert window_contexts.get("trajectory_metadata", {}).get("gender") == "Female"
+    assert window_contexts.get("trajectory_metadata", {}).get("total_icu_stay_hours") == 30.0
+    assert window_contexts.get("trajectory_metadata", {}).get("icu_outcome") == "Survived after ICU"
     assert window_contexts.get("history_hours") == 48.0
+    assert window_contexts.get("future_hours") == 48.0
     assert window_contexts.get("window_contexts")
     first_context_window = window_contexts["window_contexts"][0]
     assert first_context_window.get("window_index") == 1
+    assert first_context_window.get("window_metadata", {}).get("age") == 70.0
+    assert first_context_window.get("window_metadata", {}).get("gender") == "Female"
+    assert first_context_window.get("window_metadata", {}).get("total_icu_stay_hours") == 30.0
+    assert first_context_window.get("window_metadata", {}).get("icu_outcome") == "Survived after ICU"
     assert first_context_window.get("window_metadata", {}).get("history_hours") == 48.0
+    assert first_context_window.get("window_metadata", {}).get("future_hours") == 48.0
     assert first_context_window.get("current_events") == first_raw_events
     assert first_context_window.get("history_events") == []
+    assert isinstance(first_context_window.get("future_events"), list)
+    assert isinstance(first_context_window.get("oracle_context_history_events"), list)
+    assert isinstance(first_context_window.get("oracle_context_current_events"), list)
+    assert isinstance(first_context_window.get("oracle_context_future_events"), list)
     sections = first_context_window.get("prompt_sections", {})
     assert set(sections.keys()) == {
         "icu_discharge_summary",
         "icu_trajectory_context_window",
-        "history_events_current_window",
+        "previous_events_current_window",
         "current_observation_window",
     }
 
@@ -303,6 +331,7 @@ def test_process_batch_for_oracle(monkeypatch, tmp_path):
     assert summary.get("future_context_hours") == 48.0
     assert summary.get("use_discharge_summary") is False
     assert summary.get("include_icu_outcome_in_prompt") is False
+    assert summary.get("total_doctor_actions") == 1
     assert summary.get("top_k_recommendations") == 3
     assert str(run_dir) == summary.get("run_directory")
 

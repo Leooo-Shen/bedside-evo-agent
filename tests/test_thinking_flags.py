@@ -1,4 +1,4 @@
-"""Test thinking flags for multi-agent system."""
+"""Test JSON-only prompt behavior for multi-agent system."""
 
 import sys
 from pathlib import Path
@@ -7,7 +7,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from prompts.agent_multi_prompts import (
+from prompts.agent_multi_prompts import (  # noqa: E402
     get_memory_agent_prompt,
     get_observer_prompt,
     get_predictor_prompt,
@@ -15,42 +15,35 @@ from prompts.agent_multi_prompts import (
 )
 
 
-def test_observer_thinking():
-    """Test observer prompt with and without thinking."""
-    # With thinking
-    prompt_with = get_observer_prompt(use_thinking=True)
-    assert "<think>" in prompt_with
-    assert "</think>" in prompt_with
-    assert "ALWAYS start with thinking first" in prompt_with
-
-    # Without thinking
-    prompt_without = get_observer_prompt(use_thinking=False)
-    assert "<think>" not in prompt_without
-    assert "</think>" not in prompt_without
-    assert "ALWAYS start with thinking first" not in prompt_without
-    assert "<response>" in prompt_without
-
-    print("✓ Observer thinking flags work correctly")
+def _assert_json_only_prompt(prompt: str) -> None:
+    assert "<think>" not in prompt
+    assert "</think>" not in prompt
+    assert "<response>" not in prompt
+    assert "</response>" not in prompt
+    assert "ALWAYS start with thinking first" not in prompt
 
 
-def test_memory_thinking():
-    """Test memory agent prompt with and without thinking."""
-    # With thinking
-    prompt_with = get_memory_agent_prompt(use_thinking=True)
-    assert "<think>" in prompt_with
-    assert "</think>" in prompt_with
+def test_observer_prompt_json_only():
+    """Observer prompt should be JSON-only with no think/response tags."""
+    prompt = get_observer_prompt()
+    _assert_json_only_prompt(prompt)
+    assert "clinical_summary" in prompt
 
-    # Without thinking
-    prompt_without = get_memory_agent_prompt(use_thinking=False)
-    assert "<think>" not in prompt_without
-    assert "</think>" not in prompt_without
+    print("✓ Observer prompt is JSON-only")
 
-    print("✓ Memory agent thinking flags work correctly")
+
+def test_memory_prompt_json_only():
+    """Memory prompt should be JSON-only with no think/response tags."""
+    prompt = get_memory_agent_prompt()
+    _assert_json_only_prompt(prompt)
+    assert "memory_management" in prompt
+
+    print("✓ Memory prompt is JSON-only")
 
 
 def test_memory_prompt_variable_formatting():
     """Test memory prompt variables are substituted correctly."""
-    prompt = get_memory_agent_prompt(use_thinking=False).format(
+    prompt = get_memory_agent_prompt().format(
         trajectory_text="TRAJECTORY",
         window_input='{"clinical_summary":"ok"}',
         window_index=3,
@@ -68,24 +61,18 @@ def test_memory_prompt_variable_formatting():
     print("✓ Memory prompt variables are formatted correctly")
 
 
-def test_reflection_thinking():
-    """Test reflection agent prompt with and without thinking."""
-    # With thinking
-    prompt_with = get_reflection_agent_prompt(use_thinking=True)
-    assert "<think>" in prompt_with
-    assert "</think>" in prompt_with
+def test_reflection_prompt_json_only():
+    """Reflection prompt should be JSON-only with no think/response tags."""
+    prompt = get_reflection_agent_prompt()
+    _assert_json_only_prompt(prompt)
+    assert "audit_results" in prompt
 
-    # Without thinking
-    prompt_without = get_reflection_agent_prompt(use_thinking=False)
-    assert "<think>" not in prompt_without
-    assert "</think>" not in prompt_without
-
-    print("✓ Reflection agent thinking flags work correctly")
+    print("✓ Reflection prompt is JSON-only")
 
 
 def test_reflection_prompt_variable_formatting():
     """Test reflection prompt variables are substituted correctly."""
-    prompt = get_reflection_agent_prompt(use_thinking=False).format(
+    prompt = get_reflection_agent_prompt().format(
         previous_trajectory_text="PREV_TRAJ",
         start_index=1,
         end_index=3,
@@ -110,47 +97,33 @@ def test_reflection_prompt_variable_formatting():
     print("✓ Reflection prompt variables are formatted correctly")
 
 
-def test_predictor_thinking():
-    """Test predictor prompt with and without thinking."""
-    # With thinking
-    prompt_with = get_predictor_prompt(use_thinking=True)
-    assert "<think>" in prompt_with
-    assert "</think>" in prompt_with
-
-    # Without thinking
-    prompt_without = get_predictor_prompt(use_thinking=False)
-    assert "<think>" not in prompt_without
-    assert "</think>" not in prompt_without
-
-    prompt_8h = get_predictor_prompt(use_thinking=False, observation_hours=8)
+def test_predictor_prompt_json_only():
+    """Predictor prompt should be JSON-only with no think/response tags."""
+    prompt_8h = get_predictor_prompt(observation_hours=8)
+    _assert_json_only_prompt(prompt_8h)
     assert "first 8 hours after ICU admission" in prompt_8h
     formatted_prompt = prompt_8h.format(context="CONTEXT_OK")
     assert "CONTEXT_OK" in formatted_prompt
     assert "{context}" not in formatted_prompt
 
-    print("✓ Predictor thinking flags work correctly")
+    print("✓ Predictor prompt is JSON-only")
 
 
-def test_multi_agent_initialization():
-    """Test MultiAgent initialization with thinking flags."""
+def test_multi_agent_initialization_no_thinking_flags():
+    """MultiAgent should initialize without legacy thinking flags."""
     from agents.agent_fold_multi import MultiAgent
 
-    # Test with thinking disabled
     agent = MultiAgent(
         provider="openai",
         model="gpt-4o-mini",
-        observer_use_thinking=False,
-        memory_use_thinking=False,
-        reflection_use_thinking=False,
-        predictor_use_thinking=False,
     )
 
-    assert agent.observer_use_thinking is False
-    assert agent.memory_use_thinking is False
-    assert agent.reflection_use_thinking is False
-    assert agent.predictor_use_thinking is False
+    assert not hasattr(agent, "observer_use_thinking")
+    assert not hasattr(agent, "memory_use_thinking")
+    assert not hasattr(agent, "reflection_use_thinking")
+    assert not hasattr(agent, "predictor_use_thinking")
 
-    print("✓ MultiAgent thinking flags initialized correctly")
+    print("✓ MultiAgent initializes without thinking flags")
 
 
 def test_multi_agent_log_stores_parsed_response():
@@ -180,12 +153,12 @@ def test_multi_agent_log_stores_parsed_response():
 
 
 if __name__ == "__main__":
-    test_observer_thinking()
-    test_memory_thinking()
+    test_observer_prompt_json_only()
+    test_memory_prompt_json_only()
     test_memory_prompt_variable_formatting()
-    test_reflection_thinking()
+    test_reflection_prompt_json_only()
     test_reflection_prompt_variable_formatting()
-    test_predictor_thinking()
-    test_multi_agent_initialization()
+    test_predictor_prompt_json_only()
+    test_multi_agent_initialization_no_thinking_flags()
     test_multi_agent_log_stores_parsed_response()
-    print("\n✓ All thinking flag tests passed!")
+    print("\n✓ All JSON-only prompt tests passed!")

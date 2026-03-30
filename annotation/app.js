@@ -66,6 +66,7 @@ const ACTION_CORRECTION_OPTIONS = ["appropriate", "suboptimal", "potentially_har
 const RECOMMENDATION_AGREED_URGENCY_OPTIONS = [
   { value: "urgent", label: "Urgent" },
   { value: "nice_to_have", label: "Nice to have" },
+  { value: "optional", label: "Optional" },
 ];
 const RECOMMENDATION_AGREED_DOSE_OPTIONS = [
   { value: "low", label: "low" },
@@ -93,8 +94,6 @@ const ICU_ACTION_CATEGORIES = [
   "Escalation & Goals of Care",
   "Others",
 ];
-const EVIDENCE_EVENT_ID_PREFIXES = new Set(["CW", "HX", "FX", "B"]);
-const MIN_ADDITIONAL_ACTION_EVIDENCE_IDS = 1;
 const MAX_ADDITIONAL_ACTION_EVIDENCE_IDS = 5;
 const VERDICT_VALUES = new Set(["agree", "disagree", "uncertain"]);
 const STATUS_CORRECTION_VALUES = new Set(STATUS_CORRECTION_OPTIONS);
@@ -458,15 +457,22 @@ function normalizeActions(actionEvaluations) {
     const guideline = isObject(action.guideline_adherence) ? action.guideline_adherence : {};
 
     const actionId = safeString(action.action_id) || `ACTION_${index + 1}`;
-    const description = safeString(action.action_description) || "No description";
+    const description = safeString(action.action_description)
+      || safeString(action.action_name)
+      || safeString(action.action)
+      || "No description";
     const overallLabel = normalizeLabel(overall.label) || normalizeLabel(contextual.label);
+    const overallRationale = safeString(overall.rationale)
+      || safeString(contextual.rationale)
+      || safeString(contextual.hindsight_usage)
+      || safeString(guideline.rationale);
 
     return {
       originalIndex: index,
       action_id: actionId,
       action_description: description,
       overall_label: overallLabel || "unknown",
-      overall_rationale: safeString(overall.rationale),
+      overall_rationale: overallRationale,
       contextual,
       guideline,
     };
@@ -492,9 +498,15 @@ function normalizeRecommendations(recommendations) {
       originalIndex: index,
       rank: toIntOrNull(rec.rank),
       urgency: safeString(rec.urgency) || "",
-      action: safeString(rec.action) || "No action title",
+      action: safeString(rec.action)
+        || safeString(rec.action_name)
+        || safeString(rec.title)
+        || "No action title",
       action_description: safeString(rec.action_description) || "",
-      rationale: safeString(rec.rationale) || "",
+      rationale: safeString(rec.rationale)
+        || safeString(rec.justification)
+        || safeString(rec.reasoning)
+        || "",
     };
   });
 
@@ -549,6 +561,9 @@ function resolveRawWindowEvents({ windowOutput, contextEntry }) {
 }
 
 function resolveHistoryEvents({ windowOutput, contextEntry }) {
+  if (contextEntry && Array.isArray(contextEntry.oracle_context_history_events)) {
+    return cloneData(contextEntry.oracle_context_history_events);
+  }
   if (contextEntry && Array.isArray(contextEntry.history_events)) {
     return cloneData(contextEntry.history_events);
   }
@@ -556,12 +571,26 @@ function resolveHistoryEvents({ windowOutput, contextEntry }) {
   return cloneData(historyEvents);
 }
 
+function hasRenderableStructuredHistoryEvents(events) {
+  const safeEvents = Array.isArray(events) ? events : [];
+  return safeEvents.some((event) => {
+    if (!isObject(event)) {
+      return false;
+    }
+    const time = safeString(event.time || event.start_time);
+    const code = safeString(event.code);
+    const details = safeString(event.code_specifics);
+    const eventId = resolveEventEvidenceId(event);
+    return Boolean(time || code || details || eventId);
+  });
+}
+
 function resolveContextSections({ contextEntry }) {
   const empty = {
     sections: {
       icu_discharge_summary: "",
       icu_trajectory_context_window: "",
-      history_events_current_window: "",
+      previous_events_current_window: "",
       current_observation_window: "",
     },
     source: "none",
@@ -572,7 +601,7 @@ function resolveContextSections({ contextEntry }) {
       sections: {
         icu_discharge_summary: safeString(contextEntry.prompt_sections.icu_discharge_summary),
         icu_trajectory_context_window: safeString(contextEntry.prompt_sections.icu_trajectory_context_window),
-        history_events_current_window: safeString(contextEntry.prompt_sections.history_events_current_window),
+        previous_events_current_window: safeString(contextEntry.prompt_sections.previous_events_current_window),
         current_observation_window: safeString(contextEntry.prompt_sections.current_observation_window),
       },
       source: "window_contexts.prompt_sections",
@@ -613,6 +642,7 @@ function resolveWindowContextEntry(windowIndex, arrayIndex, contextMap) {
 function buildInitialAnnotation(round) {
   return {
     window_key: round.windowKey,
+    skip_annotation: false,
     task1_status: {
       verdict: null,
       correction_label: null,
@@ -650,6 +680,9 @@ function normalizeAnnotationForRound(round, rawAnnotation) {
   if (!isObject(rawAnnotation)) {
     return normalized;
   }
+
+  const skipAnnotation = normalizeNullableBoolean(rawAnnotation.skip_annotation);
+  normalized.skip_annotation = skipAnnotation === true;
 
   const rawTask1 = isObject(rawAnnotation.task1_status) ? rawAnnotation.task1_status : {};
   normalized.task1_status.verdict = normalizeEnumValue(rawTask1.verdict, VERDICT_VALUES);
@@ -770,7 +803,9 @@ function renderTopBar() {
 
   windowSelectEl.innerHTML = state.rounds
     .map((item, idx) => {
-      const label = `Window ${item.windowIndex} (${idx + 1}/${state.rounds.length})`;
+      const annotation = state.annotations[item.arrayIndex];
+      const skipSuffix = annotation && annotation.skip_annotation === true ? " [Skipped]" : "";
+      const label = `Window ${item.windowIndex} (${idx + 1}/${state.rounds.length})${skipSuffix}`;
       const selected = idx === state.currentRoundIndex ? "selected" : "";
       return `<option value="${idx}" ${selected}>${escapeHtml(label)}</option>`;
     })
@@ -785,14 +820,17 @@ function renderLeftPanel() {
   const annotation = getCurrentAnnotation();
   const metadata = isObject(round.windowOutput.window_metadata) ? round.windowOutput.window_metadata : {};
   const stats = getRoundReviewStats(round, annotation);
-  const icuOutcome = getIcuOutcomeInfo(state.predictionsData);
+  const patientContext = getPatientContextInfo(state.predictionsData, metadata);
   const dischargeSummaryText = safeString(round.contextSections.icu_discharge_summary);
-  const promptHistoryView = parsePromptHistorySection(round.contextSections.history_events_current_window);
+  const promptHistoryView = parsePromptHistorySection(round.contextSections.previous_events_current_window);
   const historyHours = resolveHistoryHours(round, promptHistoryView.historyHours);
-  const historyEventsForDisplayBase = promptHistoryView.hasSection
-    ? promptHistoryView.events
-    : (Array.isArray(round.historyEvents) ? round.historyEvents : []);
-  const historyEventsForDisplay = withOracleEventIds(historyEventsForDisplayBase, "HX");
+  const structuredHistoryEvents = Array.isArray(round.historyEvents) ? round.historyEvents : [];
+  const hasStructuredHistoryTimelineEvents = hasRenderableStructuredHistoryEvents(structuredHistoryEvents);
+  const hasParsedPromptHistoryEvents = promptHistoryView.hasSection && promptHistoryView.events.length > 0;
+  const historyEventsForDisplayBase = hasStructuredHistoryTimelineEvents
+    ? structuredHistoryEvents
+    : (hasParsedPromptHistoryEvents ? promptHistoryView.events : structuredHistoryEvents);
+  const historyEventsForDisplay = withOracleEventIds(historyEventsForDisplayBase);
   const filteredHistoryEvents = filterEventsByType(historyEventsForDisplay, state.historyEventTypeFilter);
   const historyTypeCounts = getEventTypeCounts(historyEventsForDisplay);
   const historyWindowLabel = historyHours !== null
@@ -811,9 +849,14 @@ function renderLeftPanel() {
       <div><strong>Window index</strong>: ${round.windowIndex}</div>
       <div><strong>Range</strong>: ${escapeHtml(formatWindowRange(metadata))}</div>
       <div><strong>Hours since ICU admit</strong>: ${escapeHtml(formatNumber(metadata.hours_since_admission))}</div>
+      <div><strong>Age</strong>: ${escapeHtml(patientContext.age)}</div>
+      <div><strong>Gender</strong>: ${escapeHtml(patientContext.gender)}</div>
+      <div><strong>Total ICU Stay hours</strong>: ${escapeHtml(patientContext.totalIcuStayHours)}</div>
       <div>
         <strong>ICU outcome</strong>:
-        <span class="outcome-text outcome-${escapeHtml(icuOutcome.toneClass)}">${escapeHtml(icuOutcome.label)}</span>
+        <span class="outcome-text outcome-${escapeHtml(patientContext.icuOutcome.toneClass)}">${escapeHtml(
+          patientContext.icuOutcome.label
+        )}</span>
       </div>
     </div>
 
@@ -833,13 +876,23 @@ function renderLeftPanel() {
 
     <div class="summary-card">
       <strong>Review progress</strong>
-      <div class="stat-grid">
-        <div class="stat-pill">Task 1: ${stats.task1Done ? "Reviewed" : "Pending"}</div>
-        <div class="stat-pill">Actions: ${stats.reviewedActions}/${stats.totalActions}</div>
-        <div class="stat-pill">Recs: ${stats.reviewedRecs}/${stats.totalRecs}</div>
-        <div class="stat-pill">Extra recs Q: ${stats.additionalRecommendationsDone ? "Answered" : "Pending"}</div>
-        <div class="stat-pill">Task 4: ${stats.task4Done ? "Reviewed" : "Pending"}</div>
-      </div>
+      ${
+        stats.isSkipped
+          ? `
+        <div class="stat-grid">
+          <div class="stat-pill stat-pill-skip">Skipped: this window does not require annotation.</div>
+        </div>
+      `
+          : `
+        <div class="stat-grid">
+          <div class="stat-pill">Task 1: ${stats.task1Done ? "Reviewed" : "Pending"}</div>
+          <div class="stat-pill">Actions: ${stats.reviewedActions}/${stats.totalActions}</div>
+          <div class="stat-pill">Recs: ${stats.reviewedRecs}/${stats.totalRecs}</div>
+          <div class="stat-pill">Extra recs Q: ${stats.additionalRecommendationsDone ? "Answered" : "Pending"}</div>
+          <div class="stat-pill">Task 4: ${stats.task4Done ? "Reviewed" : "Pending"}</div>
+        </div>
+      `
+      }
     </div>
   `;
 }
@@ -852,7 +905,7 @@ function renderCenterPanel() {
   const eventsForDisplayBase = promptCurrentView.hasSection
     ? promptCurrentView.events
     : (rawEvents.length > 0 ? rawEvents : currentEvents);
-  const eventsForDisplay = withOracleEventIds(eventsForDisplayBase, "CW");
+  const eventsForDisplay = withOracleEventIds(eventsForDisplayBase);
   const eventsSourceForDisplay = promptCurrentView.hasSection
     ? "window_contexts.prompt_sections.current_observation_window"
     : (rawEvents.length > 0 ? round.rawEventSource : round.eventSource);
@@ -931,16 +984,46 @@ function renderTimelineEvents(events, emptyHtml) {
 function renderRightPanel() {
   const round = getCurrentRound();
   const annotation = getCurrentAnnotation();
-  const task1Locked = annotation.task1_status.verdict === null;
+  const isSkipped = annotation.skip_annotation === true;
   const patientStatus = round.oracleOutput.patient_status;
   const overall = isObject(patientStatus.overall) ? patientStatus.overall : {};
 
   rightPanelEl.innerHTML = `
     <h2>Annotation Tasks</h2>
-    ${renderTask1(overall, annotation)}
-    ${renderTask2(round, annotation, task1Locked)}
-    ${renderTask3(round, annotation, task1Locked)}
-    ${renderTask4(annotation, task1Locked)}
+    ${renderSkipControl(annotation)}
+    ${
+      isSkipped
+        ? `
+      <section class="task-section skip-window-note">
+        <h3 class="task-title">This window is marked as skipped</h3>
+        <div class="inline-meta">No annotation is required for this page.</div>
+      </section>
+    `
+        : `
+      ${renderTask1(overall, annotation)}
+      ${renderTask2(round, annotation)}
+      ${renderTask3(round, annotation)}
+      ${renderTask4(annotation)}
+    `
+    }
+  `;
+}
+
+function renderSkipControl(annotation) {
+  const isSkipped = annotation.skip_annotation === true;
+  return `
+    <section class="task-section">
+      <h3 class="task-title">Skip this window?</h3>
+      <div class="verdict-row">
+        <label class="verdict-chip"><input type="radio" name="window-skip-toggle" value="false" ${
+          isSkipped ? "" : "checked"
+        } /> No (default)</label>
+        <label class="verdict-chip"><input type="radio" name="window-skip-toggle" value="true" ${
+          isSkipped ? "checked" : ""
+        } /> Yes, skip this page</label>
+      </div>
+      <div class="inline-meta">If skipped, this window is excluded from required annotation checks.</div>
+    </section>
   `;
 }
 
@@ -993,7 +1076,7 @@ function renderTask1(overall, annotation) {
   `;
 }
 
-function renderTask2(round, annotation, locked) {
+function renderTask2(round, annotation) {
   const actionCards = round.actions
     .map((action, index) => {
       const actionAnn = annotation.task2_actions[index];
@@ -1047,12 +1130,11 @@ function renderTask2(round, annotation, locked) {
       <h3 class="task-title">Task 2: Action Evaluation</h3>
       <div class="review-note">No routine-tier suppression. All listed actions are available for review.</div>
       ${actionCards || `<div class="summary-card">No actions in this window.</div>`}
-      ${locked ? '<div class="task-locked-overlay">Complete Task 1 to unlock Task 2</div>' : ""}
     </section>
   `;
 }
 
-function renderTask3(round, annotation, locked) {
+function renderTask3(round, annotation) {
   const additionalRecs = annotation.task3_additional_recommendations;
   const additionalActions = getTextConfidenceItems(additionalRecs.actions);
   const redFlagActions = getTextConfidenceItems(annotation.task3_red_flag_actions.actions);
@@ -1121,7 +1203,7 @@ function renderTask3(round, annotation, locked) {
           ? `
         <div class="control-group ${hasCurrentHighlight("task3_additional_recommendations.actions") ? "error-highlight" : ""}">
           <label>Additional recommended action(s)</label>
-          <div class="inline-meta">Choose category first, then write free text. Each action also needs 1-5 evidence event IDs (e.g., CW4, HX12).</div>
+          <div class="inline-meta">Choose category first, then write free text. Evidence event IDs are optional (if provided, use comma-separated IDs like 12345).</div>
           <div class="additional-actions-list">
             ${
               additionalActions.map((actionItem, actionIndex) => {
@@ -1170,7 +1252,7 @@ function renderTask3(round, annotation, locked) {
                         class="evidence-ids-input ${evidenceErrorClass}"
                         value="${escapeHtml(actionItem.evidence_event_ids_text || "")}"
                         data-additional-action-evidence-index="${actionIndex}"
-                        placeholder="Evidence IDs (1-5): CW4, HX12"
+                        placeholder="Evidence IDs (optional): 12345"
                       />
                     </div>
                   </div>
@@ -1228,12 +1310,11 @@ function renderTask3(round, annotation, locked) {
       ${recommendationCards || `<div class="summary-card">No recommendations in this window.</div>`}
       ${additionalRecommendationBlock}
       ${redFlagActionsBlock}
-      ${locked ? '<div class="task-locked-overlay">Complete Task 1 to unlock Task 3</div>' : ""}
     </section>
   `;
 }
 
-function renderTask4(annotation, locked) {
+function renderTask4(annotation) {
   const insights = getTextConfidenceItems(
     isObject(annotation.task4_patient_insights) ? annotation.task4_patient_insights.insights : []
   );
@@ -1271,7 +1352,6 @@ function renderTask4(annotation, locked) {
         </div>
         <button type="button" class="secondary-btn" data-patient-insight-add="1">Add insight</button>
       </div>
-      ${locked ? '<div class="task-locked-overlay">Complete Task 1 to unlock Task 4</div>' : ""}
     </section>
   `;
 }
@@ -1793,9 +1873,13 @@ function onWorkspaceChange(event) {
 
   const target = event.target;
   const annotation = getCurrentAnnotation();
-  const previousTask1Verdict = annotation.task1_status.verdict;
   let shouldRender = false;
   clearCurrentRoundErrorHighlights();
+
+  if (target.name === "window-skip-toggle") {
+    annotation.skip_annotation = target.value === "true";
+    shouldRender = true;
+  }
 
   if (target.name === "task1-verdict") {
     annotation.task1_status.verdict = target.value;
@@ -1805,15 +1889,6 @@ function onWorkspaceChange(event) {
       annotation.task1_status.comment = null;
     }
     shouldRender = true;
-
-    if (previousTask1Verdict === null && annotation.task1_status.verdict !== null) {
-      setTimeout(() => {
-        const task2 = document.getElementById("task2-section");
-        if (task2) {
-          task2.scrollIntoView({ behavior: "smooth", block: "start" });
-        }
-      }, 80);
-    }
   }
 
   if (target.name === "task1-correction-label") {
@@ -2001,18 +2076,15 @@ function onExport() {
     const message = [`Cannot export yet (${validation.blocking.length} blocking issue(s)):`]
       .concat(validation.blocking.slice(0, 12).map((issue) => `- ${issue}`))
       .join("\n");
-    window.alert(message);
     setGlobalMessage(message.replace(/\n/g, " "), "warn");
     return;
   }
 
   if (validation.warnings.length > 0) {
-    const warningMessage = [`There are ${validation.warnings.length} review warning(s). Export anyway?`]
+    const warningMessage = [`There are ${validation.warnings.length} review warning(s). Exported with warnings:`]
       .concat(validation.warnings.slice(0, 10).map((item) => `- ${item}`))
       .join("\n");
-    if (!window.confirm(warningMessage)) {
-      return;
-    }
+    setGlobalMessage(warningMessage.replace(/\n/g, " "), "warn");
   }
 
   const nowIso = new Date().toISOString();
@@ -2028,6 +2100,7 @@ function onExport() {
 
     output.window_outputs[round.arrayIndex].annotation = {
       window_key: round.windowKey,
+      skip_annotation: annotation.skip_annotation === true,
       annotated_at: nowIso,
       duration_seconds: durationSeconds,
       task1_status: {
@@ -2274,6 +2347,7 @@ function collectValidationReport() {
   state.rounds.forEach((round) => {
     const annotation = state.annotations[round.arrayIndex];
     const labelPrefix = `${round.windowKey}`;
+    const isSkipped = annotation.skip_annotation === true;
     const roundIssues = collectRoundBlockingIssues(round, annotation);
     roundIssues.forEach((issue) => {
       const fullMessage = `${labelPrefix}: ${issue.message}`;
@@ -2285,22 +2359,24 @@ function collectValidationReport() {
       });
     });
 
-    const unreviewedActions = annotation.task2_actions
-      .filter((action) => action.verdict === null)
-      .map((action) => action.action_id);
-    const unreviewedRecommendations = annotation.task3_recommendations
-      .filter((rec) => rec.verdict === null)
-      .map((rec) => formatRecommendationId(rec));
+    const unreviewedActions = isSkipped
+      ? []
+      : annotation.task2_actions.filter((action) => action.verdict === null).map((action) => action.action_id);
+    const unreviewedRecommendations = isSkipped
+      ? []
+      : annotation.task3_recommendations
+        .filter((rec) => rec.verdict === null)
+        .map((rec) => formatRecommendationId(rec));
 
     windowWarnings[round.arrayIndex] = {
       unreviewed_actions: unreviewedActions,
       unreviewed_recommendations: unreviewedRecommendations,
     };
 
-    if (unreviewedActions.length > 0) {
+    if (!isSkipped && unreviewedActions.length > 0) {
       warnings.push(`${labelPrefix}: unreviewed actions (${unreviewedActions.join(", ")})`);
     }
-    if (unreviewedRecommendations.length > 0) {
+    if (!isSkipped && unreviewedRecommendations.length > 0) {
       warnings.push(`${labelPrefix}: unreviewed recommendations (${unreviewedRecommendations.join(", ")})`);
     }
   });
@@ -2315,6 +2391,9 @@ function collectValidationReport() {
 
 function collectRoundBlockingIssues(round, annotation) {
   const issues = [];
+  if (annotation.skip_annotation === true) {
+    return issues;
+  }
 
   if (!annotation.task1_status.verdict) {
     issues.push({
@@ -2394,15 +2473,12 @@ function collectRoundBlockingIssues(round, annotation) {
           message: `Additional action ${actionIndex + 1} has invalid event IDs: ${evidenceParse.invalid.join(", ")}.`,
         });
       }
-      if (
-        evidenceParse.valid.length < MIN_ADDITIONAL_ACTION_EVIDENCE_IDS
-        || evidenceParse.valid.length > MAX_ADDITIONAL_ACTION_EVIDENCE_IDS
-      ) {
+      if (evidenceParse.valid.length > MAX_ADDITIONAL_ACTION_EVIDENCE_IDS) {
         issues.push({
           token: `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`,
           message:
-            `Additional action ${actionIndex + 1} requires `
-            + `${MIN_ADDITIONAL_ACTION_EVIDENCE_IDS}-${MAX_ADDITIONAL_ACTION_EVIDENCE_IDS} evidence event IDs.`,
+            `Additional action ${actionIndex + 1} allows at most `
+            + `${MAX_ADDITIONAL_ACTION_EVIDENCE_IDS} evidence event IDs.`,
         });
       }
     });
@@ -2438,10 +2514,25 @@ function getWindowCompletionSummary() {
 }
 
 function getRoundReviewStats(round, annotation) {
+  const isSkipped = annotation.skip_annotation === true;
+  if (isSkipped) {
+    return {
+      isSkipped: true,
+      task1Done: true,
+      reviewedActions: round.actions.length,
+      totalActions: round.actions.length,
+      reviewedRecs: round.recommendations.length,
+      totalRecs: round.recommendations.length,
+      additionalRecommendationsDone: true,
+      task4Done: true,
+    };
+  }
+
   const reviewedActions = annotation.task2_actions.filter((entry) => entry.verdict !== null).length;
   const reviewedRecs = annotation.task3_recommendations.filter((entry) => entry.verdict !== null).length;
 
   return {
+    isSkipped: false,
     task1Done: annotation.task1_status.verdict !== null,
     reviewedActions,
     totalActions: round.actions.length,
@@ -2519,11 +2610,21 @@ function parsePromptHistorySection(sectionText) {
       return;
     }
 
-    const eventMatch = line.match(/^(HX\d+)\.\s+(.+)$/i);
-    if (!eventMatch) {
+    const legacyMatch = line.match(/^(HX\d+)\.\s+(.+)$/i);
+    if (legacyMatch) {
+      parsed.events.push(parsePromptEventLine(legacyMatch[2], line, legacyMatch[1]));
       return;
     }
-    parsed.events.push(parsePromptEventLine(eventMatch[2], line, eventMatch[1]));
+
+    const bulletMatch = line.match(/^-\s+(.+)$/);
+    if (bulletMatch) {
+      parsed.events.push(parsePromptEventLine(bulletMatch[1], line, ""));
+      return;
+    }
+
+    if (isPromptRawEventLine(line)) {
+      parsed.events.push(parsePromptEventLine(line, line, ""));
+    }
   });
 
   return parsed;
@@ -2543,33 +2644,77 @@ function parsePromptCurrentSection(sectionText) {
   parsed.hasSection = true;
   const lines = text.split("\n").map((line) => safeString(line)).filter((line) => line.length > 0);
   lines.forEach((line) => {
-    const eventMatch = line.match(/^(CW\d+)\.\s+(.+)$/i);
-    if (!eventMatch) {
+    const legacyMatch = line.match(/^(CW\d+)\.\s+(.+)$/i);
+    if (legacyMatch) {
+      parsed.events.push(parsePromptEventLine(legacyMatch[2], line, legacyMatch[1]));
       return;
     }
-    parsed.events.push(parsePromptEventLine(eventMatch[2], line, eventMatch[1]));
+
+    const bulletMatch = line.match(/^-\s+(.+)$/);
+    if (bulletMatch) {
+      parsed.events.push(parsePromptEventLine(bulletMatch[1], line, ""));
+      return;
+    }
+
+    if (isPromptRawEventLine(line)) {
+      parsed.events.push(parsePromptEventLine(line, line, ""));
+    }
   });
   return parsed;
 }
 
+function isPromptRawEventLine(line) {
+  const text = safeString(line);
+  if (!text) {
+    return false;
+  }
+  return /^(?:\[\d+\]\s+|\d+\s+)?\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)/.test(text);
+}
+
 function parsePromptEventLine(eventText, rawLine, eventId = "") {
   const text = safeString(eventText);
-  const normalizedEventId = normalizeEventEvidenceId(eventId);
+  let normalizedEventId = normalizeEventEvidenceId(eventId);
+  let body = text;
+
+  const prefixedIdMatch = body.match(/^event_id\s*=\s*(\d+)\s+(.+)$/i);
+  if (prefixedIdMatch) {
+    normalizedEventId = normalizeEventEvidenceId(prefixedIdMatch[1]) || normalizedEventId;
+    body = safeString(prefixedIdMatch[2]);
+  }
+
+  const leadingBracketIdMatch = body.match(/^\[(\d+)\]\s+(.+)$/);
+  if (leadingBracketIdMatch) {
+    const maybeTimestampPayload = safeString(leadingBracketIdMatch[2]);
+    if (looksLikeEventTimestamp(maybeTimestampPayload)) {
+      normalizedEventId = normalizeEventEvidenceId(leadingBracketIdMatch[1]) || normalizedEventId;
+      body = maybeTimestampPayload;
+    }
+  }
+
+  const leadingNumericIdMatch = body.match(/^(\d+)\s+(.+)$/);
+  if (leadingNumericIdMatch) {
+    const maybeTimestampPayload = safeString(leadingNumericIdMatch[2]);
+    if (looksLikeEventTimestamp(maybeTimestampPayload)) {
+      normalizedEventId = normalizeEventEvidenceId(leadingNumericIdMatch[1]) || normalizedEventId;
+      body = maybeTimestampPayload;
+    }
+  }
+
   const fallback = {
     time: "",
     code: "UNKNOWN",
-    code_specifics: text,
+    code_specifics: body,
     text_value: null,
     numeric_value: null,
     event_id: normalizedEventId,
-    raw_line: safeString(rawLine) || text,
+    raw_line: safeString(rawLine) || body,
   };
 
-  if (!text) {
+  if (!body) {
     return fallback;
   }
 
-  const match = text.match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)\s+([A-Z0-9_]+)\s*(.*)$/);
+  const match = body.match(/^(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?))\s+([A-Z0-9_]+)\s*(.*)$/);
   if (!match) {
     return fallback;
   }
@@ -2600,33 +2745,48 @@ function parsePromptEventLine(eventText, rawLine, eventId = "") {
     text_value: textValue,
     numeric_value: numericValue,
     event_id: normalizedEventId,
-    raw_line: safeString(rawLine) || text,
+    raw_line: safeString(rawLine) || body,
   };
 }
 
-function resolveHistoryHours(round, parsedHistoryHours) {
-  const globalCandidates = [
-    state.windowContextsData && state.windowContextsData.history_hours,
-    state.windowContextsData && state.windowContextsData.context_history_hours,
-    state.windowContextsData
-      && isObject(state.windowContextsData.oracle_context)
-      && state.windowContextsData.oracle_context.history_hours,
-  ];
+function looksLikeEventTimestamp(value) {
+  const text = safeString(value);
+  if (!text) {
+    return false;
+  }
+  return /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)/.test(text);
+}
 
-  for (const candidate of globalCandidates) {
+function resolveHistoryHours(round, parsedHistoryHours) {
+  const metadata = round && round.windowOutput && isObject(round.windowOutput.window_metadata)
+    ? round.windowOutput.window_metadata
+    : null;
+  const perWindowCandidates = [
+    parsedHistoryHours,
+    metadata ? metadata.history_hours : null,
+    metadata ? metadata.context_history_hours : null,
+  ];
+  for (const candidate of perWindowCandidates) {
     const value = toNumber(candidate);
     if (Number.isFinite(value)) {
       return value;
     }
   }
 
-  const perWindowCandidates = [
-    round && round.windowOutput && isObject(round.windowOutput.window_metadata)
-      ? round.windowOutput.window_metadata.history_hours
-      : null,
-    parsedHistoryHours,
+  const globalCandidates = [
+    state.windowContextsData && state.windowContextsData.history_hours,
+    state.windowContextsData && state.windowContextsData.context_history_hours,
+    state.predictionsData && state.predictionsData.history_hours,
+    state.predictionsData && state.predictionsData.context_history_hours,
+    state.windowContextsData
+      && isObject(state.windowContextsData.oracle_context)
+      && state.windowContextsData.oracle_context.history_hours,
+    state.predictionsData
+      && isObject(state.predictionsData.oracle_context)
+      && state.predictionsData.oracle_context.history_hours,
   ];
-  for (const candidate of perWindowCandidates) {
+
+  for (const candidate of globalCandidates) {
     const value = toNumber(candidate);
     if (Number.isFinite(value)) {
       return value;
@@ -2902,6 +3062,23 @@ function rankVitalSeries(entry) {
   };
 }
 
+function getNonInvasiveBloodPressureOrderPriority(label) {
+  const normalized = normalizeLabel(label);
+  if (!/\bnon[\s-]*invasive\s+blood\s*pressure\b/.test(normalized)) {
+    return null;
+  }
+  if (/\bsystolic\b/.test(normalized)) {
+    return 0;
+  }
+  if (/\bdiastolic\b/.test(normalized)) {
+    return 1;
+  }
+  if (/\bmean\b/.test(normalized)) {
+    return 2;
+  }
+  return null;
+}
+
 function extractEventNumericValue(normalizedEvent) {
   const event = normalizedEvent && normalizedEvent.event ? normalizedEvent.event : {};
   const direct = toNumber(event.numeric_value);
@@ -2966,13 +3143,12 @@ function parseEventTimeMs(event) {
   return null;
 }
 
-function withOracleEventIds(events, defaultPrefix) {
+function withOracleEventIds(events) {
   const safeEvents = Array.isArray(events) ? events : [];
-  const normalizedPrefix = safeString(defaultPrefix).toUpperCase();
   return safeEvents.map((event, index) => {
     const normalizedEvent = isObject(event) ? { ...event } : {};
     const existingId = resolveEventEvidenceId(event);
-    normalizedEvent.event_id = existingId || `${normalizedPrefix}${index + 1}`;
+    normalizedEvent.event_id = existingId || `${index + 1}`;
     return normalizedEvent;
   });
 }
@@ -3004,29 +3180,27 @@ function normalizeEventEvidenceId(value) {
   const compact = raw
     .replace(/[，；]/g, ",")
     .replace(/^[([{]+|[)\].,;:]+$/g, "")
-    .replace(/\s+/g, "")
-    .toUpperCase();
-  const match = compact.match(/^([A-Z]{1,3})(\d+)(?:-([A-Z]{1,3})?(\d+))?$/);
-  if (!match) {
-    return "";
+    .replace(/\s+/g, "");
+
+  const prefixedMatch = compact.match(/^event_id[:=]?(\d+)$/i);
+  if (prefixedMatch) {
+    return `${Number.parseInt(prefixedMatch[1], 10)}`;
   }
 
-  const startPrefix = match[1];
-  const startNumber = Number.parseInt(match[2], 10);
-  if (!EVIDENCE_EVENT_ID_PREFIXES.has(startPrefix) || !Number.isFinite(startNumber) || startNumber < 1) {
-    return "";
+  if (/^\d+$/.test(compact)) {
+    return `${Number.parseInt(compact, 10)}`;
   }
 
-  if (!match[4]) {
-    return `${startPrefix}${startNumber}`;
-  }
-
-  const endPrefix = safeString(match[3]).toUpperCase() || startPrefix;
-  const endNumber = Number.parseInt(match[4], 10);
-  if (!EVIDENCE_EVENT_ID_PREFIXES.has(endPrefix) || endPrefix !== startPrefix || !Number.isFinite(endNumber) || endNumber < startNumber) {
+  const rangeMatch = compact.match(/^(\d+)-(\d+)$/);
+  if (!rangeMatch) {
     return "";
   }
-  return `${startPrefix}${startNumber}-${endPrefix}${endNumber}`;
+  const startNumber = Number.parseInt(rangeMatch[1], 10);
+  const endNumber = Number.parseInt(rangeMatch[2], 10);
+  if (!Number.isFinite(startNumber) || !Number.isFinite(endNumber) || startNumber < 1 || endNumber < startNumber) {
+    return "";
+  }
+  return `${startNumber}-${endNumber}`;
 }
 
 function parseEvidenceEventIdsInput(value) {
@@ -3154,6 +3328,15 @@ function buildVitalSeries(historyEvents, currentEvents) {
       const bPreferred = labelMatchesAnyPattern(b.entry.label, PLOTTABLE_VITAL_LABEL_PATTERNS) ? 1 : 0;
       if (aPreferred !== bPreferred) {
         return bPreferred - aPreferred;
+      }
+      const aNonInvasiveBpPriority = getNonInvasiveBloodPressureOrderPriority(a.entry.label);
+      const bNonInvasiveBpPriority = getNonInvasiveBloodPressureOrderPriority(b.entry.label);
+      if (
+        aNonInvasiveBpPriority !== null &&
+        bNonInvasiveBpPriority !== null &&
+        aNonInvasiveBpPriority !== bNonInvasiveBpPriority
+      ) {
+        return aNonInvasiveBpPriority - bNonInvasiveBpPriority;
       }
       return a.entry.label.localeCompare(b.entry.label, undefined, { sensitivity: "base" });
     });
@@ -3434,10 +3617,79 @@ function formatCompactNumber(value) {
   return rounded.toFixed(1);
 }
 
-function getIcuOutcomeInfo(predictionsData) {
+function getPatientContextInfo(predictionsData, windowMetadata = {}) {
   const trajectoryMetadata = isObject(predictionsData && predictionsData.trajectory_metadata)
     ? predictionsData.trajectory_metadata
     : {};
+  const windowMeta = isObject(windowMetadata) ? windowMetadata : {};
+
+  const ageCandidates = [
+    trajectoryMetadata.age,
+    trajectoryMetadata.age_at_admission,
+    windowMeta.age,
+  ];
+  let ageText = "-";
+  for (const candidate of ageCandidates) {
+    const ageValue = toNumber(candidate);
+    if (Number.isFinite(ageValue)) {
+      ageText = `${formatCompactNumber(ageValue)} years`;
+      break;
+    }
+  }
+
+  const genderRaw = safeString(trajectoryMetadata.gender) || safeString(windowMeta.gender);
+  let genderText = "-";
+  if (genderRaw) {
+    const normalized = normalizeLabel(genderRaw);
+    if (!["none", "nan", "null", "nat", "unknown"].includes(normalized)) {
+      if (normalized === "m" || normalized === "male") {
+        genderText = "Male";
+      } else if (normalized === "f" || normalized === "female") {
+        genderText = "Female";
+      } else {
+        genderText = genderRaw;
+      }
+    }
+  }
+
+  const stayHourCandidates = [
+    trajectoryMetadata.total_icu_stay_hours,
+    trajectoryMetadata.icu_duration_hours,
+    windowMeta.total_icu_stay_hours,
+    windowMeta.total_icu_duration_hours,
+  ];
+  let totalIcuStayHoursText = "-";
+  for (const candidate of stayHourCandidates) {
+    const hours = toNumber(candidate);
+    if (Number.isFinite(hours)) {
+      totalIcuStayHoursText = `${formatCompactNumber(hours)} hours`;
+      break;
+    }
+  }
+
+  return {
+    age: ageText,
+    gender: genderText,
+    totalIcuStayHours: totalIcuStayHoursText,
+    icuOutcome: getIcuOutcomeInfo(predictionsData, windowMeta),
+  };
+}
+
+function getIcuOutcomeInfo(predictionsData, windowMetadata = {}) {
+  const trajectoryMetadata = isObject(predictionsData && predictionsData.trajectory_metadata)
+    ? predictionsData.trajectory_metadata
+    : {};
+  const windowMeta = isObject(windowMetadata) ? windowMetadata : {};
+
+  const explicitOutcome = safeString(trajectoryMetadata.icu_outcome) || safeString(windowMeta.icu_outcome);
+  const explicitNormalized = normalizeLabel(explicitOutcome);
+  if (["survived after icu", "survived", "alive"].includes(explicitNormalized)) {
+    return { label: "Survived after ICU", toneClass: "survived" };
+  }
+  if (["died after icu", "died", "dead", "deceased"].includes(explicitNormalized)) {
+    return { label: "Died after ICU", toneClass: "died" };
+  }
+
   const survived = trajectoryMetadata.survived;
   if (survived === true) {
     return { label: "Survived after ICU", toneClass: "survived" };
@@ -3454,7 +3706,23 @@ function getIcuOutcomeInfo(predictionsData) {
     return { label: "Died after ICU", toneClass: "died" };
   }
 
-  if (safeString(trajectoryMetadata.death_time)) {
+  const fallbackSurvived = windowMeta.survived;
+  if (fallbackSurvived === true) {
+    return { label: "Survived after ICU", toneClass: "survived" };
+  }
+  if (fallbackSurvived === false) {
+    return { label: "Died after ICU", toneClass: "died" };
+  }
+
+  const fallbackNormalized = normalizeLabel(fallbackSurvived);
+  if (["true", "1", "yes", "y", "survived", "alive"].includes(fallbackNormalized)) {
+    return { label: "Survived after ICU", toneClass: "survived" };
+  }
+  if (["false", "0", "no", "n", "died", "dead", "deceased"].includes(fallbackNormalized)) {
+    return { label: "Died after ICU", toneClass: "died" };
+  }
+
+  if (safeString(trajectoryMetadata.death_time) || safeString(windowMeta.death_time)) {
     return { label: "Died after ICU", toneClass: "died" };
   }
   return { label: "Unknown", toneClass: "unknown" };
@@ -3521,7 +3789,7 @@ function readJsonFile(file) {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const parsed = JSON.parse(String(reader.result));
+        const parsed = parseJsonWithRecovery(String(reader.result));
         resolve(parsed);
       } catch (error) {
         reject(new Error(`Invalid JSON in ${file.name}: ${error.message}`));
@@ -3532,6 +3800,99 @@ function readJsonFile(file) {
     };
     reader.readAsText(file);
   });
+}
+
+function parseJsonWithRecovery(rawText) {
+  const text = String(rawText || "");
+  try {
+    return JSON.parse(text);
+  } catch (originalError) {
+    const sanitized = sanitizeNonStandardJsonNumbers(text);
+    if (sanitized.replaced === 0) {
+      throw originalError;
+    }
+    try {
+      return JSON.parse(sanitized.text);
+    } catch (recoveryError) {
+      throw originalError;
+    }
+  }
+}
+
+function sanitizeNonStandardJsonNumbers(text) {
+  const input = String(text || "");
+  if (!input) {
+    return { text: input, replaced: 0 };
+  }
+
+  let output = "";
+  let replaced = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < input.length;) {
+    const char = input[index];
+
+    if (inString) {
+      output += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      output += char;
+      index += 1;
+      continue;
+    }
+
+    if (matchesJsonNumberTokenAt(input, index, "-Infinity")) {
+      output += "null";
+      replaced += 1;
+      index += "-Infinity".length;
+      continue;
+    }
+    if (matchesJsonNumberTokenAt(input, index, "Infinity")) {
+      output += "null";
+      replaced += 1;
+      index += "Infinity".length;
+      continue;
+    }
+    if (matchesJsonNumberTokenAt(input, index, "NaN")) {
+      output += "null";
+      replaced += 1;
+      index += "NaN".length;
+      continue;
+    }
+
+    output += char;
+    index += 1;
+  }
+
+  return { text: output, replaced };
+}
+
+function matchesJsonNumberTokenAt(input, index, token) {
+  if (!input.startsWith(token, index)) {
+    return false;
+  }
+  const left = index > 0 ? input[index - 1] : "";
+  const right = input[index + token.length] || "";
+  return isJsonTokenBoundaryChar(left) && isJsonTokenBoundaryChar(right);
+}
+
+function isJsonTokenBoundaryChar(char) {
+  if (!char) {
+    return true;
+  }
+  return /[\s,[\]{}:]/.test(char);
 }
 
 function downloadJson(payload, fileName) {

@@ -25,7 +25,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from experiments.oracle.common import extract_overall_label
 
-
 RUN_PREFIX = "oracle_conditions_"
 PRIMARY_STATUS_LABELS: Tuple[str, ...] = ("improving", "stable", "deteriorating")
 INSUFFICIENT_STATUS = "insufficient_data"
@@ -39,7 +38,7 @@ REQUIRED_PATIENT_FILES: Tuple[str, ...] = (
 REQUIRED_PROMPT_SECTION_KEYS: Tuple[str, ...] = (
     "icu_discharge_summary",
     "icu_trajectory_context_window",
-    "history_events_current_window",
+    "previous_events_current_window",
     "current_observation_window",
 )
 AUTO_K_BUFFER_FACTOR = 1.2
@@ -191,8 +190,8 @@ def _build_llm_call_index(calls_payload: Mapping[str, Any]) -> Dict[int, Dict[st
             continue
         if str(call.get("step_type") or "") != "oracle_evaluator":
             continue
-        idx = _safe_int(call.get("window_index"), default=-10**9)
-        if idx <= -10**9:
+        idx = _safe_int(call.get("window_index"), default=-(10**9))
+        if idx <= -(10**9):
             continue
         by_index[idx] = call
     return by_index
@@ -508,8 +507,7 @@ def _pop_next_by_proportional_deficit(
     if not available:
         return None
     deficits: Dict[str, float] = {
-        label: float(desired_counts.get(label, 0.0)) - float(selected_counts.get(label, 0))
-        for label in available
+        label: float(desired_counts.get(label, 0.0)) - float(selected_counts.get(label, 0)) for label in available
     }
     max_deficit = max(deficits.values())
     candidates = [label for label in available if deficits[label] == max_deficit]
@@ -527,17 +525,13 @@ def _sample_final_windows(
     rng: random.Random,
 ) -> Tuple[List[CandidateWindow], Dict[str, Any]]:
     if len(candidate_pool) < target_windows:
-        raise ValueError(
-            f"Candidate pool ({len(candidate_pool)}) is smaller than target_windows ({target_windows})."
-        )
+        raise ValueError(f"Candidate pool ({len(candidate_pool)}) is smaller than target_windows ({target_windows}).")
 
     buckets = _build_status_buckets(candidate_pool, rng)
     available_counts = Counter({label: len(items) for label, items in buckets.items()})
     available_total = sum(available_counts.values())
     if available_total < target_windows:
-        raise ValueError(
-            f"Not enough windows after bucketing ({available_total}) for target ({target_windows})."
-        )
+        raise ValueError(f"Not enough windows after bucketing ({available_total}) for target ({target_windows}).")
 
     selected: List[CandidateWindow] = []
     selected_counts: Counter = Counter()
@@ -578,9 +572,7 @@ def _sample_final_windows(
         selected_counts[item.status_label] += 1
 
     if len(selected) < target_windows:
-        raise ValueError(
-            f"Unable to reach target_windows={target_windows} after final sampling; got {len(selected)}."
-        )
+        raise ValueError(f"Unable to reach target_windows={target_windows} after final sampling; got {len(selected)}.")
 
     stats = {
         "candidate_pool_size": len(candidate_pool),
@@ -642,21 +634,33 @@ def _merge_window_outputs(
     manifest_rows: List[Dict[str, Any]] = []
 
     history_hours: Optional[float] = None
+    future_hours: Optional[float] = None
     for item in selected:
-        if history_hours is not None:
+        if history_hours is not None and future_hours is not None:
             break
         if item.context_window and isinstance(item.context_window, dict):
             value = item.context_window.get("window_metadata")
             if isinstance(value, dict):
-                try:
-                    history_hours = float(value.get("history_hours"))
-                except (TypeError, ValueError):
-                    history_hours = None
+                if history_hours is None:
+                    try:
+                        history_hours = float(value.get("history_hours"))
+                    except (TypeError, ValueError):
+                        history_hours = None
+                if future_hours is None:
+                    try:
+                        future_hours = float(value.get("future_hours"))
+                    except (TypeError, ValueError):
+                        future_hours = None
             if history_hours is None:
                 try:
                     history_hours = float(item.context_window.get("history_hours"))
                 except (TypeError, ValueError):
                     history_hours = None
+            if future_hours is None:
+                try:
+                    future_hours = float(item.context_window.get("future_hours"))
+                except (TypeError, ValueError):
+                    future_hours = None
 
     for new_index, item in enumerate(selected, start=1):
         pred = copy.deepcopy(item.prediction_window)
@@ -703,6 +707,8 @@ def _merge_window_outputs(
         if not isinstance(context_payload.get("current_events"), list):
             raw_events = pred.get("raw_current_events")
             context_payload["current_events"] = raw_events if isinstance(raw_events, list) else []
+        if not isinstance(context_payload.get("future_events"), list):
+            context_payload["future_events"] = []
         context_payload["prompt_sections"] = _ensure_prompt_sections(context_payload)
         context_windows.append(context_payload)
 
@@ -767,6 +773,7 @@ def _merge_window_outputs(
         "subject_id": "annotation_pack",
         "icu_stay_id": pack_id,
         "history_hours": history_hours,
+        "future_hours": future_hours,
         "window_contexts": context_windows,
         "combined_pack_metadata": {
             "source_run_dir": str(source_run_dir),
@@ -783,7 +790,7 @@ def _merge_window_outputs(
         "include_icu_outcome_in_prompt": None,
         "prompt_outcome_mode": "mixed",
         "pipeline_agents": [
-            {"name": "oracle_evaluator", "used": True, "thinking": None},
+            {"name": "oracle_evaluator", "used": True},
         ],
         "total_calls": len(llm_calls),
         "calls": llm_calls,

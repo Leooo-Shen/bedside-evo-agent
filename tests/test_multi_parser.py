@@ -10,35 +10,34 @@ sys.path.insert(0, str(project_root))
 from agents.agent_fold_multi import _parse_json_response
 
 
-def test_parse_multiple_response_blocks():
-    """Parser should ignore empty response blocks and parse the valid one."""
+def test_parse_direct_json():
+    """Parser should parse direct JSON payloads."""
     response = """
-<response></response>
-<response>
 {
   "clinical_summary": "stable"
 }
-</response>
 """
     parsed = _parse_json_response(response)
     assert parsed["clinical_summary"] == "stable"
 
 
-def test_parse_without_response_tag_after_think():
-    """Parser should recover when model omits <response> and returns plain JSON."""
+def test_parse_markdown_json_fence():
+    """Parser should recover when model wraps JSON in fenced code blocks."""
     response = """
-<think>Quick analysis.</think>
+Here is the result:
+```json
 {
   "memory_management": {
     "decision": "APPEND"
   }
 }
+```
 """
     parsed = _parse_json_response(response)
     assert parsed["memory_management"]["decision"] == "APPEND"
 
 
 if __name__ == "__main__":
-    test_parse_multiple_response_blocks()
-    test_parse_without_response_tag_after_think()
+    test_parse_direct_json()
+    test_parse_markdown_json_fence()
     print("All parser tests passed.")

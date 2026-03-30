@@ -33,18 +33,15 @@ You must decide how to integrate the current data into the existing {num_traject
 ---
 
 ### 3. OUTPUT SPECIFICATION
-ALWAYS start with thinking first in <think></think>. Then provide your response in the JSON format in <response></response>.
-<think>
-Conduct your clinical reasoning in the following order:
+Think through the following internally before answering:
 1. Physiological Snapshot: Summarize the current state based on the four focus areas.
-2. Comparative Analysis: Compare current events with the previous trajectories (T1-T{num_trajectories}). 
+2. Comparative Analysis: Compare current events with the previous trajectories (T1-T{num_trajectories}).
    - Is the patient status related to any historical key events?
    - Is there any open clinical concern resolved or newly identified?
-   - Is the current events a "new signal" or just "continuation" of previous trajectory?
-3. Folding Rationale: Explain why you chose to Append or Merge. If merging, identify the logical "thread" that connects these windows (e.g., "Ongoing fluid resuscitation for septic shock").
-</think>
+   - Are the current events a new signal or continuation of the prior trajectory?
+3. Folding Rationale: Explain why you chose to Append or Merge. If merging, identify the logical thread connecting windows.
 
-<response>
+Return valid JSON only (no XML tags, no markdown code fences):
 {{
   "memory_management": {{
     "decision": "APPEND" or "MERGE",
@@ -79,7 +76,6 @@ Conduct your clinical reasoning in the following order:
     ]
   }}
 }}
-</response>
 
 ---
 

@@ -34,7 +34,7 @@ class FakeLLMClient:
             },
             "action_evaluations": [
                 {
-                    "action_id": "CW4",
+                    "action_id": "1004",
                     "action_description": "Counterfactual wrong action",
                     "guideline_adherence": {"label": "non_adherent", "rationale": "wrong"},
                     "contextual_appropriateness": {"label": "potentially_harmful", "rationale": "wrong"},
@@ -115,16 +115,19 @@ class FakeParser:
                 "history_events": [],
                 "current_events": [
                     {
+                        "event_id": 1001,
                         "time": (enter + timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S"),
                         "code": "DRUG_START",
                         "code_specifics": "Norepinephrine infusion",
                     },
                     {
+                        "event_id": 1002,
                         "time": (enter + timedelta(minutes=4)).strftime("%Y-%m-%d %H:%M:%S"),
                         "code": "PROCEDURE",
                         "code_specifics": "Arterial line insertion",
                     },
                     {
+                        "event_id": 1003,
                         "time": (enter + timedelta(minutes=8)).strftime("%Y-%m-%d %H:%M:%S"),
                         "code": "TRANSFER",
                         "code_specifics": "Transfer to ICU",
@@ -175,7 +178,7 @@ def _write_baseline_patient(run_dir: Path, subject_id: int, icu_stay_id: int) ->
                 "oracle_output": {
                     "action_evaluations": [
                         {
-                            "action_id": "CW4",
+                            "action_id": "1004",
                             "action_description": "Would correspond to injected position",
                             "overall": {"label": "appropriate"},
                         }

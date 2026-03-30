@@ -147,9 +147,7 @@ class PreICUHistoryProcessor:
             if isinstance(hours_before, (int, float)):
                 signed_hours = float(hours_before)
                 if signed_hours >= 0:
-                    relation_text = (
-                        f"{signed_hours / 24.0:.1f} days / {signed_hours:.1f} hours before ICU admission"
-                    )
+                    relation_text = f"{signed_hours / 24.0:.1f} days / {signed_hours:.1f} hours before ICU admission"
                 else:
                     relation_text = (
                         f"{abs(signed_hours) / 24.0:.1f} days / {abs(signed_hours):.1f} hours after ICU admission"
@@ -159,12 +157,7 @@ class PreICUHistoryProcessor:
             if timestamp_text == "Unknown":
                 timestamp_text = "unknown"
 
-            lines.append(
-                (
-                    f"--- Report {i}: {report_title} "
-                    f"(timestamp: {timestamp_text}; {relation_text}) ---"
-                )
-            )
+            lines.append((f"--- Report {i}: {report_title} " f"(timestamp: {timestamp_text}; {relation_text}) ---"))
 
             text = str(report.get("text_value") or "").strip()
             lines.append(text if text else "(No report text)")
@@ -212,6 +205,24 @@ class PreICUHistoryProcessor:
             empty_as_json=False,
         )
 
+    @staticmethod
+    def _annotate_pre_icu_history_prompt_ids(
+        events: List[Dict[str, Any]],
+        *,
+        prefix: str = "H",
+        id_field: str = "prompt_event_id",
+    ) -> List[Dict[str, Any]]:
+        """Attach pre-ICU history prompt IDs like H0, H1, ... for text rendering."""
+        annotated: List[Dict[str, Any]] = []
+        for idx, event in enumerate(events):
+            if isinstance(event, dict):
+                enriched = dict(event)
+                enriched[id_field] = f"{prefix}{idx}"
+                annotated.append(enriched)
+            else:
+                annotated.append(event)
+        return annotated
+
     def extract_fallback_events(
         self,
         trajectory: Dict,
@@ -258,8 +269,9 @@ class PreICUHistoryProcessor:
                 f"({len(pre_icu_fallback_history_events)} events in last {float(pre_icu_history_fallback_hours):.1f}h):"
             )
         ]
-        for idx, event in enumerate(pre_icu_fallback_history_events, start=1):
-            lines.append(f"P{idx}. {PreICUHistoryProcessor._format_pre_icu_event_line(event)}")
+        display_events = PreICUHistoryProcessor._annotate_pre_icu_history_prompt_ids(pre_icu_fallback_history_events)
+        for event in display_events:
+            lines.append(PreICUHistoryProcessor._format_pre_icu_event_line(event))
         return "\n".join(lines)
 
     def extract_pre_icu_vital_lab_events(
@@ -304,13 +316,11 @@ class PreICUHistoryProcessor:
             return ""
 
         lines = [
-            (
-                "Pre-ICU LAB/VITAL events "
-                f"({len(pre_icu_baseline_events)} events in last {float(history_hours):.1f}h):"
-            )
+            "Pre-ICU LAB/VITAL events " f"({len(pre_icu_baseline_events)} events in last {float(history_hours):.1f}h):"
         ]
-        for idx, event in enumerate(pre_icu_baseline_events, start=1):
-            lines.append(f"B{idx}. {PreICUHistoryProcessor._format_pre_icu_event_line(event)}")
+        display_events = PreICUHistoryProcessor._annotate_pre_icu_history_prompt_ids(pre_icu_baseline_events)
+        for event in display_events:
+            lines.append(PreICUHistoryProcessor._format_pre_icu_event_line(event))
         return "\n".join(lines)
 
     def build_history_context(
@@ -482,7 +492,9 @@ class MIMICDataParser:
         if self.discharge_summary_selection_df is None or len(self.discharge_summary_selection_df) == 0:
             return
 
-        selected_rows = self.discharge_summary_selection_df[self.discharge_summary_selection_df["selected"] == True]  # noqa: E712
+        selected_rows = self.discharge_summary_selection_df[
+            self.discharge_summary_selection_df["selected"] == True
+        ]  # noqa: E712
         for _, row in selected_rows.iterrows():
             if pd.isna(row.get("subject_id")) or pd.isna(row.get("icu_stay_id")):
                 continue
@@ -517,15 +529,10 @@ class MIMICDataParser:
         # Filter out patients at the very beginning
         initial_count = len(self.icu_stay_df)
 
-        # Filter 1: Remove patients with ICU duration <= 4 hours (died, regardless of treatment)
-        # Filter 2: Remove patients transferred out within 24 hours (survived/status ok)
+        # Filter 1: Remove patients with ICU duration <= 4 hours (too short)
+        # Filter 2: Remove patients with ICU duration > 96 hours  (too long) # TODO in the future
         self.icu_stay_df = self.icu_stay_df[
-            ~(
-                (self.icu_stay_df["icu_duration_hours"] <= 4)  # Died too quickly
-                | (
-                    (self.icu_stay_df["icu_duration_hours"] < 24) & (self.icu_stay_df["survived"] == True)
-                )  # Transferred out quickly
-            )
+            ~((self.icu_stay_df["icu_duration_hours"] <= 4) | (self.icu_stay_df["icu_duration_hours"] > 96))
         ]
 
         filtered_count = initial_count - len(self.icu_stay_df)
@@ -624,6 +631,39 @@ class MIMICDataParser:
         if "subject_id" in patient_events.columns:
             patient_events = patient_events[patient_events["subject_id"] == subject_id]
         patient_events = patient_events.copy()
+        patient_events = patient_events.sort_index()
+
+        # Preserve a raw source index for traceability back to the dataset.
+        source_index: Optional[pd.Series] = None
+        for candidate in ("source_event_index", "event_id", "event_idx", "event_index"):
+            if candidate not in patient_events.columns:
+                continue
+            parsed_source = pd.to_numeric(patient_events[candidate], errors="coerce")
+            if parsed_source.notna().any():
+                source_index = parsed_source
+                break
+        if source_index is None:
+            source_index = pd.Series(patient_events.index, index=patient_events.index, dtype="float64")
+        patient_events["source_event_index"] = source_index.astype("Int64")
+
+        if "time" in patient_events.columns:
+            event_time_series = pd.to_datetime(patient_events["time"], errors="coerce")
+        else:
+            event_time_series = pd.Series(pd.NaT, index=patient_events.index, dtype="datetime64[ns]")
+
+        # ICU-local event index (0-based, only for events within this ICU stay).
+        patient_events["icu_event_index"] = pd.Series(pd.NA, index=patient_events.index, dtype="Int64")
+        icu_time_mask = (
+            event_time_series.notna()
+            & (event_time_series >= pd.to_datetime(icu_stay["enter_time"]))
+            & (event_time_series <= pd.to_datetime(icu_stay["leave_time"]))
+        )
+        if bool(icu_time_mask.any()):
+            icu_order = event_time_series[icu_time_mask].sort_values(kind="mergesort").index
+            patient_events.loc[icu_order, "icu_event_index"] = range(len(icu_order))
+
+        # Keep trajectory-wide index for backward compatibility with downstream tooling.
+        patient_events["event_index"] = range(len(patient_events))
 
         # Calculate age at admission
         age_at_admission = (icu_stay["enter_time"] - icu_stay["birth_time"]).days / 365.25
@@ -676,6 +716,37 @@ class MIMICDataParser:
             Cleaned event dictionary with only non-null values
         """
         cleaned = {}
+
+        # Stable ICU-local ID priority: icu_event_index > event_index > event_id/event_idx.
+        stable_event_id: Optional[int] = None
+        for key in ("icu_event_index", "event_index", "event_id", "event_idx"):
+            raw_id = event.get(key)
+            if not pd.notna(raw_id):
+                continue
+            try:
+                stable_event_id = int(raw_id)
+                break
+            except (TypeError, ValueError):
+                continue
+
+        source_event_index: Optional[int] = None
+        for key in ("source_event_index", "event_id", "event_idx", "event_index"):
+            raw_source = event.get(key)
+            if not pd.notna(raw_source):
+                continue
+            try:
+                source_event_index = int(raw_source)
+                break
+            except (TypeError, ValueError):
+                continue
+
+        if source_event_index is not None:
+            cleaned["source_event_index"] = source_event_index
+
+        if stable_event_id is not None:
+            cleaned["event_id"] = stable_event_id
+            cleaned["event_index"] = stable_event_id
+            cleaned["icu_event_index"] = stable_event_id
 
         if "time" in event and pd.notna(event["time"]):
             # Format time as YYYY-MM-DD HH:MM:SS to preserve second-level precision.
@@ -1045,9 +1116,15 @@ class MIMICDataParser:
             effective_leave_time = leave_time
 
         # Find first occurrence of outcome-revealing events and stop there
-        # This prevents information leakage by stopping before outcome is revealed
+        # This prevents information leakage by stopping before outcome is revealed.
+        #
+        # Additional guardrail:
+        # - If the timeline is truly truncated by outcome reveal and the usable ICU time is <4h,
+        #   skip this patient by returning no windows.
         outcome_codes = ["LEAVE_HOSPITALIZATION", "NOTE_DISCHARGESUMMARY", "META_DEATH", "LEAVE_ICU"]
         events_df_temp = pd.DataFrame(trajectory["events"])
+        outcome_truncated = False
+        first_outcome_time = None
 
         if len(events_df_temp) > 0 and "code" in events_df_temp.columns and "time" in events_df_temp.columns:
             # Filter for outcome-revealing events within current ICU stay
@@ -1076,8 +1153,18 @@ class MIMICDataParser:
                 first_outcome_time = outcome_events["event_time"].min()
                 # Stop windows just before the outcome event (subtract 1 second to ensure we don't include it)
                 stop_time = first_outcome_time - timedelta(seconds=1)
-                effective_leave_time = min(effective_leave_time, stop_time)
-                print(f"  Found outcome event at {first_outcome_time}, stopping windows at {stop_time}")
+                if stop_time < effective_leave_time:
+                    effective_leave_time = stop_time
+                    outcome_truncated = True
+                    print(f"  Found outcome event at {first_outcome_time}, stopping windows at {stop_time}")
+
+        if outcome_truncated:
+            truncated_icu_hours = (effective_leave_time - enter_time).total_seconds() / 3600.0
+            if truncated_icu_hours < 4.0:
+                print(
+                    "  Outcome-truncated ICU duration " f"{truncated_icu_hours:.2f}h < 4.00h, skipping patient windows"
+                )
+                return []
 
         # Build pre-ICU history block once, then attach to every window.
         pre_icu_history_source = "disabled"
@@ -1127,7 +1214,9 @@ class MIMICDataParser:
             per_code_cap = int(pre_icu_context.get("per_code_cap") or 0)
             pre_icu_baseline_content = pre_icu_context.get("baseline_content")
             pre_icu_baseline_events_count = int(pre_icu_context.get("baseline_events_count") or 0)
-            pre_icu_history_hours_applied = float(pre_icu_context.get("pre_icu_history_hours") or pre_icu_history_hours)
+            pre_icu_history_hours_applied = float(
+                pre_icu_context.get("pre_icu_history_hours") or pre_icu_history_hours
+            )
 
             if pre_icu_history_source == "reports" and pre_icu_history_content:
                 print(
@@ -1177,6 +1266,22 @@ class MIMICDataParser:
             events_df = events_df[
                 (events_df["event_time"] >= enter_time) & (events_df["event_time"] <= leave_time)
             ].copy()
+
+        # Keep deterministic time order for downstream ICU-local indexing.
+        events_df = events_df.sort_values("event_time", ascending=True, kind="mergesort").reset_index(drop=True)
+        if "event_index" not in events_df.columns:
+            events_df["event_index"] = range(len(events_df))
+        else:
+            parsed_index = pd.to_numeric(events_df["event_index"], errors="coerce")
+            if parsed_index.isna().any():
+                parsed_index = pd.Series(range(len(events_df)), index=events_df.index, dtype="int64")
+            events_df["event_index"] = parsed_index.astype("int64")
+
+        # ICU-local IDs always restart at 0 for events within [enter_time, leave_time].
+        events_df["icu_event_index"] = pd.Series(pd.NA, index=events_df.index, dtype="Int64")
+        icu_event_mask = (events_df["event_time"] >= enter_time) & (events_df["event_time"] <= leave_time)
+        if bool(icu_event_mask.any()):
+            events_df.loc[icu_event_mask, "icu_event_index"] = range(int(icu_event_mask.sum()))
 
         windows = []
         current_start = enter_time
@@ -1228,11 +1333,14 @@ class MIMICDataParser:
                     "current_window_hours": current_window_hours,
                     "patient_metadata": {
                         "age": trajectory["age_at_admission"],
+                        "gender": trajectory.get("gender"),
                         "survived": trajectory["survived"],
                         "death_time": trajectory["death_time"],
                         "total_icu_duration_hours": trajectory["icu_duration_hours"],
                     },
-                    "current_discharge_summary": (dict(current_discharge_summary) if current_discharge_summary else None),
+                    "current_discharge_summary": (
+                        dict(current_discharge_summary) if current_discharge_summary else None
+                    ),
                     "history_events": cleaned_history,
                     "current_events": cleaned_current,
                     "num_history_events": len(cleaned_history),

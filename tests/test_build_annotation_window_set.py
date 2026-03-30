@@ -84,15 +84,17 @@ def _write_patient_payloads(
                     "num_history_events": 0,
                     "num_current_events": 1,
                     "history_hours": 1.0,
+                    "future_hours": 1.0,
                 },
                 "history_events": [],
                 "current_events": [
                     {"time": start.isoformat(), "code": "VITALS", "code_specifics": f"HR_{idx}", "numeric_value": 80}
                 ],
+                "future_events": [],
                 "prompt_sections": {
                     "icu_discharge_summary": f"summary_{subject_id}_{idx}",
                     "icu_trajectory_context_window": f"traj_{subject_id}_{idx}",
-                    "history_events_current_window": f"hist_{subject_id}_{idx}",
+                    "previous_events_current_window": f"hist_{subject_id}_{idx}",
                     "current_observation_window": f"curr_{subject_id}_{idx}",
                 },
             }
@@ -134,6 +136,7 @@ def _write_patient_payloads(
         "subject_id": subject_id,
         "icu_stay_id": icu_stay_id,
         "history_hours": 1.0,
+        "future_hours": 1.0,
         "window_contexts": window_contexts,
     }
 
@@ -144,7 +147,7 @@ def _write_patient_payloads(
         "llm_model": "fake-model",
         "include_icu_outcome_in_prompt": True,
         "prompt_outcome_mode": "with_icu_outcome",
-        "pipeline_agents": [{"name": "oracle_evaluator", "used": True, "thinking": None}],
+        "pipeline_agents": [{"name": "oracle_evaluator", "used": True}],
         "total_calls": len(calls),
         "calls": calls,
     }
@@ -157,9 +160,7 @@ def _write_patient_payloads(
         json.dump(llm_payload, f, indent=2)
 
 
-def _create_run_fixture(
-    tmp_path: Path, patient_specs: Sequence[Tuple[int, int, bool, Sequence[str]]]
-) -> Path:
+def _create_run_fixture(tmp_path: Path, patient_specs: Sequence[Tuple[int, int, bool, Sequence[str]]]) -> Path:
     run_dir = tmp_path / "oracle_conditions_20260101_010101"
     (run_dir / "conditions" / "full_visible" / "patients").mkdir(parents=True, exist_ok=True)
     with open(run_dir / "run_state.json", "w", encoding="utf-8") as f:
@@ -190,8 +191,18 @@ def test_sampling_balances_patients_and_is_reproducible(tmp_path: Path) -> None:
         [
             (101, 9001, True, ["improving", "stable", "deteriorating", "insufficient_data", "stable", "improving"]),
             (102, 9002, True, ["stable", "stable", "improving", "deteriorating", "stable", "insufficient_data"]),
-            (201, 9101, False, ["deteriorating", "deteriorating", "stable", "insufficient_data", "improving", "stable"]),
-            (202, 9102, False, ["deteriorating", "stable", "deteriorating", "improving", "stable", "insufficient_data"]),
+            (
+                201,
+                9101,
+                False,
+                ["deteriorating", "deteriorating", "stable", "insufficient_data", "improving", "stable"],
+            ),
+            (
+                202,
+                9102,
+                False,
+                ["deteriorating", "stable", "deteriorating", "improving", "stable", "insufficient_data"],
+            ),
         ],
     )
 
@@ -222,14 +233,8 @@ def test_sampling_balances_patients_and_is_reproducible(tmp_path: Path) -> None:
 
     manifest_a = _read_manifest_rows(out_a / "sampling_manifest.csv")
     manifest_b = _read_manifest_rows(out_b / "sampling_manifest.csv")
-    selected_keys_a = [
-        (row["patient_id"], row["source_window_index"], row["status_label"])
-        for row in manifest_a
-    ]
-    selected_keys_b = [
-        (row["patient_id"], row["source_window_index"], row["status_label"])
-        for row in manifest_b
-    ]
+    selected_keys_a = [(row["patient_id"], row["source_window_index"], row["status_label"]) for row in manifest_a]
+    selected_keys_b = [(row["patient_id"], row["source_window_index"], row["status_label"]) for row in manifest_b]
     assert selected_keys_a == selected_keys_b
 
 
@@ -265,8 +270,18 @@ def test_final_target_and_insufficient_data_proportion(tmp_path: Path) -> None:
         [
             (101, 9001, True, ["improving", "stable", "deteriorating", "insufficient_data", "stable", "improving"]),
             (102, 9002, True, ["stable", "stable", "improving", "deteriorating", "stable", "insufficient_data"]),
-            (201, 9101, False, ["deteriorating", "deteriorating", "stable", "insufficient_data", "improving", "stable"]),
-            (202, 9102, False, ["deteriorating", "stable", "deteriorating", "improving", "stable", "insufficient_data"]),
+            (
+                201,
+                9101,
+                False,
+                ["deteriorating", "deteriorating", "stable", "insufficient_data", "improving", "stable"],
+            ),
+            (
+                202,
+                9102,
+                False,
+                ["deteriorating", "stable", "deteriorating", "improving", "stable", "insufficient_data"],
+            ),
         ],
     )
     out_dir = build_annotation_window_set(
@@ -294,8 +309,18 @@ def test_outputs_are_aligned_and_patient_windows_are_contiguous(tmp_path: Path) 
         [
             (101, 9001, True, ["improving", "stable", "deteriorating", "insufficient_data", "stable", "improving"]),
             (102, 9002, True, ["stable", "stable", "improving", "deteriorating", "stable", "insufficient_data"]),
-            (201, 9101, False, ["deteriorating", "deteriorating", "stable", "insufficient_data", "improving", "stable"]),
-            (202, 9102, False, ["deteriorating", "stable", "deteriorating", "improving", "stable", "insufficient_data"]),
+            (
+                201,
+                9101,
+                False,
+                ["deteriorating", "deteriorating", "stable", "insufficient_data", "improving", "stable"],
+            ),
+            (
+                202,
+                9102,
+                False,
+                ["deteriorating", "stable", "deteriorating", "improving", "stable", "insufficient_data"],
+            ),
         ],
     )
     out_dir = build_annotation_window_set(

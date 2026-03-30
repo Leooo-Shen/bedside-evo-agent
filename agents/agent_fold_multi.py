@@ -311,7 +311,7 @@ class MultiAgent:
         provider: str,
         model: str = None,
         api_key: str = None,
-        temperature: float = 0.3,
+        temperature: Optional[float] = None,
         max_tokens: int = 4096,
         enable_logging: bool = False,
         window_duration_hours: float = 0.5,
@@ -319,10 +319,6 @@ class MultiAgent:
         use_observer_agent: bool = True,
         use_memory_agent: bool = True,
         use_reflection_agent: bool = True,
-        observer_use_thinking: bool = True,
-        memory_use_thinking: bool = True,
-        reflection_use_thinking: bool = True,
-        predictor_use_thinking: bool = True,
     ):
         self.llm_client = LLMClient(
             provider=provider,
@@ -336,10 +332,6 @@ class MultiAgent:
         self.use_observer_agent = use_observer_agent
         self.use_memory_agent = use_memory_agent
         self.use_reflection_agent = use_reflection_agent
-        self.observer_use_thinking = observer_use_thinking
-        self.memory_use_thinking = memory_use_thinking
-        self.reflection_use_thinking = reflection_use_thinking
-        self.predictor_use_thinking = predictor_use_thinking
 
         # Sub-agents share the same LLM client
         self.observer = ObserverAgent(self.llm_client) if self.use_observer_agent else None
@@ -456,7 +448,7 @@ class MultiAgent:
                 raw_events.extend(window.get("current_events", []))
 
         # Call reflection agent
-        reflection_prompt = get_reflection_agent_prompt(use_thinking=self.reflection_use_thinking)
+        reflection_prompt = get_reflection_agent_prompt()
         audit_result, audit_raw, audit_usage, audit_formatted = self.reflection_agent.audit_trajectory(
             working_context=working_context,
             new_trajectory=new_entry,
@@ -482,7 +474,7 @@ class MultiAgent:
             revision_instructions = audit_result.get("revision_instructions", "")
 
             # Build enhanced memory prompt with feedback
-            memory_prompt = get_memory_agent_prompt(use_thinking=self.memory_use_thinking)
+            memory_prompt = get_memory_agent_prompt()
 
             # Include the trajectory being revised
             if new_entry.start_window == new_entry.end_window:
@@ -681,7 +673,6 @@ class MultiAgent:
 
         context_text = "\n".join(context_parts)
         prompt = get_prediction_prompt(
-            use_thinking=self.predictor_use_thinking,
             observation_hours=self.observation_hours,
         ).format(context=context_text)
 
@@ -838,10 +829,8 @@ class MultiAgent:
         if verbose:
             print(f"Processing patient with {len(windows)} windows...")
 
-        observer_prompt = (
-            get_observer_prompt(use_thinking=self.observer_use_thinking) if self.use_observer_agent else ""
-        )
-        memory_prompt = get_memory_agent_prompt(use_thinking=self.memory_use_thinking)
+        observer_prompt = get_observer_prompt() if self.use_observer_agent else ""
+        memory_prompt = get_memory_agent_prompt()
         precomputed_by_window: Dict[int, Dict] = {}
         if self.use_observer_agent and precomputed_observer_outputs:
             for item in precomputed_observer_outputs:
@@ -943,7 +932,6 @@ class MultiAgent:
                 working_context=working_context,
                 hours_since_admission=last_hours,
                 prompt_template=get_predictor_prompt(
-                    use_thinking=self.predictor_use_thinking,
                     observation_hours=self.observation_hours,
                 ),
             )
@@ -1045,21 +1033,6 @@ def _parse_json_response(response: str) -> Dict:
         return None
 
     candidates = []
-
-    # Some responses may contain multiple <response> blocks (e.g., an empty one then a real one).
-    # Prefer the most recent non-empty block.
-    response_blocks = re.findall(r"<response\b[^>]*>([\s\S]*?)</response>", response, re.IGNORECASE)
-    for block in reversed(response_blocks):
-        block = block.strip()
-        if block:
-            candidates.append(block)
-
-    # If model omitted <response>, remove any <think> block and parse the remainder.
-    stripped = re.sub(r"<think\b[^>]*>[\s\S]*?</think>", "", response, flags=re.IGNORECASE).strip()
-    stripped = re.sub(r"<thinking\b[^>]*>[\s\S]*?</thinking>", "", stripped, flags=re.IGNORECASE).strip()
-    if stripped:
-        candidates.append(stripped)
-
     raw_response = response.strip()
     if raw_response:
         candidates.append(raw_response)

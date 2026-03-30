@@ -177,7 +177,6 @@ def main() -> None:
     oracle = MetaOracle(
         provider=config.llm_provider,
         model=config.llm_model,
-        temperature=config.llm_temperature,
         include_icu_outcome_in_prompt=True,
         use_discharge_summary=config.oracle_context_use_discharge_summary,
         history_context_hours=config.oracle_context_history_hours,

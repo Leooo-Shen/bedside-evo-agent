@@ -292,12 +292,46 @@ def inject_counterfactual_current_event(
         "numeric_value": None,
     }
 
+    existing_event_ids: List[int] = []
+    for event in current_events:
+        if not isinstance(event, Mapping):
+            continue
+        for key in ("event_id", "event_idx"):
+            raw_id = event.get(key)
+            try:
+                parsed_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            existing_event_ids.append(parsed_id)
+            break
+
+    next_event_id = (max(existing_event_ids) + 1) if existing_event_ids else (len(current_events) + 1)
+    injected_event["event_id"] = int(next_event_id)
+
     current_events.append(injected_event)
     payload["current_events"] = current_events
     payload["num_current_events"] = len(current_events)
 
-    expected_action_id = f"CW{len(current_events)}"
+    expected_action_id = str(next_event_id)
     return payload, injected_event, expected_action_id
+
+
+def _extract_action_id_number(value: Any) -> Optional[int]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    match = re.search(r"\bevent_id\s*[:=]\s*(\d+)\b", text, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    bracket_match = re.fullmatch(r"\[(\d+)\]", text)
+    if bracket_match:
+        return int(bracket_match.group(1))
+
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    return None
 
 
 def identify_action_evaluation(
@@ -310,14 +344,19 @@ def identify_action_evaluation(
         return None
 
     normalized_expected = str(expected_action_id or "").strip().lower()
+    expected_numeric = _extract_action_id_number(expected_action_id)
     normalized_marker = str(marker_token or "").strip().lower()
 
     if normalized_expected:
         for item in action_evaluations:
             if not isinstance(item, Mapping):
                 continue
-            action_id = str(item.get("action_id") or "").strip().lower()
+            action_id_raw = item.get("action_id")
+            action_id = str(action_id_raw or "").strip().lower()
             if action_id == normalized_expected:
+                return dict(item)
+            action_numeric = _extract_action_id_number(action_id_raw)
+            if expected_numeric is not None and action_numeric == expected_numeric:
                 return dict(item)
 
     if normalized_marker:

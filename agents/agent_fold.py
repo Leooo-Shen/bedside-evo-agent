@@ -309,7 +309,7 @@ class FoldAgent:
         provider: str = "openai",
         model: str = None,
         api_key: str = None,
-        temperature: float = 0.3,
+        temperature: Optional[float] = None,
         max_tokens: int = 4096,
         enable_logging: bool = False,
         window_duration_hours: float = 0.5,
@@ -321,7 +321,7 @@ class FoldAgent:
             provider: LLM provider ("openai", "anthropic", "google", or "gemini")
             model: Model name
             api_key: API key
-            temperature: Sampling temperature
+            temperature: Optional sampling temperature override
             max_tokens: Maximum tokens in response
             enable_logging: Enable detailed logging of all LLM calls
             window_duration_hours: Duration of each window in hours (default 0.5)
@@ -759,10 +759,7 @@ class FoldAgent:
 
     def _parse_json_response(self, response: str) -> Dict:
         """Parse JSON from LLM response."""
-        # Try to extract from <response> tags first
-        response_match = re.search(r"<response>(.*?)</response>", response, re.DOTALL | re.IGNORECASE)
-        if response_match:
-            response = response_match.group(1).strip()
+        response = response.strip()
 
         # Try direct parse
         try:

@@ -496,7 +496,6 @@ def _run_single_condition(
     oracle = MetaOracle(
         provider=provider,
         model=model,
-        temperature=config.llm_temperature,
         max_tokens=config.llm_max_tokens,
         use_discharge_summary=True,  # Forced ON so discharge-summary masking differences are meaningful.
         include_icu_outcome_in_prompt=condition.include_icu_outcome_in_prompt,
@@ -635,6 +634,7 @@ def _run_single_condition(
                 windows=windows,
                 llm_calls=llm_calls,
                 history_hours=float(config.oracle_context_history_hours),
+                future_hours=float(config.oracle_context_future_hours),
             )
             window_contexts["condition"] = condition.name
             window_contexts["true_survived"] = true_survived

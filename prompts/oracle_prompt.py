@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
-from utils.event_format import format_event_line as format_shared_event_line
+from utils.event_format import (
+    format_event_line as format_shared_event_line,
+    format_event_lines as format_shared_event_lines,
+)
 from utils.time_format import format_timestamp_minute
 
 ORACLE_PROMPT_TEMPLATE = """
@@ -47,18 +51,28 @@ Use your hindsight knowledge from the provided context to inform contextual appr
 If an action was reasonable at the time but later context revealed a missed diagnosis, note this nuance.
 
 ## PART3 — CLINICAL RECOMMENDATIONS
-The doctor's actions at current window may be correct, wrong, or missing key interventions.
 
-After evaluating all actions, provide maximum top {top_k} clinical recommendations for what the clinical team should have prioritised at this window, grounded in hindsight knowledge of the trajectory.
-Each recommendation must be concrete and actionable (e.g., "Increase norepinephrine dose — MAP trending below 65 despite fluid resuscitation over the next 4 hours"), and must reference specific trajectory evidence that justifies it. 
+Provide up to {top_k} recommendations for what the clinical team should have prioritised at this window, grounded in hindsight knowledge of the trajectory.
 
-You can include existing actions if they were appropriate, or new actions that were missing but would have been impactful based on your hindsight knowledge. If no clear recommendations can be made, write null. 
-Also include an urgency label for each recommendation. 
+Requirements:
+- Concrete and actionable
+- Grounded in trajectory evidence (can include hindsight)
+- Focus on what would have most improved patient outcome
+
+You may:
+- Reinforce correct actions
+- Suggest missing interventions
+- Prioritize more impactful alternatives
+
+Ranking criteria:
+1. Expected impact on outcome
+2. Urgency (urgent, nice_to_have, or optional)
+3. Strength of supporting evidence
+
+If no meaningful recommendation exists, return an empty list [].
 
 ## OUTPUT FORMAT
-Output your structured response inside <response></response> tags as valid JSON:
-
-<response>
+Output in valid JSON format:
 {
   "patient_status": {
     "domains": {
@@ -74,7 +88,7 @@ Output your structured response inside <response></response> tags as valid JSON:
   },
   "action_evaluations": [
     {
-      "action_id": "<identifier for the action, e.g., CW1>",
+      "action_id": "<ICU-local event ID within this ICU stay (0-based), e.g., 12>",
       "action_name": "<action name corresponding to the action_id>",
       "guideline_adherence": {
         "label": "<adherent | non_adherent | not_applicable | guideline_unclear>",
@@ -86,7 +100,7 @@ Output your structured response inside <response></response> tags as valid JSON:
       },
       "overall": {
         "label": "<appropriate | suboptimal | potentially_harmful | insufficient_data>",
-        "rationale": "<1-2 sentences integrating both dimensions>"
+        "rationale": "<1-2 sentence integrating both dimensions>"
       }
     }
   ],
@@ -101,7 +115,6 @@ Output your structured response inside <response></response> tags as valid JSON:
   ], // Or [] if no recommendations
   "overall_window_summary": "<1-2 sentence covering the patient direction, care quality, and any critical observations>"
 }
-</response>
 
 
 ## PATIENT ICU CONTEXT WINDOW
@@ -109,6 +122,47 @@ Output your structured response inside <response></response> tags as valid JSON:
 
 Now, evaluate the CURRENT OBSERVATION WINDOW according to the instructions above.
 """.strip()
+
+
+def format_pre_icu_compression_prompt(pre_icu_history: Dict[str, Any], max_summary_chars: int = 1800) -> str:
+    """Build prompt for one-shot pre-ICU compression reused across all windows."""
+    payload = {
+        "source": str(pre_icu_history.get("source") or "").strip(),
+        "items": int(_safe_float(pre_icu_history.get("items"))),
+        "historical_discharge_summary_items": int(
+            _safe_float(pre_icu_history.get("historical_discharge_summary_items"))
+        ),
+        "report_content": str(pre_icu_history.get("content") or "").strip(),
+        "events_count": int(_safe_float(pre_icu_history.get("baseline_events_count"))),
+        "events_content": str(pre_icu_history.get("baseline_content") or "").strip(),
+    }
+    payload_json = json.dumps(payload, indent=2, ensure_ascii=False)
+    return f"""You compress pre-ICU history for repeated ICU window evaluation prompts.
+
+Return JSON only:
+{{
+  "compressed_pre_icu_history": "Concise summary (<= {max_summary_chars} chars)."
+}}
+
+Requirements:
+- Preserve clinically important signal; remove boilerplate.
+- Focus on:
+  1) Baseline vulnerability (major comorbidities, frailty, immunosuppression)
+  2) Pre-ICU trajectory (course, worsening/improving, response to treatments)
+  3) Acute severity signals (organ dysfunction, critical abnormal findings)
+  4) Working diagnoses if evident
+
+- Prefer interpreted clinical states over raw numbers (e.g. 'worsening hypoxia despite O2').
+- Pre-ICU event lines may carry history IDs like `[H0]`, `[H1]`, ... where `H` means pre-ICU history.
+- If citing specific pre-ICU events in the compressed text, keep those `[H#]` references.
+- Mention uncertainty if source text is sparse or conflicting.
+- Do not invent events or outcomes not present in input.
+- Keep the summary reusable across all subsequent ICU windows.
+- Include critical patient-specific constraints (e.g.treatment-limiting allergies) if present.
+
+Pre-ICU history payload:
+{payload_json}
+"""
 
 
 # ORACLE_PROMPT_TEMPLATE = """
@@ -235,9 +289,7 @@ Now, evaluate the CURRENT OBSERVATION WINDOW according to the instructions above
 # --------------------------------------------------
 # ## OUTPUT FORMAT (STRICT JSON)
 
-# Output inside <response></response>:
-
-# <response>
+# Output JSON:
 # {
 #   "patient_status": {
 #     "domains": {
@@ -292,7 +344,6 @@ Now, evaluate the CURRENT OBSERVATION WINDOW according to the instructions above
 #   ],
 #   "overall_window_summary": "<1-2 sentences covering patient trajectory, care quality, and key observations>"
 # }
-# </response>
 
 # --------------------------------------------------
 # ## PATIENT ICU CONTEXT
@@ -324,6 +375,7 @@ def format_oracle_prompt(
     patient_context = [
         "## Patient Context",
         f"- Age: {_format_age(metadata.get('age'))}",
+        f"- Gender: {_format_gender(metadata.get('gender'))}",
         f"- Total ICU Stay: {icu_duration_hours:.1f} hours",
         f"- Current Hour Since ICU Admission: {current_hour_since_admission:.1f}",
         f"- Context Mode: {context_mode}",
@@ -349,7 +401,7 @@ def format_oracle_prompt(
 
 
 def _format_pre_icu_history_lines(pre_icu_history: Any) -> List[str]:
-    lines = ["## HISTORICAL PRE-ICU REPORTS"]
+    lines = ["## HISTORICAL PRE-ICU SUMMARY"]
 
     if not isinstance(pre_icu_history, dict):
         lines.append("No historical pre-ICU reports provided.")
@@ -362,6 +414,9 @@ def _format_pre_icu_history_lines(pre_icu_history: Any) -> List[str]:
 
     if source in {"", "none", "disabled"}:
         lines.append("No historical pre-ICU reports provided.")
+    elif source == "llm_compressed":
+        lines.append(content if content else "No historical pre-ICU reports provided.")
+
     elif source == "reports":
         lines.append(content if content else "No historical pre-ICU reports provided.")
     elif source == "events_fallback":
@@ -393,6 +448,11 @@ def format_event_line(event: Dict[str, Any]) -> str:
     return format_shared_event_line(event)
 
 
+def format_event_lines(events: List[Dict[str, Any]], *, empty_text: str = "(No events)") -> List[str]:
+    """Format multiple event lines for prompt context blocks."""
+    return format_shared_event_lines(events, empty_text=empty_text)
+
+
 def _format_age(age: Any) -> str:
     if age is None:
         return "Unknown"
@@ -400,6 +460,20 @@ def _format_age(age: Any) -> str:
         return f"{float(age):.1f} years"
     except (TypeError, ValueError):
         return str(age)
+
+
+def _format_gender(gender: Any) -> str:
+    text = str(gender).strip() if gender is not None else ""
+    if not text:
+        return "Unknown"
+    normalized = text.lower()
+    if normalized in {"none", "nan", "null", "nat", "unknown"}:
+        return "Unknown"
+    if normalized in {"m", "male"}:
+        return "Male"
+    if normalized in {"f", "female"}:
+        return "Female"
+    return text
 
 
 def _format_outcome(survived: Any) -> str:

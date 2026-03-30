@@ -227,6 +227,8 @@ def test_pre_icu_fallback_uses_previous_72h_events_only():
     fallback_content = first["pre_icu_history"]["content"]
     assert fallback_content is not None
     assert "[2024-" not in fallback_content
+    assert "[H0]" in fallback_content
+    assert "[H1]" in fallback_content
     assert "LAB_TEST Lactate =7.20" in fallback_content
 
     earliest = enter - timedelta(hours=72)
@@ -342,8 +344,10 @@ def test_pre_icu_baseline_snapshot_includes_all_lab_and_vital_events_in_window()
     assert "Non Invasive Blood Pressure mean, mmHg" in baseline_content
     assert "Lactic Acid, mmol/L" not in baseline_content
     assert "[2024-" not in baseline_content
+    assert "[H0]" in baseline_content
+    assert "[H3]" in baseline_content
     # Baseline event lines should keep minute precision only.
-    assert re.search(r"B1\.\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+LAB_TEST", baseline_content) is not None
+    assert re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+LAB_TEST", baseline_content) is not None
     assert re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+LAB_TEST", baseline_content) is None
     assert "=2.30" in baseline_content
     assert "=8.50" in baseline_content

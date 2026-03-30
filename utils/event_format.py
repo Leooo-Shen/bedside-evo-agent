@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any, Mapping, Sequence
+from typing import Any, List, Mapping, Sequence
 
 from utils.time_format import format_timestamp_minute
 
@@ -38,9 +38,27 @@ def format_event_line(
     """
     Format one event into a compact stable line.
 
-    The default behavior matches Oracle prompt CW/HX/FX rendering.
+    The default behavior matches Oracle prompt context rendering.
     """
     parts: list[str] = []
+
+    # Prefer ICU-local stable IDs across windows.
+    event_id = event.get("icu_event_index")
+    if _is_missing_value(event_id):
+        event_id = event.get("event_index")
+    if _is_missing_value(event_id):
+        event_id = event.get("event_id")
+    if _is_missing_value(event_id):
+        event_id = event.get("event_idx")
+    if _is_missing_value(event_id):
+        event_id = event.get("prompt_event_id")
+    if _is_missing_value(event_id):
+        event_id = event.get("relative_event_id")
+    if not _is_missing_value(event_id):
+        try:
+            parts.append(f"[{int(event_id)}]")
+        except (TypeError, ValueError):
+            parts.append(f"[{event_id}]")
 
     time_value: Any = None
     for key in time_keys:
@@ -78,3 +96,22 @@ def format_event_line(
         return json.dumps(dict(event), ensure_ascii=False, default=str)
 
     return ""
+
+
+def format_event_lines(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    empty_text: str = "(No events)",
+) -> List[str]:
+    """
+    Format a sequence of events using the shared single-event formatter.
+
+    Returns at least one line: either formatted events or ``empty_text``.
+    """
+    lines: List[str] = []
+    for event in events:
+        line = format_event_line(event)
+        if isinstance(line, str) and line.strip():
+            lines.append(line)
+
+    return lines if lines else [empty_text]

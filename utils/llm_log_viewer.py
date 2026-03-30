@@ -40,53 +40,30 @@ def get_call_step_type(call: Dict[str, Any]) -> str:
 
 
 def build_pipeline_agents(agent: Any, agent_type: str) -> List[Dict[str, Any]]:
-    """Build pipeline metadata (used + thinking mode) from an agent instance."""
+    """Build pipeline metadata (agent name + usage) from an agent instance."""
     if agent_type == "multi":
         use_observer_agent = bool(getattr(agent, "use_observer_agent", True))
         use_memory_agent = bool(getattr(agent, "use_memory_agent", False))
         use_reflection_agent = bool(getattr(agent, "use_reflection_agent", False)) and use_memory_agent
         return [
-            {
-                "name": "observer",
-                "used": use_observer_agent,
-                "thinking": bool(getattr(agent, "observer_use_thinking", False)) if use_observer_agent else None,
-            },
-            {
-                "name": "memory_agent",
-                "used": use_memory_agent,
-                "thinking": bool(getattr(agent, "memory_use_thinking", False)) if use_memory_agent else None,
-            },
-            {
-                "name": "reflection_agent",
-                "used": use_reflection_agent,
-                "thinking": bool(getattr(agent, "reflection_use_thinking", False)) if use_reflection_agent else None,
-            },
-            {"name": "predictor", "used": True, "thinking": bool(getattr(agent, "predictor_use_thinking", False))},
+            {"name": "observer", "used": use_observer_agent},
+            {"name": "memory_agent", "used": use_memory_agent},
+            {"name": "reflection_agent", "used": use_reflection_agent},
+            {"name": "predictor", "used": True},
         ]
 
     if agent_type == "fold":
-        return [{"name": "fold_agent", "used": True, "thinking": None}]
+        return [{"name": "fold_agent", "used": True}]
 
     if agent_type == "remem":
-        return [{"name": "remem_agent", "used": True, "thinking": None}]
+        return [{"name": "remem_agent", "used": True}]
 
-    if agent_type == "med":
+    if agent_type == "med_evo":
         return [
-            {
-                "name": "static_memory_builder",
-                "used": bool(getattr(agent, "use_llm_static_compression", False)),
-                "thinking": None,
-            },
-            {
-                "name": "memory_agent",
-                "used": True,
-                "thinking": bool(getattr(agent, "memory_use_thinking", False)),
-            },
-            {
-                "name": "predictor",
-                "used": True,
-                "thinking": bool(getattr(agent, "predictor_use_thinking", False)),
-            },
+            {"name": "perception_agent", "used": True},
+            {"name": "event_agent", "used": True},
+            {"name": "insight_agent", "used": True},
+            {"name": "predictor", "used": True},
         ]
 
     return []
@@ -106,33 +83,32 @@ def _resolve_pipeline_agents(patient_logs: Dict[str, Any]) -> Tuple[List[Dict[st
     """Resolve pipeline metadata from logs; infer from calls if missing."""
     pipeline_agents = patient_logs.get("pipeline_agents")
     if isinstance(pipeline_agents, list) and pipeline_agents:
-        return pipeline_agents, False
+        normalized: List[Dict[str, Any]] = []
+        for agent_info in pipeline_agents:
+            if not isinstance(agent_info, dict):
+                continue
+            normalized.append(
+                {
+                    "name": str(agent_info.get("name", "unknown")),
+                    "used": bool(agent_info.get("used", False)),
+                }
+            )
+        if normalized:
+            return normalized, False
 
     calls = patient_logs.get("calls", [])
     step_types = {get_call_step_type(call) for call in calls}
     inferred = [
-        {"name": "observer", "used": "observer" in step_types, "thinking": None},
+        {"name": "observer", "used": "observer" in step_types},
         {
             "name": "memory_agent",
             "used": any(step in step_types for step in ["memory_agent", "memory_agent_revision"]),
-            "thinking": None,
         },
-        {"name": "reflection_agent", "used": "reflection_agent" in step_types, "thinking": None},
-        {"name": "predictor", "used": "predictor" in step_types, "thinking": None},
+        {"name": "reflection_agent", "used": "reflection_agent" in step_types},
+        {"name": "predictor", "used": "predictor" in step_types},
     ]
     inferred = [agent for agent in inferred if agent["used"]]
     return inferred, True
-
-
-def _thinking_label(value: Any, used: bool) -> str:
-    """Render thinking mode label."""
-    if not used:
-        return "-"
-    if value is True:
-        return "ON"
-    if value is False:
-        return "OFF"
-    return "Unknown"
 
 
 def _normalize_identity_value(value: Any) -> str:
@@ -753,7 +729,6 @@ def save_llm_calls_html(patient_logs: Dict[str, Any], output_path: Path) -> None
         "<tr>"
         f"<td>{escape(str(agent_info.get('name', 'unknown')))}</td>"
         f"<td>{'Yes' if agent_info.get('used') else 'No'}</td>"
-        f"<td>{_thinking_label(agent_info.get('thinking'), bool(agent_info.get('used')))}</td>"
         "</tr>"
         for agent_info in pipeline_agents
     )
@@ -1056,13 +1031,12 @@ def save_llm_calls_html(patient_logs: Dict[str, Any], output_path: Path) -> None
             <tr>
               <th>Agent</th>
               <th>Used</th>
-              <th>Thinking Mode</th>
             </tr>
           </thead>
           <tbody>{pipeline_rows}</tbody>
         </table>
       </div>
-      {"<p class='muted'>Pipeline info inferred from call steps (thinking mode unknown).</p>" if inferred_pipeline else ""}
+      {"<p class='muted'>Pipeline info inferred from call steps.</p>" if inferred_pipeline else ""}
     </div>
     {oracle_trend_section}
     {"".join(call_sections)}

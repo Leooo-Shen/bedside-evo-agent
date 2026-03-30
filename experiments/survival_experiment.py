@@ -4,7 +4,7 @@ Survival Prediction Experiment with Multiple Agent Types
 This script runs the Evo-ICU experiment using different agent approaches:
 1. ReMeM: Retrieval-Enhanced Memory Management (intra-patient memory only)
 2. AgentFold: Hierarchical Memory with Dynamic Trajectory Folding
-3. MedAgent: Static + Dynamic Memory with final predictor
+3. MedEvo: Event-grounded multi-agent dynamic memory
 """
 
 import hashlib
@@ -23,7 +23,7 @@ sys.path.insert(0, str(project_root))
 
 from agents.agent_fold import FoldAgent
 from agents.agent_fold_multi import MultiAgent
-from agents.med_agent import MedAgent
+from agents.med_evo_agent import MedEvoAgent
 from agents.remem import PatientState, RememAgent
 from config.config import get_config
 from data_parser import MIMICDataParser
@@ -86,14 +86,14 @@ def _build_observer_cache_metadata(config, subject_id: int, icu_stay_id: int, wi
             "include_pre_icu_data": config.agent_include_pre_icu_data,
             "use_discharge_summary_for_history": config.agent_use_discharge_summary_for_history,
             "num_discharge_summaries": config.agent_num_discharge_summaries,
+            "relative_report_codes": config.oracle_relative_report_codes,
+            "pre_icu_history_hours": config.oracle_pre_icu_history_hours,
         },
         "observer_model": {
             "provider": config.llm_provider,
             "model": config.llm_model,
-            "temperature": config.llm_temperature,
             "max_tokens": config.llm_max_tokens,
             "use_observer_agent": config.agent_multi_use_observer_agent,
-            "observer_use_thinking": config.agent_multi_observer_use_thinking,
         },
         "data_source": {
             "events_path": config.events_path,
@@ -197,7 +197,7 @@ def _save_observer_cache(
 def process_single_patient(
     patient_row: pd.Series,
     parser: MIMICDataParser,
-    agent,  # Can be RememAgent, FoldAgent, MultiAgent, or MedAgent
+    agent,  # Can be RememAgent, FoldAgent, or MultiAgent
     agent_type: str,
     config,
     results_dir: Path,
@@ -212,7 +212,7 @@ def process_single_patient(
         patient_row: Patient data from ICU stay DataFrame
         parser: MIMICDataParser instance
         agent: Agent instance
-        agent_type: Type of agent ("remem", "fold", "multi", or "med")
+    agent_type: Type of agent ("remem", "fold", "multi", or "med_evo")
         config: Configuration object
         results_dir: Directory to save results
         patient_idx: Index of this patient
@@ -247,6 +247,10 @@ def process_single_patient(
             window_step_hours=config.agent_window_step_hours,
             include_pre_icu_data=config.agent_include_pre_icu_data,
             use_first_n_hours_after_icu=observation_hours,
+            use_discharge_summary_for_history=config.agent_use_discharge_summary_for_history,
+            num_discharge_summaries=config.agent_num_discharge_summaries,
+            relative_report_codes=config.oracle_relative_report_codes,
+            pre_icu_history_hours=config.oracle_pre_icu_history_hours,
         )
 
         if len(windows) < 1:
@@ -326,7 +330,6 @@ def process_single_patient(
         agent.clear_logs()
 
         # Run appropriate agent pipeline
-        med_output = None
         if agent_type == "remem":
             prediction, final_state, window_states = agent.run_patient_trajectory(
                 windows=windows,
@@ -334,6 +337,14 @@ def process_single_patient(
                 verbose=verbose,
             )
             final_state_text = final_state.to_text()
+        elif agent_type == "med_evo":
+            prediction, memory_state, memory_db = agent.run_patient_trajectory(
+                windows=windows,
+                patient_metadata=patient_metadata,
+                verbose=verbose,
+            )
+            final_state_text = memory_state.to_text()
+            window_states = []
         elif agent_type == "multi":
             prediction, working_context, memory_db = agent.run_patient_trajectory(
                 windows=windows,
@@ -360,15 +371,6 @@ def process_single_patient(
                         observer_cache_info["save_error"] = str(e)
                         if verbose:
                             print(f"   Observer cache: SAVE ERROR ({e})")
-        elif agent_type == "med":
-            prediction, med_output = agent.run_patient_trajectory(
-                windows=windows,
-                patient_metadata=patient_metadata,
-                trajectory=trajectory,
-                verbose=verbose,
-            )
-            final_state_text = med_output.final_state_text
-            window_states = []
         else:  # agent_fold
             prediction, working_context, memory_db = agent.run_patient_trajectory(
                 windows=windows,
@@ -425,12 +427,10 @@ def process_single_patient(
             }
             with open(patient_dir / "patient_specific_insights.json", "w") as f:
                 json.dump(insights, f, indent=2)
-        elif agent_type == "med":
-            if med_output is not None:
-                with open(patient_dir / "patient_memory.json", "w") as f:
-                    json.dump(med_output.patient_memory_dict(), f, indent=2)
-                with open(patient_dir / "dynamic_memory_history.json", "w") as f:
-                    json.dump(med_output.dynamic_history_dict(), f, indent=2)
+        elif agent_type == "med_evo":
+            memory_db.save(str(patient_dir / "memory_database.json"))
+            with open(patient_dir / "final_memory.json", "w") as f:
+                json.dump(memory_state.to_dict(), f, indent=2)
         else:  # agent_fold or multi
             # Save memory database
             memory_db.save(str(patient_dir / "memory_database.json"))
@@ -504,7 +504,7 @@ def run_experiment(
     Run the survival prediction experiment.
 
     Args:
-        agent_type: "remem", "fold", "multi", or "med"
+        agent_type: "remem", "fold", "multi", or "med_evo"
         n_survived: Number of survived patients to include
         n_died: Number of died patients to include
         verbose: Print progress
@@ -534,7 +534,6 @@ def run_experiment(
         agent = RememAgent(
             provider=config.llm_provider,
             model=config.llm_model,
-            temperature=config.llm_temperature,
             max_tokens=config.llm_max_tokens,
             max_state_length=config.remem_max_state_length,
             enable_logging=enable_logging,
@@ -545,7 +544,6 @@ def run_experiment(
         agent = MultiAgent(
             provider=config.llm_provider,
             model=config.llm_model,
-            temperature=config.llm_temperature,
             max_tokens=config.llm_max_tokens,
             enable_logging=enable_logging,
             window_duration_hours=config.agent_current_window_hours,
@@ -553,38 +551,30 @@ def run_experiment(
             use_observer_agent=config.agent_multi_use_observer_agent,
             use_memory_agent=config.agent_multi_use_memory_agent,
             use_reflection_agent=config.agent_multi_use_reflection_agent,
-            observer_use_thinking=config.agent_multi_observer_use_thinking,
-            memory_use_thinking=config.agent_multi_memory_use_thinking,
-            reflection_use_thinking=config.agent_multi_reflection_use_thinking,
-            predictor_use_thinking=config.agent_multi_predictor_use_thinking,
-        )
-    elif agent_type == "med":
-        # Initialize MedAgent (Static Memory + Dynamic Memory + Predictor)
-        agent = MedAgent(
-            provider=config.llm_provider,
-            model=config.llm_model,
-            temperature=config.llm_temperature,
-            max_tokens=config.llm_max_tokens,
-            enable_logging=enable_logging,
-            observation_hours=config.agent_observation_hours,
-            use_llm_static_compression=config.med_agent_use_llm_static_compression,
-            baseline_lab_lookback_start_hours=config.med_agent_baseline_lab_lookback_start_hours,
-            baseline_lab_lookback_end_hours=config.med_agent_baseline_lab_lookback_end_hours,
-            max_active_problems=config.med_agent_max_active_problems,
-            max_critical_events=config.med_agent_max_critical_events,
-            max_patterns=config.med_agent_max_patterns,
-            memory_use_thinking=config.med_agent_memory_use_thinking,
-            predictor_use_thinking=config.med_agent_predictor_use_thinking,
         )
     elif agent_type == "fold":
         # Initialize FoldAgent
         agent = FoldAgent(
             provider=config.llm_provider,
             model=config.llm_model,
-            temperature=config.llm_temperature,
             max_tokens=config.llm_max_tokens,
             enable_logging=enable_logging,
             window_duration_hours=config.agent_current_window_hours,
+        )
+    elif agent_type == "med_evo":
+        agent = MedEvoAgent(
+            provider=config.llm_provider,
+            model=config.llm_model,
+            max_tokens=config.llm_max_tokens,
+            enable_logging=enable_logging,
+            observation_hours=config.agent_observation_hours,
+            window_duration_hours=config.agent_current_window_hours,
+            max_working_windows=config.med_evo_max_working_windows,
+            max_events=config.med_evo_max_events,
+            max_episodes=config.med_evo_max_episodes,
+            max_insights=config.med_evo_max_insights,
+            insight_recency_tau=config.med_evo_insight_recency_tau,
+            insight_every_n_windows=config.med_evo_insight_every_n_windows,
         )
     else:
         raise ValueError(f"Invalid agent type: {agent_type}")
@@ -621,7 +611,6 @@ def run_experiment(
             patient_agent = RememAgent(
                 provider=config.llm_provider,
                 model=config.llm_model,
-                temperature=config.llm_temperature,
                 max_tokens=config.llm_max_tokens,
                 max_state_length=config.remem_max_state_length,
                 enable_logging=enable_logging,
@@ -631,7 +620,6 @@ def run_experiment(
             patient_agent = MultiAgent(
                 provider=config.llm_provider,
                 model=config.llm_model,
-                temperature=config.llm_temperature,
                 max_tokens=config.llm_max_tokens,
                 enable_logging=enable_logging,
                 window_duration_hours=config.agent_current_window_hours,
@@ -639,33 +627,26 @@ def run_experiment(
                 use_observer_agent=config.agent_multi_use_observer_agent,
                 use_memory_agent=config.agent_multi_use_memory_agent,
                 use_reflection_agent=config.agent_multi_use_reflection_agent,
-                observer_use_thinking=config.agent_multi_observer_use_thinking,
-                memory_use_thinking=config.agent_multi_memory_use_thinking,
-                reflection_use_thinking=config.agent_multi_reflection_use_thinking,
-                predictor_use_thinking=config.agent_multi_predictor_use_thinking,
             )
-        elif agent_type == "med":
-            patient_agent = MedAgent(
+        elif agent_type == "med_evo":
+            patient_agent = MedEvoAgent(
                 provider=config.llm_provider,
                 model=config.llm_model,
-                temperature=config.llm_temperature,
                 max_tokens=config.llm_max_tokens,
                 enable_logging=enable_logging,
                 observation_hours=config.agent_observation_hours,
-                use_llm_static_compression=config.med_agent_use_llm_static_compression,
-                baseline_lab_lookback_start_hours=config.med_agent_baseline_lab_lookback_start_hours,
-                baseline_lab_lookback_end_hours=config.med_agent_baseline_lab_lookback_end_hours,
-                max_active_problems=config.med_agent_max_active_problems,
-                max_critical_events=config.med_agent_max_critical_events,
-                max_patterns=config.med_agent_max_patterns,
-                memory_use_thinking=config.med_agent_memory_use_thinking,
-                predictor_use_thinking=config.med_agent_predictor_use_thinking,
+                window_duration_hours=config.agent_current_window_hours,
+                max_working_windows=config.med_evo_max_working_windows,
+                max_events=config.med_evo_max_events,
+                max_episodes=config.med_evo_max_episodes,
+                max_insights=config.med_evo_max_insights,
+                insight_recency_tau=config.med_evo_insight_recency_tau,
+                insight_every_n_windows=config.med_evo_insight_every_n_windows,
             )
         else:  # agent_fold
             patient_agent = FoldAgent(
                 provider=config.llm_provider,
                 model=config.llm_model,
-                temperature=config.llm_temperature,
                 max_tokens=config.llm_max_tokens,
                 enable_logging=enable_logging,
                 window_duration_hours=config.agent_current_window_hours,
@@ -686,7 +667,7 @@ def run_experiment(
     patient_data = [(idx, row) for idx, (_, row) in enumerate(selected_patients.iterrows(), 1)]
 
     # Process in parallel
-    max_workers = min(4, len(selected_patients))  # Limit concurrent workers
+    max_workers = min(1, len(selected_patients))  # Limit concurrent workers
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_patient_wrapper, data) for data in patient_data]
         for future in as_completed(futures):
@@ -745,11 +726,12 @@ def run_experiment(
                     print(f"  Revisions: {stats.get('total_revisions', 0)}")
             else:
                 print(f"  Memory Agent: DISABLED (ablation mode)")
-        elif agent_type == "med":
-            print(f"  Static Compression Calls: {stats.get('total_static_compression_calls', 0)}")
-            print(f"  Dynamic Memory Calls: {stats.get('total_memory_calls', 0)}")
-            print(f"  Predictor Calls: {stats.get('total_predictor_calls', 0)}")
-            print(f"  Dynamic Fallbacks: {stats.get('total_dynamic_fallbacks', 0)}")
+        elif agent_type == "med_evo":
+            print(f"  EventAgent Calls: {stats['total_event_calls']}")
+            print(f"  InsightAgent Calls: {stats['total_insight_calls']}")
+            print(f"  Predictor Calls: {stats['total_predictor_calls']}")
+            print(f"  Grounding Rejections: {stats['total_grounding_rejections']}")
+            print(f"  Insights Pruned: {stats['total_insights_pruned']}")
         else:  # agent_fold
             print(f"  Total Folds: {stats['total_folds']}")
             print(f"  Total Appends: {stats['total_appends']}")
@@ -782,12 +764,12 @@ def main():
     parser = argparse.ArgumentParser(description="Survival Prediction Experiment")
     parser.add_argument(
         "--agent-type",
-        choices=["remem", "fold", "multi", "med"],
-        default="multi",
+        choices=["remem", "fold", "multi", "med_evo"],
+        default="med_evo",
         help="Agent type to use",
     )
-    parser.add_argument("--n-survived", type=int, default=10, help="Number of survived patients")
-    parser.add_argument("--n-died", type=int, default=10, help="Number of died patients")
+    parser.add_argument("--n-survived", type=int, default=1, help="Number of survived patients")
+    parser.add_argument("--n-died", type=int, default=0, help="Number of died patients")
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
     parser.add_argument("--no-logging", action="store_true", help="Disable detailed LLM call logging")
 
