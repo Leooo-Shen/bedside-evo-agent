@@ -32,7 +32,7 @@ sys.path.insert(0, str(project_root))
 from agents.agent_fold_multi import _parse_json_response
 from config.config import get_config
 from model.llms import LLMClient
-from prompts.shared_prompts import get_prediction_prompt
+from prompts.predictor_prompts import get_prediction_prompt
 from utils.outcome_utils import evaluate_outcome_match
 
 REMOVED_SECTION_TITLES = {"historical key events", "status trajectory"}

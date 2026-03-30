@@ -1,6 +1,6 @@
 """Prompt templates for AgentFold with dynamic trajectory folding."""
 
-from prompts.shared_prompts import get_prediction_prompt
+from prompts.predictor_prompts import get_prediction_prompt
 
 
 def get_window_update_prompt() -> str:

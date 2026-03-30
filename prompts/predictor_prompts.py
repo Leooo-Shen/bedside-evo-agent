@@ -20,17 +20,12 @@ Below are all clinical contexts from the first {obs_hours} hours after ICU admis
 Based on the patient context from the first {obs_hours} hours after ICU admission, predict whether this patient will survive or die after ICU discharge.
 
 ## Output Specification
-Return valid JSON only (no XML tags, no markdown code fences):
+Return valid JSON only:
 {{{{
   "survival_prediction": {{{{
     "outcome": "survive/die",
     "confidence": <float from 0.0 to 1.0>,
     "rationale": "Detailed clinical reasoning for your prediction"
-  }}}},
-  "patient_trajectory_assessment": {{{{
-    "severity_category": "improving/stable/critically_ill",
-    "trajectory": "improving/stable/deteriorating",
-    "rationale": "Clinical reasoning for the trajectory assessment"
   }}}},
   "supportive_factors": [
     {{{{

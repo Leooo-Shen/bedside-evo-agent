@@ -103,29 +103,3 @@ Return a JSON object:
 
 Omit a field entirely if there is nothing to report. Empty arrays are acceptable.
 """
-
-
-def get_med_evo_predictor_prompt(observation_hours: float = 12.0) -> str:
-    """Prompt for Predictor: ICU outcome prediction only (v1)."""
-    obs_hours = int(observation_hours) if float(observation_hours).is_integer() else observation_hours
-    return f"""You are an ICU outcome prediction agent.
-
-## Clinical Context (First {obs_hours} hours)
-{{context}}
-
-## Task
-Predict ICU outcome: survive or die.
-
-## Output Specification
-Provide your response in JSON format in <response></response>.
-<response>
-{{
-  "survival_prediction": {{
-    "outcome": "survive/die",
-    "confidence": 0.0,
-    "rationale": "Grounded clinical rationale"
-  }},
-  "supportive_factors": ["factor 1", "factor 2"],
-  "risk_factors": ["factor 1", "factor 2"]
-}}
-</response>"""

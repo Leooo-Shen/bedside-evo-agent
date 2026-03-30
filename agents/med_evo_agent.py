@@ -938,7 +938,7 @@ class MedEvoAgent:
         if grounded:
             return grounded
 
-        # If model output is empty/invalid, do not force any critical event.
+        # If model output is empty/invalid, return an empty list.
         return []
 
     def _ground_window_summary(

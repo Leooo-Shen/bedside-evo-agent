@@ -1,11 +1,10 @@
 """Prompt templates for Multi-Agent pipeline (Observer + Memory + Predictor)."""
 
-from prompts.shared_prompts import get_prediction_prompt
+from prompts.predictor_prompts import get_prediction_prompt
 
 
 def get_observer_prompt() -> str:
-    """Prompt for the Observer Agent: pure clinical assessment.
-    """
+    """Prompt for the Observer Agent: pure clinical assessment."""
     return f"""You are a Senior ICU Clinical Decision Support Agent. Your task is to analyze the current window of patient events and produce a clinical assessment.
 
 {{context}}
@@ -68,8 +67,7 @@ These are events that represent significant changes in the patient's clinical co
 
 
 def get_memory_agent_prompt() -> str:
-    """Prompt for the Memory Agent: trajectory folding decisions.
-    """
+    """Prompt for the Memory Agent: trajectory folding decisions."""
     return f"""You are a Memory Management Agent for an ICU clinical decision support system. Your task is to decide how to integrate a new clinical observation into the patient's trajectory history.
 
 ## Current Trajectory State
@@ -125,8 +123,7 @@ def get_predictor_prompt(observation_hours: float = 12.0) -> str:
 
 
 def get_reflection_agent_prompt() -> str:
-    """Prompt for the Reflection Agent: trajectory quality audit.
-    """
+    """Prompt for the Reflection Agent: trajectory quality audit."""
     return f"""You are a Clinical Auditor Agent reviewing trajectory summaries for quality and accuracy. Your task is to verify that the Memory Agent's trajectory summary is clinically sound and evidence-based.
 
 ## Previous Trajectory Context

@@ -607,7 +607,7 @@ class MultiAgent:
         Returns:
             Tuple of (parsed_prediction, raw_response, usage, formatted_prompt)
         """
-        from prompts.shared_prompts import get_prediction_prompt
+        from prompts.predictor_prompts import get_prediction_prompt
 
         # Build context with patient metadata and observer summaries
         context_parts = []

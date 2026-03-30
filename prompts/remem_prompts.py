@@ -10,7 +10,7 @@ may use different prompting strategies.
 
 from typing import Dict, List
 
-from prompts.shared_prompts import get_prediction_prompt
+from prompts.predictor_prompts import get_prediction_prompt
 
 
 def format_state_update_prompt(context: str) -> str:

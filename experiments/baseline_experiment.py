@@ -30,7 +30,7 @@ import pandas as pd
 from config.config import get_config
 from data_parser import MIMICDataParser
 from model.llms import LLMClient
-from prompts.shared_prompts import get_prediction_prompt
+from prompts.predictor_prompts import get_prediction_prompt
 from utils.outcome_utils import evaluate_outcome_match
 from utils.patient_selection import select_balanced_patients
 
