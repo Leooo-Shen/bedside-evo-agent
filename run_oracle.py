@@ -510,12 +510,15 @@ def _build_window_contexts_payload(
 
     for idx, raw_window in enumerate(windows, start=1):
         window = raw_window if isinstance(raw_window, dict) else {}
-        current_events = window.get("current_events")
-        if not isinstance(current_events, list):
-            current_events = []
+        source_current_events = window.get("current_events")
+        if not isinstance(source_current_events, list):
+            source_current_events = []
         source_history_events = window.get("history_events")
         if not isinstance(source_history_events, list):
             source_history_events = []
+        source_future_events = window.get("future_events")
+        if not isinstance(source_future_events, list):
+            source_future_events = []
 
         prompt_sections, llm_window_index = _resolve_prompt_sections_for_window(
             window_index=idx,
@@ -567,10 +570,12 @@ def _build_window_contexts_payload(
             resolved_future_hours = window_future_hours
 
         history_events = oracle_context_history_events if isinstance(context_events_payload, dict) else source_history_events
+        current_events = oracle_context_current_events if isinstance(context_events_payload, dict) else source_current_events
+        future_events = oracle_context_future_events if isinstance(context_events_payload, dict) else source_future_events
         context_events_source = (
             "oracle_context_events"
             if isinstance(context_events_payload, dict)
-            else "window_payload_history_events"
+            else "window_payload_events"
         )
 
         window_contexts.append(
@@ -591,7 +596,7 @@ def _build_window_contexts_payload(
                     "current_window_hours": window.get("current_window_hours"),
                     "num_history_events": len(history_events),
                     "num_current_events": len(current_events),
-                    "num_future_events": len(oracle_context_future_events),
+                    "num_future_events": len(future_events),
                     "pre_icu_history_source": window.get("pre_icu_history_source"),
                     "pre_icu_history_items": window.get("pre_icu_history_items"),
                     "current_discharge_summary_selection_rule": (
@@ -604,8 +609,10 @@ def _build_window_contexts_payload(
                 },
                 "history_events": history_events,
                 "current_events": current_events,
-                "future_events": oracle_context_future_events,
+                "future_events": future_events,
                 "source_window_history_events": source_history_events,
+                "source_window_current_events": source_current_events,
+                "source_window_future_events": source_future_events,
                 "oracle_context_history_events": oracle_context_history_events,
                 "oracle_context_current_events": oracle_context_current_events,
                 "oracle_context_future_events": oracle_context_future_events,
@@ -704,8 +711,7 @@ def process_batch_for_oracle(
     print(f"  Use ICU discharge summary in context: {selected_use_discharge_summary}")
     print(f"  Compress pre-ICU history once per patient: {selected_compress_pre_icu_history}")
     print(f"  Include ICU outcome in prompt: {selected_include_icu_outcome_in_prompt}")
-    print(f"  Context history threshold (hours): {config.oracle_context_history_hours}")
-    print(f"  Context future threshold (hours): {config.oracle_context_future_hours}")
+    print("  Context history/future source: window payload (create_time_windows)")
     print(f"  Top-k recommendations requested: {config.oracle_context_top_k_recommendations}")
 
     oracle = MetaOracle(
@@ -786,6 +792,8 @@ def process_batch_for_oracle(
                 num_discharge_summaries=config.oracle_num_discharge_summaries,
                 relative_report_codes=config.oracle_relative_report_codes,
                 pre_icu_history_hours=config.oracle_pre_icu_history_hours,
+                history_context_hours=config.oracle_context_history_hours,
+                future_context_hours=config.oracle_context_future_hours,
             )
 
             print(f"  Generated {len(windows)} time windows")
@@ -798,12 +806,11 @@ def process_batch_for_oracle(
                 print(f"  Evaluating windows in parallel ({effective_workers} workers)")
                 reports = oracle.evaluate_trajectory_parallel(
                     windows,
-                    trajectory=trajectory,
                     max_workers=effective_workers,
                     show_progress=True,
                 )
             else:
-                reports = oracle.evaluate_trajectory(windows, trajectory=trajectory)
+                reports = oracle.evaluate_trajectory(windows)
 
             print(f"  Completed: {len(reports)} evaluations")
 

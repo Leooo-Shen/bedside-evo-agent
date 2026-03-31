@@ -7,19 +7,15 @@ import math
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from model.llms import LLMClient
-from prompts.oracle_prompt import (
-    format_event_lines,
-    format_oracle_prompt,
-    format_pre_icu_compression_prompt,
-)
+from prompts.oracle_prompt import format_event_lines, format_oracle_prompt, format_pre_icu_compression_prompt
 
 try:
     import tiktoken
@@ -421,28 +417,11 @@ class MetaOracle:
             self._trajectory_logs = keep
         return matched
 
-    def _prepare_trajectory_context(self, trajectory: Dict[str, Any]) -> Dict[str, Any]:
-        raw_events, enter_time, leave_time = _extract_icu_events(trajectory)
-        return {
-            "raw_events": raw_events,
-            "enter_time": enter_time,
-            "leave_time": leave_time,
-        }
-
     def prepare_context(
         self,
-        trajectory: Dict[str, Any],
         window_data: Dict[str, Any],
-        prepared_trajectory_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Build local ICU context for one window using configured history/future bounds."""
-        prepared = prepared_trajectory_context or self._prepare_trajectory_context(trajectory)
-        raw_events = prepared.get("raw_events") if isinstance(prepared, dict) else None
-        if not isinstance(raw_events, list):
-            raw_events = []
-        enter_time = prepared.get("enter_time") if isinstance(prepared, dict) else None
-        leave_time = prepared.get("leave_time") if isinstance(prepared, dict) else None
-
+        """Build Oracle context directly from pre-sliced window payload events."""
         current_window_start = _parse_time(window_data.get("current_window_start"))
         current_window_end = _parse_time(window_data.get("current_window_end"))
         if (
@@ -452,45 +431,31 @@ class MetaOracle:
         ):
             current_window_end = current_window_start
 
-        anchor_time = current_window_start
-        if anchor_time is None:
-            anchor_time = current_window_end
-        if anchor_time is None:
-            anchor_time = enter_time
+        history_events = _normalize_window_event_payload(window_data.get("history_events"))
+        current_window_events = _normalize_window_event_payload(window_data.get("current_events"))
+        future_events = _normalize_window_event_payload(window_data.get("future_events"))
+        context_events = [*history_events, *current_window_events, *future_events]
+        context_start, context_end = _event_time_bounds(context_events)
+        if context_start is None:
+            context_start = current_window_start
+        if context_end is None:
+            context_end = current_window_end
+        if context_start and context_end and context_end < context_start:
+            context_end = context_start
 
-        context_start: Optional[datetime]
-        context_end: Optional[datetime]
-        if anchor_time is None:
-            context_start = enter_time
-            context_end = leave_time
-        else:
-            context_start = anchor_time - timedelta(hours=self.history_context_hours)
-            context_end = anchor_time + timedelta(hours=self.future_context_hours)
-
-        if enter_time and (context_start is None or context_start < enter_time):
-            context_start = enter_time
-        if leave_time and (context_end is None or context_end > leave_time):
-            context_end = leave_time
-        if context_start and context_end and context_start > context_end:
-            context_start = context_end
-
-        context_events_all = _slice_events_by_time(raw_events, context_start, context_end)
+        history_hours = _derive_history_hours(
+            history_events=history_events,
+            current_window_start=current_window_start,
+        )
+        future_hours = _derive_future_hours(
+            future_events=future_events,
+            current_window_end=current_window_end,
+        )
+        anchor_time = current_window_start or current_window_end
         current_discharge_summary = (
             window_data.get("current_discharge_summary")
             if isinstance(window_data.get("current_discharge_summary"), dict)
             else None
-        )
-        if current_discharge_summary is None:
-            current_discharge_summary = _extract_current_discharge_summary_fallback(
-                raw_events,
-                leave_time=leave_time,
-            )
-        # NOTE_DISCHARGESUMMARY must not appear in raw ICU events context.
-        context_events = _exclude_discharge_summary_events(context_events_all)
-        history_events, current_window_events, future_events = _partition_events_relative_to_window(
-            context_events,
-            current_window_start=current_window_start,
-            current_window_end=current_window_end,
         )
         history_events_for_log = _sanitize_context_events(history_events)
         current_window_events_for_log = _sanitize_context_events(current_window_events)
@@ -505,8 +470,8 @@ class MetaOracle:
             current_window_start=current_window_start,
             current_window_end=current_window_end,
             anchor_time=anchor_time,
-            history_hours=self.history_context_hours,
-            future_hours=self.future_context_hours,
+            history_hours=history_hours,
+            future_hours=future_hours,
         )
 
         current_discharge_summary_text = _build_current_discharge_summary_context_text(
@@ -546,12 +511,10 @@ class MetaOracle:
             "context_anchor_time": anchor_time.isoformat() if anchor_time else None,
             "context_window_start": context_start.isoformat() if context_start else None,
             "context_window_end": context_end.isoformat() if context_end else None,
-            "history_hours": self.history_context_hours,
-            "future_hours": self.future_context_hours,
+            "history_hours": history_hours,
+            "future_hours": future_hours,
             "has_current_discharge_summary": has_current_discharge_summary,
             "current_discharge_summary_selection_rule": current_discharge_summary_selection_rule,
-            # Backward-compatible aliases for existing analytics.
-            "has_icu_discharge_summary": has_current_discharge_summary,
             "icu_discharge_summary_count": 1 if has_current_discharge_summary else 0,
         }
 
@@ -705,14 +668,8 @@ class MetaOracle:
     def evaluate_window(
         self,
         window_data: Dict[str, Any],
-        trajectory: Dict[str, Any],
-        prepared_trajectory_context: Optional[Dict[str, Any]] = None,
     ) -> OracleReport:
-        context_info = self.prepare_context(
-            trajectory,
-            window_data,
-            prepared_trajectory_context=prepared_trajectory_context,
-        )
+        context_info = self.prepare_context(window_data)
         prompt = format_oracle_prompt(
             window_data=window_data,
             context_block=context_info.get("context_text", ""),
@@ -810,7 +767,6 @@ class MetaOracle:
                     ),
                     "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
                     "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
-                    "has_icu_discharge_summary": context_info.get("has_icu_discharge_summary", False),
                     "icu_discharge_summary_count": context_info.get("icu_discharge_summary_count", 0),
                 },
             )
@@ -895,20 +851,15 @@ class MetaOracle:
             )
             return report
 
-    def evaluate_trajectory(self, windows: List[Dict[str, Any]], trajectory: Dict[str, Any]) -> List[OracleReport]:
+    def evaluate_trajectory(self, windows: List[Dict[str, Any]]) -> List[OracleReport]:
         reports: List[OracleReport] = []
         self.compress_pre_icu_history_for_windows(windows)
-        prepared_trajectory_context = self._prepare_trajectory_context(trajectory)
 
         for i, window in enumerate(windows):
             window_payload = dict(window)
             window_payload.setdefault("window_index", i)
             print(f"Evaluating window {i+1}/{len(windows)} (Hour {window_payload['hours_since_admission']:.1f})...")
-            report = self.evaluate_window(
-                window_payload,
-                trajectory=trajectory,
-                prepared_trajectory_context=prepared_trajectory_context,
-            )
+            report = self.evaluate_window(window_payload)
             reports.append(report)
 
         return reports
@@ -916,7 +867,6 @@ class MetaOracle:
     def evaluate_trajectory_parallel(
         self,
         windows: List[Dict[str, Any]],
-        trajectory: Dict[str, Any],
         max_workers: int = 10,
         show_progress: bool = True,
     ) -> List[OracleReport]:
@@ -930,7 +880,6 @@ class MetaOracle:
             print(f"Starting parallel evaluation with {worker_count} workers...")
 
         self.compress_pre_icu_history_for_windows(windows)
-        prepared_trajectory_context = self._prepare_trajectory_context(trajectory)
         windows_with_index = []
         for i, window in enumerate(windows):
             window_payload = dict(window)
@@ -942,8 +891,7 @@ class MetaOracle:
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_to_index = {
-                executor.submit(self.evaluate_window, window, trajectory, prepared_trajectory_context): i
-                for i, window in enumerate(windows_with_index)
+                executor.submit(self.evaluate_window, window): i for i, window in enumerate(windows_with_index)
             }
 
             for future in as_completed(future_to_index):
@@ -1057,26 +1005,6 @@ def _safe_text(value: Any) -> str:
     return str(value).strip()
 
 
-def _safe_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _extract_event_id(event: Mapping[str, Any]) -> Optional[int]:
-    # Preferred ID is ICU-local stable index (0-based within one ICU stay).
-    for key in ("icu_event_index", "event_index", "event_id", "event_idx", "prompt_event_id", "relative_event_id"):
-        event_id = _safe_int(event.get(key))
-        if event_id is not None:
-            return event_id
-    return None
-
-
 def _safe_float(value: Any) -> float:
     try:
         return float(value)
@@ -1125,104 +1053,6 @@ def _parse_time(value: Any) -> Optional[datetime]:
         return None
 
 
-def _extract_icu_events(
-    trajectory: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], Optional[datetime], Optional[datetime]]:
-    enter_time = _parse_time(trajectory.get("enter_time"))
-    leave_time = _parse_time(trajectory.get("leave_time"))
-    events = trajectory.get("events", [])
-
-    normalized: List[Dict[str, Any]] = []
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-
-        event_time = _parse_time(event.get("time") or event.get("start_time"))
-        if enter_time and event_time and event_time < enter_time:
-            continue
-        if leave_time and event_time and event_time > leave_time:
-            continue
-
-        cleaned = {
-            "time": event.get("time") or event.get("start_time"),
-            "code": event.get("code"),
-            "code_specifics": event.get("code_specifics"),
-            "numeric_value": event.get("numeric_value"),
-            "text_value": event.get("text_value"),
-        }
-        event_id = _extract_event_id(event)
-        if event_id is not None:
-            cleaned["event_id"] = event_id
-        cleaned = {k: v for k, v in cleaned.items() if v is not None}
-        if not cleaned:
-            continue
-
-        cleaned["_event_time"] = event_time
-        normalized.append(cleaned)
-
-    normalized.sort(key=lambda item: (item.get("_event_time") is None, item.get("_event_time") or datetime.max))
-    return normalized, enter_time, leave_time
-
-
-def _slice_events_by_time(
-    raw_events: List[Dict[str, Any]],
-    start: Optional[datetime],
-    end: Optional[datetime],
-) -> List[Dict[str, Any]]:
-    if not raw_events:
-        return []
-
-    sliced: List[Dict[str, Any]] = []
-    for event in raw_events:
-        event_time = event.get("_event_time")
-        if not isinstance(event_time, datetime):
-            continue
-        if start and event_time < start:
-            continue
-        if end and event_time > end:
-            continue
-        sliced.append(event)
-
-    return sliced
-
-
-def _exclude_discharge_summary_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    filtered: List[Dict[str, Any]] = []
-    for event in events:
-        if _safe_text(event.get("code")) == "NOTE_DISCHARGESUMMARY":
-            continue
-        filtered.append(event)
-    return filtered
-
-
-def _partition_events_relative_to_window(
-    events: List[Dict[str, Any]],
-    *,
-    current_window_start: Optional[datetime],
-    current_window_end: Optional[datetime],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    history_events: List[Dict[str, Any]] = []
-    current_window_events: List[Dict[str, Any]] = []
-    future_events: List[Dict[str, Any]] = []
-
-    for event in events:
-        event_time = event.get("_event_time")
-        if not isinstance(event_time, datetime):
-            continue
-
-        if current_window_start is not None and event_time < current_window_start:
-            history_events.append(event)
-            continue
-
-        if current_window_end is not None and event_time > current_window_end:
-            future_events.append(event)
-            continue
-
-        current_window_events.append(event)
-
-    return history_events, current_window_events, future_events
-
-
 def _sanitize_context_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     sanitized: List[Dict[str, Any]] = []
     for event in events:
@@ -1231,6 +1061,67 @@ def _sanitize_context_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any
         cleaned = {key: value for key, value in event.items() if not str(key).startswith("_")}
         sanitized.append(cleaned)
     return sanitized
+
+
+def _normalize_window_event_payload(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+    return normalized
+
+
+def _event_time_from_payload(event: Dict[str, Any]) -> Optional[datetime]:
+    return _parse_time(event.get("time") or event.get("start_time"))
+
+
+def _event_time_bounds(events: List[Dict[str, Any]]) -> Tuple[Optional[datetime], Optional[datetime]]:
+    times: List[datetime] = []
+    for event in events:
+        event_time = _event_time_from_payload(event)
+        if isinstance(event_time, datetime):
+            times.append(event_time)
+    if not times:
+        return None, None
+    return min(times), max(times)
+
+
+def _derive_history_hours(
+    *,
+    history_events: List[Dict[str, Any]],
+    current_window_start: Optional[datetime],
+) -> Optional[float]:
+    if current_window_start is None:
+        return None
+    if not history_events:
+        return 0.0
+    first_history_time, _ = _event_time_bounds(history_events)
+    if first_history_time is None:
+        return None
+    return max(0.0, (current_window_start - first_history_time).total_seconds() / 3600.0)
+
+
+def _derive_future_hours(
+    *,
+    future_events: List[Dict[str, Any]],
+    current_window_end: Optional[datetime],
+) -> Optional[float]:
+    if current_window_end is None:
+        return None
+    if not future_events:
+        return 0.0
+    _, last_future_time = _event_time_bounds(future_events)
+    if last_future_time is None:
+        return None
+    return max(0.0, (last_future_time - current_window_end).total_seconds() / 3600.0)
+
+
+def _format_optional_hours(value: Optional[float]) -> str:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return "unknown"
+    return f"{float(value):.1f}"
 
 
 def _build_raw_context_text(
@@ -1243,8 +1134,8 @@ def _build_raw_context_text(
     current_window_start: Optional[datetime],
     current_window_end: Optional[datetime],
     anchor_time: Optional[datetime],
-    history_hours: float,
-    future_hours: float,
+    history_hours: Optional[float],
+    future_hours: Optional[float],
 ) -> str:
     anchor_text = anchor_time.isoformat() if anchor_time else "unknown"
     start_text = context_start.isoformat() if context_start else "unknown"
@@ -1269,7 +1160,7 @@ def _build_raw_context_text(
         "",
         "## HISTORY EVENTS OF CURRENT WINDOW",
         f"Total history events: {len(history_events)}",
-        f"History duration (hours): {history_hours:.1f}",
+        f"History duration (hours): {_format_optional_hours(history_hours)}",
     ]
 
     lines.extend(format_event_lines(history_events, empty_text="(No history events before current window)"))
@@ -1291,7 +1182,7 @@ def _build_raw_context_text(
             "",
             "## FUTURE EVENTS",
             f"Total future events: {len(future_events)}",
-            f"Future duration (hours): {future_hours:.1f}",
+            f"Future duration (hours): {_format_optional_hours(future_hours)}",
         ]
     )
 
@@ -1304,30 +1195,6 @@ def _mask_outcome_terms(text: str) -> str:
     if not text:
         return ""
     return OUTCOME_LEAK_TERMS_PATTERN.sub(OUTCOME_MASK_TOKEN, text)
-
-
-def _extract_current_discharge_summary_fallback(
-    raw_events: List[Dict[str, Any]],
-    *,
-    leave_time: Optional[datetime],
-) -> Optional[Dict[str, Any]]:
-    discharge_summaries = [event for event in raw_events if _safe_text(event.get("code")) == "NOTE_DISCHARGESUMMARY"]
-    if not discharge_summaries:
-        return None
-
-    selected = discharge_summaries[-1]
-    event_time = selected.get("_event_time")
-    hours_after_icu_leave = None
-    if isinstance(event_time, datetime) and isinstance(leave_time, datetime):
-        hours_after_icu_leave = float((event_time - leave_time).total_seconds() / 3600.0)
-
-    return {
-        "time": selected.get("time"),
-        "code_specifics": selected.get("code_specifics"),
-        "text_value": selected.get("text_value"),
-        "selection_rule": "trajectory_event_fallback",
-        "hours_after_icu_leave": hours_after_icu_leave,
-    }
 
 
 def _remove_summary_section(text: str, section_header: str) -> str:

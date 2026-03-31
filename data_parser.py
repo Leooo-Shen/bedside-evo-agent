@@ -470,13 +470,13 @@ class MIMICDataParser:
         initial_count = len(self.icu_stay_df)
 
         # Filter 1: Remove patients with ICU duration <= 4 hours (too short)
-        # Filter 2: Remove patients with ICU duration > 96 hours  (too long) # TODO in the future
+        # Filter 2: Remove patients with ICU duration > 96 hours  (too long)
         self.icu_stay_df = self.icu_stay_df[
             ~((self.icu_stay_df["icu_duration_hours"] <= 4) | (self.icu_stay_df["icu_duration_hours"] > 96))
         ]
 
         filtered_count = initial_count - len(self.icu_stay_df)
-        print(f"Filtered out {filtered_count} patients (Dead < 4h or Survived & Transferred < 24h)")
+        print(f"Filtered out {filtered_count} patients (< 4h or > 96h ICU duration)")
 
         # Keep ALL ICU stays for each patient (treat multiple stays independently)
         # Sort by subject_id and enter_time for consistent ordering
@@ -993,6 +993,7 @@ class MIMICDataParser:
         current_discharge_summary: Optional[Dict[str, Any]],
         cleaned_history: List[Dict[str, Any]],
         cleaned_current: List[Dict[str, Any]],
+        cleaned_future: List[Dict[str, Any]],
         pre_icu_history_source: str,
         pre_icu_history_items: int,
         historical_discharge_summary_items: int,
@@ -1016,8 +1017,10 @@ class MIMICDataParser:
             "current_discharge_summary": (dict(current_discharge_summary) if current_discharge_summary else None),
             "history_events": cleaned_history,
             "current_events": cleaned_current,
+            "future_events": cleaned_future,
             "num_history_events": len(cleaned_history),
             "num_current_events": len(cleaned_current),
+            "num_future_events": len(cleaned_future),
             "pre_icu_history": {
                 "source": pre_icu_history_source,
                 "items": pre_icu_history_items,
@@ -1047,6 +1050,8 @@ class MIMICDataParser:
         pre_icu_history_events: List[Dict],
         pre_icu_history_hours_applied: float,
         current_discharge_summary: Optional[Dict[str, Any]],
+        history_context_hours: Optional[float],
+        future_context_hours: Optional[float],
     ) -> List[Dict]:
         if len(events_df) == 0:
             return []
@@ -1071,6 +1076,23 @@ class MIMICDataParser:
 
             start_idx = int(event_time_index.searchsorted(current_start, side="left"))
             end_idx = int(event_time_index.searchsorted(current_end, side="left"))
+            history_start_idx = 0
+            if history_context_hours is not None:
+                history_start_time = current_start - timedelta(hours=history_context_hours)
+                if use_report_history_mode:
+                    history_start_time = max(history_start_time, enter_time)
+                history_start_idx = int(event_time_index.searchsorted(history_start_time, side="left"))
+            elif use_report_history_mode:
+                # Keep window history local to current ICU trajectory when report-history mode is enabled.
+                history_start_idx = int(event_time_index.searchsorted(enter_time, side="left"))
+
+            future_end_idx = len(events_records)
+            if future_context_hours is not None:
+                if future_context_hours == 0:
+                    future_end_idx = end_idx
+                else:
+                    future_end_time = current_end + timedelta(hours=future_context_hours)
+                    future_end_idx = int(event_time_index.searchsorted(future_end_time, side="right"))
 
             if end_idx > start_idx:
                 if use_report_history_mode and clean_event_cache is not None:
@@ -1087,9 +1109,33 @@ class MIMICDataParser:
                     cleaned_current = cleaned_events_records[start_idx:end_idx] if cleaned_events_records else []
 
                 if use_report_history_mode:
-                    cleaned_history = pre_icu_history_events
+                    cleaned_history: List[Dict[str, Any]] = []
+                    if clean_event_cache is not None:
+                        for idx in range(history_start_idx, start_idx):
+                            cached = clean_event_cache[idx]
+                            if cached is cache_sentinel:
+                                cleaned = self._clean_event(events_records[idx], prev_event_time=None)
+                                clean_event_cache[idx] = cleaned if cleaned else None
+                                cached = clean_event_cache[idx]
+                            if isinstance(cached, dict) and cached:
+                                cleaned_history.append(cached)
                 else:
-                    cleaned_history = cleaned_events_records[:start_idx] if cleaned_events_records else []
+                    cleaned_history = (
+                        cleaned_events_records[history_start_idx:start_idx] if cleaned_events_records else []
+                    )
+
+                if use_report_history_mode and clean_event_cache is not None:
+                    cleaned_future: List[Dict[str, Any]] = []
+                    for idx in range(end_idx, future_end_idx):
+                        cached = clean_event_cache[idx]
+                        if cached is cache_sentinel:
+                            cleaned = self._clean_event(events_records[idx], prev_event_time=None)
+                            clean_event_cache[idx] = cleaned if cleaned else None
+                            cached = clean_event_cache[idx]
+                        if isinstance(cached, dict) and cached:
+                            cleaned_future.append(cached)
+                else:
+                    cleaned_future = cleaned_events_records[end_idx:future_end_idx] if cleaned_events_records else []
 
                 windows.append(
                     self._build_window_payload(
@@ -1101,6 +1147,7 @@ class MIMICDataParser:
                         current_discharge_summary=current_discharge_summary,
                         cleaned_history=cleaned_history,
                         cleaned_current=cleaned_current,
+                        cleaned_future=cleaned_future,
                         pre_icu_history_source=pre_icu_history_source,
                         pre_icu_history_items=pre_icu_history_items,
                         historical_discharge_summary_items=historical_discharge_summary_items,
@@ -1124,17 +1171,24 @@ class MIMICDataParser:
         num_discharge_summaries: int = 2,
         relative_report_codes: Optional[List[str]] = None,
         pre_icu_history_hours: float = 72.0,
+        history_context_hours: Optional[float] = None,
+        future_context_hours: Optional[float] = None,
     ) -> List[Dict]:
         """
         Split a patient trajectory into time windows for Oracle or Agent evaluation.
 
         Each window contains:
-        - History: All events before current window start
-          If include_pre_icu_data is True, includes pre-ICU hospital events
-          If use_discharge_summary_for_history is True, uses a unified pre-ICU history
-          block built from pre-ICU events (within pre_icu_history_hours) plus optional
-          historical pre-ICU reports.
+        - History: Local events before current window start
+          If history_context_hours is set, history is limited to
+          [current_window_start - history_context_hours, current_window_start).
+          When use_discharge_summary_for_history is True, history remains local per-window
+          and does not get replaced by the shared pre-ICU history block.
         - Current: Events from current_start to (current_start + current_window_hours)
+        - Future: Events after current window end within this ICU trajectory
+          If future_context_hours is set, future is limited to
+          [current_window_end, current_window_end + future_context_hours].
+        - Pre-ICU shared context: Optional `pre_icu_history` text block (from events/reports)
+          attached identically to every window for optional LLM compression/reuse.
         - Metadata: Patient info and outcome
 
         IMPORTANT: To prevent information leakage, window creation automatically stops at the first
@@ -1152,9 +1206,12 @@ class MIMICDataParser:
                                          Example: use_first_n_hours_after_icu=12 uses only first 12 hours
                                          When None, uses the full ICU duration (or until outcome event)
             use_discharge_summary_for_history: Use pre-ICU report content as history context
-                                               added on top of pre-ICU events (default False).
-                                               Current ICU-stay-matched discharge summary is always
-                                               exposed separately in `current_discharge_summary`.
+                                               to build a shared `pre_icu_history` block
+                                               (default False). This shared block is identical
+                                               across windows and separate from per-window
+                                               `history_events`. Current ICU-stay-matched discharge
+                                               summary is always exposed separately in
+                                               `current_discharge_summary`.
             num_discharge_summaries: Maximum number of prioritized pre-ICU reports to
                                      include per NOTE_* code (default 2). With
                                      NOTE_DISCHARGESUMMARY and NOTE_RADIOLOGYREPORT,
@@ -1163,6 +1220,10 @@ class MIMICDataParser:
                                    NOTE_DISCHARGESUMMARY is always prioritized first.
             pre_icu_history_hours: Pre-ICU lookback window in hours (default 72h) used for
                                    pre-ICU history events.
+            history_context_hours: Optional history horizon (hours) before current window
+                                   start for window history_events. None keeps full history.
+            future_context_hours: Optional future horizon (hours) after current window end
+                                  for window future_events. None keeps full future.
 
         Example with current=0.5, step=0.5:
             Window 0: history=[ICU_start, 0h], current=[0h, 0.5h]
@@ -1173,6 +1234,18 @@ class MIMICDataParser:
         Returns:
             List of time windows, each suitable for Oracle or Agent evaluation
         """
+        history_context_hours_applied: Optional[float] = None
+        if history_context_hours is not None:
+            history_context_hours_applied = float(history_context_hours)
+            if history_context_hours_applied < 0:
+                raise ValueError(f"history_context_hours must be >= 0 or None, got {history_context_hours_applied}")
+
+        future_context_hours_applied: Optional[float] = None
+        if future_context_hours is not None:
+            future_context_hours_applied = float(future_context_hours)
+            if future_context_hours_applied < 0:
+                raise ValueError(f"future_context_hours must be >= 0 or None, got {future_context_hours_applied}")
+
         enter_time = pd.to_datetime(trajectory["enter_time"])
         leave_time = pd.to_datetime(trajectory["leave_time"])
 
@@ -1357,6 +1430,8 @@ class MIMICDataParser:
             pre_icu_history_events=pre_icu_history_events,
             pre_icu_history_hours_applied=pre_icu_history_hours_applied,
             current_discharge_summary=current_discharge_summary,
+            history_context_hours=history_context_hours_applied,
+            future_context_hours=future_context_hours_applied,
         )
 
     def extract_discharge_summary(self, trajectory: Dict, k: int = 1) -> Optional[List[Dict]]:

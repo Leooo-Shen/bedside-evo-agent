@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Sample a balanced, parser-compatible ICU subset from sharded MIMIC data."""
-
 from __future__ import annotations
 
 import argparse
 import gc
 import json
 import random
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from data_parser import MIMICDataParser
 
@@ -29,7 +33,7 @@ class ShardPaths:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a balanced 100-patient (50 died / 50 survived) ICU subset from data/mimic-demo "
+            "Build a balanced ICU subset from data/mimic-demo "
             "with one ICU stay per subject and parser-compatible parquet outputs."
         )
     )
@@ -42,19 +46,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/mimic-demo/anno_subset_100"),
+        default=Path("data/mimic-demo/anno_subset_140"),
         help="Output directory for sampled metadata + subset parquets.",
     )
     parser.add_argument(
         "--n-survived",
         type=int,
-        default=50,
+        default=70,
         help="Number of survived patients to sample.",
     )
     parser.add_argument(
         "--n-died",
         type=int,
-        default=50,
+        default=70,
         help="Number of died patients to sample.",
     )
     parser.add_argument(

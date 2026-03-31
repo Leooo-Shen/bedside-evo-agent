@@ -329,6 +329,8 @@ def run_counterfactual_action_experiment(
             num_discharge_summaries=config.oracle_num_discharge_summaries,
             relative_report_codes=config.oracle_relative_report_codes,
             pre_icu_history_hours=config.oracle_pre_icu_history_hours,
+            history_context_hours=config.oracle_context_history_hours,
+            future_context_hours=config.oracle_context_future_hours,
         )
 
         if selected_window_index < 1 or selected_window_index > len(windows):
@@ -354,7 +356,7 @@ def run_counterfactual_action_experiment(
         )
         injected_window["window_index"] = selected_window_index
 
-        report = oracle.evaluate_window(injected_window, trajectory)
+        report = oracle.evaluate_window(injected_window)
         report_dict = report.to_dict() if hasattr(report, "to_dict") else {}
 
         llm_calls = oracle.pop_patient_llm_call_logs(subject_id=subject_id, icu_stay_id=icu_stay_id)

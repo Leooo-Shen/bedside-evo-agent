@@ -309,18 +309,16 @@ def _build_oracle_trend_rows(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if not status_label and not action_labels:
             continue
 
-        trend_rows_by_window[window_index] = (
-            {
-                "window_index": window_index,
-                "hours_since_admission": hours_since_admission,
-                "status_label": status_label,
-                "status_score": status_score,
-                "action_labels": action_labels,
-                "action_score": action_score,
-                "action_total": len(action_labels),
-                "action_scorable": len(action_scores),
-            }
-        )
+        trend_rows_by_window[window_index] = {
+            "window_index": window_index,
+            "hours_since_admission": hours_since_admission,
+            "status_label": status_label,
+            "status_score": status_score,
+            "action_labels": action_labels,
+            "action_score": action_score,
+            "action_total": len(action_labels),
+            "action_scorable": len(action_scores),
+        }
 
     trend_rows = list(trend_rows_by_window.values())
     trend_rows.sort(key=lambda row: row["window_index"])
@@ -472,9 +470,7 @@ def _build_oracle_trend_table(rows: List[Dict[str, Any]]) -> str:
         "<div class='trend-table-wrap'><table><thead><tr>"
         "<th>Window</th><th>ICU Hour</th><th>Patient Status</th><th>Status Score</th>"
         "<th>Action Labels</th><th>Action Score</th><th>Scorable Actions</th>"
-        "</tr></thead><tbody>"
-        + "".join(table_rows)
-        + "</tbody></table></div></details>"
+        "</tr></thead><tbody>" + "".join(table_rows) + "</tbody></table></div></details>"
     )
 
 
@@ -631,14 +627,11 @@ def _build_oracle_trend_section(calls: List[Dict[str, Any]], output_dir: Optiona
         )
         average_action_score = weighted_sum / total_scorable_actions
 
-    non_scorable_count = sum(
-        count for label, count in action_counter.items() if label in NON_SCORABLE_ACTION_LABELS
-    )
+    non_scorable_count = sum(count for label, count in action_counter.items() if label in NON_SCORABLE_ACTION_LABELS)
 
     status_mapping_text = "deteriorating=-1, fluctuating=-0.5, stable=0.5, improving=1"
     action_mapping_text = (
-        "potentially_harmful=-1, suboptimal/non_adherent=-0.5, "
-        "neutral=0, appropriate/adherent/optimal=1"
+        "potentially_harmful=-1, suboptimal/non_adherent=-0.5, " "neutral=0, appropriate/adherent/optimal=1"
     )
     saved_figures_html = ""
     if figure_files:
@@ -742,7 +735,15 @@ def save_llm_calls_html(patient_logs: Dict[str, Any], output_path: Path) -> None
         output_tokens = call.get("output_tokens", 0)
         timestamp = escape(str(call.get("timestamp", "")))
 
-        metadata_text = _format_json_block(call.get("metadata", {}))
+        # not show the context_history_events, context_current_window_events, context_future_events from metadata to avoid overwhelming the display with long event lists; these can be inspected in the raw JSON if needed
+        meta_data = call.get("metadata", {})
+        if isinstance(meta_data, dict):
+            meta_data = {
+                k: v
+                for k, v in meta_data.items()
+                if k not in {"context_history_events", "context_current_window_events", "context_future_events"}
+            }
+        metadata_text = _format_json_block(meta_data)
         parsed_text = _format_json_block(call.get("parsed_response"))
         prompt_text = call.get("prompt")
         if prompt_text is None:

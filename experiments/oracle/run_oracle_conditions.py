@@ -564,6 +564,8 @@ def _run_single_condition(
                 num_discharge_summaries=config.oracle_num_discharge_summaries,
                 relative_report_codes=config.oracle_relative_report_codes,
                 pre_icu_history_hours=config.oracle_pre_icu_history_hours,
+                history_context_hours=config.oracle_context_history_hours,
+                future_context_hours=config.oracle_context_future_hours,
             )
             if condition.mask_discharge_summary_outcome_terms:
                 windows = [mask_window_outcome_leakage(window) for window in windows]
@@ -575,12 +577,11 @@ def _run_single_condition(
             if window_workers > 1 and len(windows) > 1:
                 reports = oracle.evaluate_trajectory_parallel(
                     windows,
-                    trajectory=prompt_trajectory,
                     max_workers=min(window_workers, len(windows)),
                     show_progress=True,
                 )
             else:
-                reports = oracle.evaluate_trajectory(windows, trajectory=prompt_trajectory)
+                reports = oracle.evaluate_trajectory(windows)
 
             patient_dir.mkdir(parents=True, exist_ok=True)
 
