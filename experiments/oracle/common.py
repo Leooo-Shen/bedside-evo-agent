@@ -173,9 +173,6 @@ def mask_window_outcome_leakage(window: Dict[str, Any]) -> Dict[str, Any]:
         content = pre_icu_history.get("content")
         if content is not None:
             pre_icu_history["content"] = sanitize_discharge_summary_text(str(content))
-        baseline = pre_icu_history.get("baseline_content")
-        if baseline is not None:
-            pre_icu_history["baseline_content"] = mask_outcome_terms(str(baseline))
 
     current_discharge_summary = masked.get("current_discharge_summary")
     if isinstance(current_discharge_summary, MutableMapping):

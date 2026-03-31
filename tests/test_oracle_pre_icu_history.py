@@ -1,4 +1,4 @@
-"""Tests for Oracle pre-ICU history report-first behavior in the parser."""
+"""Tests for unified Oracle pre-ICU history behavior in the parser."""
 
 from __future__ import annotations
 
@@ -96,15 +96,18 @@ def test_pre_icu_report_priority_includes_discharge_and_relative_codes():
 
     assert windows
     first = windows[0]
-    assert first["pre_icu_history_source"] == "reports"
-    assert first["pre_icu_history_items"] == 3
+    assert first["pre_icu_history_source"] == "pre_icu_history"
+    assert first["pre_icu_history_items"] == 6
     report_content = str(first["pre_icu_history"]["content"] or "")
+    assert "Pre-ICU history events" in report_content
+    assert "Pre-ICU historical reports:" in report_content
     assert "Discharge Summary" in report_content
     assert "NOTE_RADIOLOGYREPORT" in report_content
     # Report headers should keep minute precision only.
     assert re.search(r"timestamp:\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2};", report_content) is not None
     assert re.search(r"timestamp:\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2};", report_content) is None
-    assert first["history_events"][0]["type"] == "pre_icu_reports"
+    assert len(first["history_events"]) == 3
+    assert first["history_events"][0]["code"] == "NOTE_DISCHARGESUMMARY"
 
 
 def test_pre_icu_report_cap_applies_per_code():
@@ -173,13 +176,17 @@ def test_pre_icu_report_cap_applies_per_code():
     assert windows
     first = windows[0]
     content = first["pre_icu_history"]["content"]
-    assert first["pre_icu_history_source"] == "reports"
-    assert first["pre_icu_history_items"] == 4
+    assert first["pre_icu_history_source"] == "pre_icu_history"
+    assert first["pre_icu_history_items"] == 10
     assert content.count("Discharge Summary") == 2
-    assert content.count("NOTE_RADIOLOGYREPORT") == 2
+    assert content.count("--- Report") == 4
+    report_section = content.split("Pre-ICU historical reports:", 1)[1]
+    assert "rad newest" in report_section
+    assert "rad older" in report_section
+    assert "rad oldest" not in report_section
 
 
-def test_pre_icu_fallback_uses_previous_72h_events_only():
+def test_pre_icu_history_uses_previous_72h_events_only_when_no_reports():
     parser = MIMICDataParser("unused_events.parquet", "unused_icu.parquet")
     trajectory = _build_trajectory(subject_id=2)
     enter = pd.to_datetime(trajectory["enter_time"])
@@ -222,14 +229,14 @@ def test_pre_icu_fallback_uses_previous_72h_events_only():
 
     assert windows
     first = windows[0]
-    assert first["pre_icu_history_source"] == "events_fallback"
+    assert first["pre_icu_history_source"] == "pre_icu_history"
     assert first["pre_icu_history_items"] == len(first["history_events"])
-    fallback_content = first["pre_icu_history"]["content"]
-    assert fallback_content is not None
-    assert "[2024-" not in fallback_content
-    assert "[H0]" in fallback_content
-    assert "[H1]" in fallback_content
-    assert "LAB_TEST Lactate =7.20" in fallback_content
+    history_content = first["pre_icu_history"]["content"]
+    assert history_content is not None
+    assert "[2024-" not in history_content
+    assert "[H0]" in history_content
+    assert "[H1]" in history_content
+    assert "LAB_TEST Lactate =7.20" in history_content
 
     earliest = enter - timedelta(hours=72)
     for event in first["history_events"]:
@@ -271,7 +278,7 @@ def test_pre_icu_history_opt_in_disabled():
     assert first["pre_icu_history"]["content"] is None
 
 
-def test_pre_icu_baseline_snapshot_includes_all_lab_and_vital_events_in_window():
+def test_pre_icu_history_content_includes_all_events_in_window_without_baseline_field():
     parser = MIMICDataParser("unused_events.parquet", "unused_icu.parquet")
     trajectory = _build_trajectory(subject_id=4)
     enter = pd.to_datetime(trajectory["enter_time"])
@@ -335,20 +342,21 @@ def test_pre_icu_baseline_snapshot_includes_all_lab_and_vital_events_in_window()
 
     assert windows
     first = windows[0]
-    baseline_content = first["pre_icu_history"]["baseline_content"]
-    assert baseline_content is not None
-    assert "Pre-ICU LAB/VITAL events" in baseline_content
-    assert "Creatinine, mg/dL" in baseline_content
-    assert "Hemoglobin, g/dL" in baseline_content
-    assert "Heart Rate, bpm" in baseline_content
-    assert "Non Invasive Blood Pressure mean, mmHg" in baseline_content
-    assert "Lactic Acid, mmol/L" not in baseline_content
-    assert "[2024-" not in baseline_content
-    assert "[H0]" in baseline_content
-    assert "[H3]" in baseline_content
-    # Baseline event lines should keep minute precision only.
-    assert re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+LAB_TEST", baseline_content) is not None
-    assert re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+LAB_TEST", baseline_content) is None
-    assert "=2.30" in baseline_content
-    assert "=8.50" in baseline_content
-    assert first["pre_icu_history"]["baseline_events_count"] == 4
+    content = first["pre_icu_history"]["content"]
+    assert content is not None
+    assert "baseline_content" not in first["pre_icu_history"]
+    assert "baseline_events_count" not in first["pre_icu_history"]
+    assert "Pre-ICU history events" in content
+    assert "Creatinine, mg/dL" in content
+    assert "Hemoglobin, g/dL" in content
+    assert "Heart Rate, bpm" in content
+    assert "Non Invasive Blood Pressure mean, mmHg" in content
+    assert "Lactic Acid, mmol/L" not in content
+    assert "[2024-" not in content
+    assert "[H0]" in content
+    assert "[H3]" in content
+    # Event lines should keep minute precision only.
+    assert re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+LAB_TEST", content) is not None
+    assert re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+LAB_TEST", content) is None
+    assert "=2.30" in content
+    assert "=8.50" in content

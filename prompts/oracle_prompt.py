@@ -129,12 +129,11 @@ def format_pre_icu_compression_prompt(pre_icu_history: Dict[str, Any], max_summa
     payload = {
         "source": str(pre_icu_history.get("source") or "").strip(),
         "items": int(_safe_float(pre_icu_history.get("items"))),
+        "history_hours": _safe_float(pre_icu_history.get("history_hours")),
         "historical_discharge_summary_items": int(
             _safe_float(pre_icu_history.get("historical_discharge_summary_items"))
         ),
-        "report_content": str(pre_icu_history.get("content") or "").strip(),
-        "events_count": int(_safe_float(pre_icu_history.get("baseline_events_count"))),
-        "events_content": str(pre_icu_history.get("baseline_content") or "").strip(),
+        "content": str(pre_icu_history.get("content") or "").strip(),
     }
     payload_json = json.dumps(payload, indent=2, ensure_ascii=False)
     return f"""You compress pre-ICU history for repeated ICU window evaluation prompts.
@@ -404,41 +403,23 @@ def _format_pre_icu_history_lines(pre_icu_history: Any) -> List[str]:
     lines = ["## HISTORICAL PRE-ICU SUMMARY"]
 
     if not isinstance(pre_icu_history, dict):
-        lines.append("No historical pre-ICU reports provided.")
+        lines.append("No historical pre-ICU history provided.")
         return lines
 
     source = str(pre_icu_history.get("source") or "").strip().lower()
     items = int(_safe_float(pre_icu_history.get("items")))
     content = str(pre_icu_history.get("content") or "").strip()
-    fallback_hours = _safe_float(pre_icu_history.get("fallback_hours"))
+    history_hours = _safe_float(pre_icu_history.get("history_hours"))
 
     if source in {"", "none", "disabled"}:
-        lines.append("No historical pre-ICU reports provided.")
-    elif source == "llm_compressed":
-        lines.append(content if content else "No historical pre-ICU reports provided.")
-
-    elif source == "reports":
-        lines.append(content if content else "No historical pre-ICU reports provided.")
-    elif source == "events_fallback":
-        lines.append(f"({items} item(s) from previous {fallback_hours:.1f} hours)")
-        lines.append(content if content else "No historical pre-ICU reports provided.")
+        lines.append("No historical pre-ICU history provided.")
     else:
-        lines.append(f"Source: {source} ({items} item(s))")
-        lines.append(content if content else "No historical pre-ICU reports provided.")
-
-    baseline_content = str(pre_icu_history.get("baseline_content") or "").strip()
-    baseline_events_count = int(_safe_float(pre_icu_history.get("baseline_events_count")))
-    baseline_history_hours = _safe_float(pre_icu_history.get("history_hours"))
-    if baseline_history_hours <= 0:
-        baseline_history_hours = _safe_float(pre_icu_history.get("fallback_hours"))
-
-    if baseline_content:
-        lines.append("")
-        lines.append("## PRE-ICU BASELINE SNAPSHOT")
-        lines.append(
-            f"({baseline_events_count} LAB/VITAL event(s) from last {baseline_history_hours:.1f}h before ICU)"
-        )
-        lines.append(baseline_content)
+        if items > 0 and history_hours > 0:
+            lines.append(f"({items} item(s) from previous {history_hours:.1f} hours)")
+        elif items > 0:
+            lines.append(f"({items} item(s))")
+        lines.append(f"Source: {source}")
+        lines.append(content if content else "No historical pre-ICU history provided.")
 
     return lines
 

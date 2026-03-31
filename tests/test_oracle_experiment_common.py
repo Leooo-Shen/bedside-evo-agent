@@ -50,7 +50,6 @@ def test_mask_window_outcome_leakage_masks_discharge_summary_payloads() -> None:
         "current_events": [],
         "pre_icu_history": {
             "content": "Discharge Condition: Deceased",
-            "baseline_content": "No outcome text expected here but passed away is leaked.",
         },
     }
     masked = mask_window_outcome_leakage(window)
@@ -61,7 +60,6 @@ def test_mask_window_outcome_leakage_masks_discharge_summary_payloads() -> None:
     assert "[OUTCOME_MASKED]" in masked["history_events"][1]["content"]
     assert "deceased" not in masked["pre_icu_history"]["content"].lower()
     assert "Discharge Condition:" not in masked["pre_icu_history"]["content"]
-    assert "[OUTCOME_MASKED]" in masked["pre_icu_history"]["baseline_content"]
 
 
 def test_apply_prompt_outcome_mode_reverses_prompt_visible_outcome_only() -> None:

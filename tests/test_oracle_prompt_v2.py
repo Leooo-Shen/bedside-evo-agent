@@ -18,12 +18,9 @@ def test_format_oracle_prompt_contains_required_blocks():
         "current_window_end": "2024-01-01T01:30:00",
         "patient_metadata": {"age": 65.0, "gender": "F", "total_icu_duration_hours": 120.0, "survived": False},
         "pre_icu_history": {
-            "source": "reports",
+            "source": "pre_icu_history",
             "items": 1,
             "content": "--- Report 1: Discharge Summary ---\nprior admission summary",
-            "fallback_hours": 72.0,
-            "baseline_content": "Baseline labs ...\n- Creatinine, mg/dL = 1.2",
-            "baseline_events_count": 1,
             "history_hours": 72.0,
         },
         "current_events": [
@@ -66,12 +63,10 @@ def test_format_oracle_prompt_contains_required_blocks():
     assert "## HISTORICAL PRE-ICU SUMMARY" in prompt
     assert "--- Report 1: Discharge Summary ---" in prompt
     assert "prior admission summary" in prompt
-    assert "## PRE-ICU BASELINE SNAPSHOT" in prompt
-    assert "Baseline labs ..." in prompt
+    assert "Source: pre_icu_history" in prompt
     assert prompt.index("## PATIENT ICU CONTEXT WINDOW") < prompt.index("## Patient Context")
     assert prompt.index("## Patient Context") < prompt.index("## HISTORICAL PRE-ICU SUMMARY")
-    assert prompt.index("## HISTORICAL PRE-ICU SUMMARY") < prompt.index("## PRE-ICU BASELINE SNAPSHOT")
-    assert prompt.index("## PRE-ICU BASELINE SNAPSHOT") < prompt.index("## CURRENT DISCHARGE SUMMARY")
+    assert prompt.index("## HISTORICAL PRE-ICU SUMMARY") < prompt.index("## CURRENT DISCHARGE SUMMARY")
     assert '"action_evaluations"' in prompt
     assert '"overall_window_summary"' in prompt
 
@@ -100,7 +95,7 @@ def test_format_oracle_prompt_with_missing_pre_icu_history():
     assert prompt.count("## CURRENT DISCHARGE SUMMARY") == 1
     assert "(No ICU-stay-matched discharge summary found)" in prompt
     assert "## HISTORICAL PRE-ICU SUMMARY" in prompt
-    assert "No historical pre-ICU reports provided." in prompt
+    assert "No historical pre-ICU history provided." in prompt
 
 
 def test_format_oracle_prompt_can_hide_icu_outcome():
@@ -134,7 +129,6 @@ def test_format_oracle_prompt_with_llm_compressed_pre_icu_history():
             "content": "Compressed pre-ICU summary with key diagnoses, radiology, and baseline trends.",
             "compression": {
                 "original_content_chars": 2400,
-                "original_baseline_chars": 600,
                 "compressed_chars": 420,
             },
         },

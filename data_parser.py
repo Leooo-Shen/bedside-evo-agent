@@ -196,7 +196,7 @@ class PreICUHistoryProcessor:
 
     @staticmethod
     def _format_pre_icu_event_line(event: Dict[str, Any]) -> str:
-        """Format pre-ICU fallback/baseline events with shared event formatter."""
+        """Format pre-ICU history events with shared event formatter."""
         return format_shared_event_line(
             event,
             time_keys=("time",),
@@ -228,7 +228,7 @@ class PreICUHistoryProcessor:
         trajectory: Dict,
         lookback_hours: float = 72.0,
     ) -> List[Dict]:
-        """Extract pre-ICU fallback events from [enter_time-lookback_hours, enter_time)."""
+        """Extract pre-ICU events from [enter_time-lookback_hours, enter_time)."""
         events_df = self._events_df()
         if events_df is None:
             return []
@@ -255,70 +255,21 @@ class PreICUHistoryProcessor:
         return fallback_events.to_dict("records")
 
     @staticmethod
-    def format_fallback_events_content(
-        pre_icu_fallback_history_events: List[Dict],
-        pre_icu_history_fallback_hours: float,
+    def format_pre_icu_events_content(
+        pre_icu_history_events: List[Dict],
+        pre_icu_history_hours: float,
     ) -> str:
-        """Render cleaned fallback events into a compact text block."""
-        if not pre_icu_fallback_history_events:
+        """Render cleaned pre-ICU events into a compact text block."""
+        if not pre_icu_history_events:
             return ""
 
         lines = [
             (
-                "Pre-ICU fallback history events "
-                f"({len(pre_icu_fallback_history_events)} events in last {float(pre_icu_history_fallback_hours):.1f}h):"
+                "Pre-ICU history events "
+                f"({len(pre_icu_history_events)} events in last {float(pre_icu_history_hours):.1f}h):"
             )
         ]
-        display_events = PreICUHistoryProcessor._annotate_pre_icu_history_prompt_ids(pre_icu_fallback_history_events)
-        for event in display_events:
-            lines.append(PreICUHistoryProcessor._format_pre_icu_event_line(event))
-        return "\n".join(lines)
-
-    def extract_pre_icu_vital_lab_events(
-        self,
-        trajectory: Dict,
-        history_hours: float = 72.0,
-    ) -> List[Dict]:
-        """Extract pre-ICU LAB_TEST and VITALS events from [enter_time-history_hours, enter_time)."""
-        events_df = self._events_df()
-        if events_df is None:
-            return []
-        if history_hours <= 0:
-            return []
-
-        subject_id = trajectory["subject_id"]
-        current_enter_time = pd.to_datetime(trajectory["enter_time"])
-        baseline_start = current_enter_time - timedelta(hours=history_hours)
-
-        patient_events = events_df[events_df["subject_id"] == subject_id].copy()
-        if len(patient_events) == 0:
-            return []
-        if "time" not in patient_events.columns or "code" not in patient_events.columns:
-            return []
-
-        patient_events["event_time"] = pd.to_datetime(patient_events["time"], errors="coerce")
-        baseline_events = patient_events[
-            pd.notna(patient_events["event_time"])
-            & (patient_events["event_time"] >= baseline_start)
-            & (patient_events["event_time"] < current_enter_time)
-            & (patient_events["code"].isin(["LAB_TEST", VITAL_CODE]))
-        ].copy()
-        baseline_events = baseline_events.sort_values("event_time", ascending=True)
-        return baseline_events.to_dict("records")
-
-    @staticmethod
-    def format_pre_icu_vital_lab_content(
-        pre_icu_baseline_events: List[Dict],
-        history_hours: float,
-    ) -> str:
-        """Render pre-ICU LAB/VITAL events into a compact text block."""
-        if not pre_icu_baseline_events:
-            return ""
-
-        lines = [
-            "Pre-ICU LAB/VITAL events " f"({len(pre_icu_baseline_events)} events in last {float(history_hours):.1f}h):"
-        ]
-        display_events = PreICUHistoryProcessor._annotate_pre_icu_history_prompt_ids(pre_icu_baseline_events)
+        display_events = PreICUHistoryProcessor._annotate_pre_icu_history_prompt_ids(pre_icu_history_events)
         for event in display_events:
             lines.append(PreICUHistoryProcessor._format_pre_icu_event_line(event))
         return "\n".join(lines)
@@ -331,26 +282,27 @@ class PreICUHistoryProcessor:
         pre_icu_history_hours: float = 72.0,
     ) -> Dict[str, Any]:
         """
-        Build report-first pre-ICU history with fallback to recent raw events.
+        Build unified pre-ICU history content from events and optional reports.
 
         Returns:
             {
-                "source": "reports|events_fallback|none",
+                "source": "pre_icu_history|none",
                 "items": int,
                 "content": Optional[str],
-                "fallback_history_events": List[Dict],
+                "history_events": List[Dict],
+                "event_items": int,
+                "report_items": int,
                 "per_code_cap": int,
-                "baseline_content": Optional[str],
             }
         """
-        baseline_raw_events = self.extract_pre_icu_vital_lab_events(
+        pre_icu_raw_events = self.extract_fallback_events(
             trajectory=trajectory,
-            history_hours=float(pre_icu_history_hours),
+            lookback_hours=float(pre_icu_history_hours),
         )
-        pre_icu_baseline_events = self._clean_events_fn(baseline_raw_events)
-        baseline_content = self.format_pre_icu_vital_lab_content(
-            pre_icu_baseline_events,
-            history_hours=float(pre_icu_history_hours),
+        pre_icu_history_events = self._clean_events_fn(pre_icu_raw_events)
+        events_content = self.format_pre_icu_events_content(
+            pre_icu_history_events,
+            pre_icu_history_hours=float(pre_icu_history_hours),
         )
 
         per_code_cap = max(0, int(num_discharge_summaries))
@@ -365,52 +317,40 @@ class PreICUHistoryProcessor:
         historical_discharge_summary_items = int(
             sum(1 for report in selected_reports if str(report.get("code") or "").strip() == "NOTE_DISCHARGESUMMARY")
         )
+        report_content = self.format_reports_content(selected_reports) if selected_reports else ""
 
-        if selected_reports:
-            content = self.format_reports_content(selected_reports)
+        sections: List[str] = []
+        if events_content:
+            sections.append(events_content)
+        if report_content:
+            if sections:
+                sections.append("")
+            sections.append("Pre-ICU historical reports:")
+            sections.append(report_content)
+
+        content = "\n".join(sections).strip() if sections else None
+        if content:
             return {
-                "source": "reports",
-                "items": len(selected_reports),
+                "source": "pre_icu_history",
+                "items": len(pre_icu_history_events) + len(selected_reports),
+                "event_items": len(pre_icu_history_events),
+                "report_items": len(selected_reports),
                 "historical_discharge_summary_items": historical_discharge_summary_items,
                 "content": content,
-                "fallback_history_events": [],
+                "history_events": pre_icu_history_events,
                 "per_code_cap": per_code_cap,
-                "baseline_content": baseline_content if baseline_content else None,
-                "baseline_events_count": len(pre_icu_baseline_events),
-                "pre_icu_history_hours": float(pre_icu_history_hours),
-            }
-
-        fallback_raw_events = self.extract_fallback_events(
-            trajectory,
-            lookback_hours=float(pre_icu_history_hours),
-        )
-        pre_icu_fallback_history_events = self._clean_events_fn(fallback_raw_events)
-        if pre_icu_fallback_history_events:
-            content = self.format_fallback_events_content(
-                pre_icu_fallback_history_events,
-                pre_icu_history_fallback_hours=float(pre_icu_history_hours),
-            )
-            return {
-                "source": "events_fallback",
-                "items": len(pre_icu_fallback_history_events),
-                "historical_discharge_summary_items": 0,
-                "content": content,
-                "fallback_history_events": pre_icu_fallback_history_events,
-                "per_code_cap": per_code_cap,
-                "baseline_content": baseline_content if baseline_content else None,
-                "baseline_events_count": len(pre_icu_baseline_events),
                 "pre_icu_history_hours": float(pre_icu_history_hours),
             }
 
         return {
             "source": "none",
             "items": 0,
+            "event_items": 0,
+            "report_items": 0,
             "historical_discharge_summary_items": 0,
             "content": None,
-            "fallback_history_events": [],
+            "history_events": [],
             "per_code_cap": per_code_cap,
-            "baseline_content": baseline_content if baseline_content else None,
-            "baseline_events_count": len(pre_icu_baseline_events),
             "pre_icu_history_hours": float(pre_icu_history_hours),
         }
 
@@ -1042,6 +982,137 @@ class MIMICDataParser:
             lookback_hours=lookback_hours,
         )
 
+    @staticmethod
+    def _build_window_payload(
+        *,
+        trajectory: Dict,
+        current_start: pd.Timestamp,
+        current_end: pd.Timestamp,
+        enter_time: pd.Timestamp,
+        current_window_hours: float,
+        current_discharge_summary: Optional[Dict[str, Any]],
+        cleaned_history: List[Dict[str, Any]],
+        cleaned_current: List[Dict[str, Any]],
+        pre_icu_history_source: str,
+        pre_icu_history_items: int,
+        historical_discharge_summary_items: int,
+        pre_icu_history_content: Optional[str],
+        pre_icu_history_hours_applied: float,
+    ) -> Dict[str, Any]:
+        return {
+            "subject_id": trajectory["subject_id"],
+            "icu_stay_id": trajectory["icu_stay_id"],
+            "current_window_start": current_start.isoformat(),
+            "current_window_end": current_end.isoformat(),
+            "hours_since_admission": (current_start - enter_time).total_seconds() / 3600,
+            "current_window_hours": current_window_hours,
+            "patient_metadata": {
+                "age": trajectory["age_at_admission"],
+                "gender": trajectory.get("gender"),
+                "survived": trajectory["survived"],
+                "death_time": trajectory["death_time"],
+                "total_icu_duration_hours": trajectory["icu_duration_hours"],
+            },
+            "current_discharge_summary": (dict(current_discharge_summary) if current_discharge_summary else None),
+            "history_events": cleaned_history,
+            "current_events": cleaned_current,
+            "num_history_events": len(cleaned_history),
+            "num_current_events": len(cleaned_current),
+            "pre_icu_history": {
+                "source": pre_icu_history_source,
+                "items": pre_icu_history_items,
+                "historical_discharge_summary_items": historical_discharge_summary_items,
+                "content": pre_icu_history_content,
+                "history_hours": float(pre_icu_history_hours_applied),
+            },
+            "pre_icu_history_source": pre_icu_history_source,
+            "pre_icu_history_items": pre_icu_history_items,
+        }
+
+    def _create_windows_from_events_df(
+        self,
+        *,
+        events_df: pd.DataFrame,
+        trajectory: Dict[str, Any],
+        enter_time: pd.Timestamp,
+        effective_leave_time: pd.Timestamp,
+        current_window_hours: float,
+        window_step_hours: float,
+        include_pre_icu_data: bool,
+        use_discharge_summary_for_history: bool,
+        pre_icu_history_source: str,
+        pre_icu_history_items: int,
+        historical_discharge_summary_items: int,
+        pre_icu_history_content: Optional[str],
+        pre_icu_history_events: List[Dict],
+        pre_icu_history_hours_applied: float,
+        current_discharge_summary: Optional[Dict[str, Any]],
+    ) -> List[Dict]:
+        if len(events_df) == 0:
+            return []
+
+        event_time_index = pd.DatetimeIndex(pd.to_datetime(events_df["event_time"], errors="coerce"))
+        events_records = events_df.to_dict("records")
+        cleaned_events_records: Optional[List[Dict[str, Any]]] = None
+
+        use_report_history_mode = bool(include_pre_icu_data and use_discharge_summary_for_history)
+        clean_event_cache: Optional[List[Any]] = None
+        cache_sentinel = object()
+        if use_report_history_mode:
+            clean_event_cache = [cache_sentinel] * len(events_records)
+        else:
+            # Non-report-history mode can reuse prefix slices for both history/current events.
+            cleaned_events_records = self._clean_events_list(events_records)
+
+        windows = []
+        current_start = enter_time
+        while current_start < effective_leave_time:
+            current_end = min(current_start + timedelta(hours=current_window_hours), effective_leave_time)
+
+            start_idx = int(event_time_index.searchsorted(current_start, side="left"))
+            end_idx = int(event_time_index.searchsorted(current_end, side="left"))
+
+            if end_idx > start_idx:
+                if use_report_history_mode and clean_event_cache is not None:
+                    cleaned_current: List[Dict[str, Any]] = []
+                    for idx in range(start_idx, end_idx):
+                        cached = clean_event_cache[idx]
+                        if cached is cache_sentinel:
+                            cleaned = self._clean_event(events_records[idx], prev_event_time=None)
+                            clean_event_cache[idx] = cleaned if cleaned else None
+                            cached = clean_event_cache[idx]
+                        if isinstance(cached, dict) and cached:
+                            cleaned_current.append(cached)
+                else:
+                    cleaned_current = cleaned_events_records[start_idx:end_idx] if cleaned_events_records else []
+
+                if use_report_history_mode:
+                    cleaned_history = pre_icu_history_events
+                else:
+                    cleaned_history = cleaned_events_records[:start_idx] if cleaned_events_records else []
+
+                windows.append(
+                    self._build_window_payload(
+                        trajectory=trajectory,
+                        current_start=current_start,
+                        current_end=current_end,
+                        enter_time=enter_time,
+                        current_window_hours=current_window_hours,
+                        current_discharge_summary=current_discharge_summary,
+                        cleaned_history=cleaned_history,
+                        cleaned_current=cleaned_current,
+                        pre_icu_history_source=pre_icu_history_source,
+                        pre_icu_history_items=pre_icu_history_items,
+                        historical_discharge_summary_items=historical_discharge_summary_items,
+                        pre_icu_history_content=pre_icu_history_content,
+                        pre_icu_history_hours_applied=pre_icu_history_hours_applied,
+                    )
+                )
+
+            current_start += timedelta(hours=window_step_hours)
+
+        return windows
+
     def create_time_windows(
         self,
         trajectory: Dict,
@@ -1060,8 +1131,9 @@ class MIMICDataParser:
         Each window contains:
         - History: All events before current window start
           If include_pre_icu_data is True, includes pre-ICU hospital events
-          If use_discharge_summary_for_history is True, uses pre-ICU report history
-          (including historical pre-ICU discharge summaries) instead of raw history events
+          If use_discharge_summary_for_history is True, uses a unified pre-ICU history
+          block built from pre-ICU events (within pre_icu_history_hours) plus optional
+          historical pre-ICU reports.
         - Current: Events from current_start to (current_start + current_window_hours)
         - Metadata: Patient info and outcome
 
@@ -1080,7 +1152,7 @@ class MIMICDataParser:
                                          Example: use_first_n_hours_after_icu=12 uses only first 12 hours
                                          When None, uses the full ICU duration (or until outcome event)
             use_discharge_summary_for_history: Use pre-ICU report content as history context
-                                               instead of raw history events (default False).
+                                               added on top of pre-ICU events (default False).
                                                Current ICU-stay-matched discharge summary is always
                                                exposed separately in `current_discharge_summary`.
             num_discharge_summaries: Maximum number of prioritized pre-ICU reports to
@@ -1089,9 +1161,8 @@ class MIMICDataParser:
                                      up to 4 reports can be selected in total.
             relative_report_codes: Additional NOTE_* codes to consider as pre-ICU reports.
                                    NOTE_DISCHARGESUMMARY is always prioritized first.
-            pre_icu_history_hours: Pre-ICU lookback window in hours (default 72h) used for:
-                                   - fallback history events when reports are unavailable
-                                   - baseline LAB_TEST/VITALS snapshot
+            pre_icu_history_hours: Pre-ICU lookback window in hours (default 72h) used for
+                                   pre-ICU history events.
 
         Example with current=0.5, step=0.5:
             Window 0: history=[ICU_start, 0h], current=[0h, 0.5h]
@@ -1170,9 +1241,8 @@ class MIMICDataParser:
         pre_icu_history_source = "disabled"
         pre_icu_history_items = 0
         pre_icu_history_content = None
-        pre_icu_fallback_history_events: List[Dict] = []
-        pre_icu_baseline_content = None
-        pre_icu_baseline_events_count = 0
+        pre_icu_history_events: List[Dict] = []
+        historical_discharge_summary_items = 0
         pre_icu_history_hours_applied = float(pre_icu_history_hours)
         selected_discharge_summary = self._selected_discharge_summary_for_stay(
             subject_id=int(trajectory["subject_id"]),
@@ -1210,36 +1280,24 @@ class MIMICDataParser:
             pre_icu_history_items = int(pre_icu_context.get("items") or 0)
             historical_discharge_summary_items = int(pre_icu_context.get("historical_discharge_summary_items") or 0)
             pre_icu_history_content = pre_icu_context.get("content")
-            pre_icu_fallback_history_events = pre_icu_context.get("fallback_history_events") or []
+            pre_icu_history_events = pre_icu_context.get("history_events") or []
             per_code_cap = int(pre_icu_context.get("per_code_cap") or 0)
-            pre_icu_baseline_content = pre_icu_context.get("baseline_content")
-            pre_icu_baseline_events_count = int(pre_icu_context.get("baseline_events_count") or 0)
             pre_icu_history_hours_applied = float(
                 pre_icu_context.get("pre_icu_history_hours") or pre_icu_history_hours
             )
+            report_items = int(pre_icu_context.get("report_items") or 0)
+            event_items = int(pre_icu_context.get("event_items") or 0)
 
-            if pre_icu_history_source == "reports" and pre_icu_history_content:
+            if pre_icu_history_content:
                 print(
-                    "  Using historical pre-ICU reports as history context "
-                    f"({pre_icu_history_items} report(s), max {per_code_cap} per code, "
+                    "  Built unified pre-ICU history context "
+                    f"({event_items} event(s) from previous {pre_icu_history_hours_applied:.1f}h, "
+                    f"{report_items} report(s), max {per_code_cap} per code, "
                     f"{len(pre_icu_history_content)} characters, "
                     f"historical discharge summaries: {historical_discharge_summary_items})"
                 )
-            elif pre_icu_history_source == "events_fallback":
-                print(
-                    "  No prioritized pre-ICU reports found; using fallback events "
-                    f"from previous {float(pre_icu_history_hours):.1f}h ({pre_icu_history_items} events)"
-                )
             else:
-                print("  No prioritized pre-ICU reports or fallback events found before current ICU stay")
-
-            if pre_icu_baseline_content:
-                print(
-                    "  Added pre-ICU baseline LAB/VITAL snapshot "
-                    f"({pre_icu_baseline_events_count} event(s) from previous {pre_icu_history_hours_applied:.1f}h)"
-                )
-        else:
-            historical_discharge_summary_items = 0
+                print("  No pre-ICU events or prioritized reports found before current ICU stay")
 
         # Convert events to DataFrame for easier manipulation
         events_df = pd.DataFrame(trajectory["events"])
@@ -1283,86 +1341,23 @@ class MIMICDataParser:
         if bool(icu_event_mask.any()):
             events_df.loc[icu_event_mask, "icu_event_index"] = range(int(icu_event_mask.sum()))
 
-        windows = []
-        current_start = enter_time
-
-        # Use effective_leave_time for windowing (may be earlier than actual leave_time)
-        while current_start < effective_leave_time:
-            # Calculate window boundaries
-            # IMPORTANT: Cap current_end at effective_leave_time to prevent including outcome events
-            current_end = min(current_start + timedelta(hours=current_window_hours), effective_leave_time)
-
-            # Split events into two segments: history (all events before current), current
-            # History: all events from ICU start (or pre-ICU if enabled) to current_start
-            history_events = events_df[events_df["event_time"] < current_start]
-
-            # Current: events from current_start to current_end
-            current_events = events_df[
-                (events_df["event_time"] >= current_start) & (events_df["event_time"] < current_end)
-            ]
-
-            # Only create window if there are current events to evaluate
-            if len(current_events) > 0:
-                # Clean events to reduce context size
-                cleaned_current = self._clean_events_list(current_events.to_dict("records"))
-
-                # Handle history: report-first pre-ICU history with fallback events when enabled.
-                if include_pre_icu_data and use_discharge_summary_for_history:
-                    if pre_icu_history_source == "reports" and pre_icu_history_content:
-                        cleaned_history = [
-                            {
-                                "type": "pre_icu_reports",
-                                "content": pre_icu_history_content,
-                                "note": "Prioritized pre-ICU reports",
-                            }
-                        ]
-                    elif pre_icu_history_source == "events_fallback":
-                        cleaned_history = pre_icu_fallback_history_events
-                    else:
-                        cleaned_history = []
-                else:
-                    # Use history events as normal
-                    cleaned_history = self._clean_events_list(history_events.to_dict("records"))
-
-                window = {
-                    "subject_id": trajectory["subject_id"],
-                    "icu_stay_id": trajectory["icu_stay_id"],
-                    "current_window_start": current_start.isoformat(),
-                    "current_window_end": current_end.isoformat(),
-                    "hours_since_admission": (current_start - enter_time).total_seconds() / 3600,
-                    "current_window_hours": current_window_hours,
-                    "patient_metadata": {
-                        "age": trajectory["age_at_admission"],
-                        "gender": trajectory.get("gender"),
-                        "survived": trajectory["survived"],
-                        "death_time": trajectory["death_time"],
-                        "total_icu_duration_hours": trajectory["icu_duration_hours"],
-                    },
-                    "current_discharge_summary": (
-                        dict(current_discharge_summary) if current_discharge_summary else None
-                    ),
-                    "history_events": cleaned_history,
-                    "current_events": cleaned_current,
-                    "num_history_events": len(cleaned_history),
-                    "num_current_events": len(cleaned_current),
-                    "pre_icu_history": {
-                        "source": pre_icu_history_source,
-                        "items": pre_icu_history_items,
-                        "historical_discharge_summary_items": historical_discharge_summary_items,
-                        "content": pre_icu_history_content,
-                        "history_hours": float(pre_icu_history_hours_applied),
-                        "fallback_hours": float(pre_icu_history_hours_applied),
-                        "baseline_content": pre_icu_baseline_content,
-                        "baseline_events_count": pre_icu_baseline_events_count,
-                    },
-                    "pre_icu_history_source": pre_icu_history_source,
-                    "pre_icu_history_items": pre_icu_history_items,
-                }
-                windows.append(window)
-
-            current_start += timedelta(hours=window_step_hours)
-
-        return windows
+        return self._create_windows_from_events_df(
+            events_df=events_df,
+            trajectory=trajectory,
+            enter_time=enter_time,
+            effective_leave_time=effective_leave_time,
+            current_window_hours=current_window_hours,
+            window_step_hours=window_step_hours,
+            include_pre_icu_data=include_pre_icu_data,
+            use_discharge_summary_for_history=use_discharge_summary_for_history,
+            pre_icu_history_source=pre_icu_history_source,
+            pre_icu_history_items=pre_icu_history_items,
+            historical_discharge_summary_items=historical_discharge_summary_items,
+            pre_icu_history_content=pre_icu_history_content,
+            pre_icu_history_events=pre_icu_history_events,
+            pre_icu_history_hours_applied=pre_icu_history_hours_applied,
+            current_discharge_summary=current_discharge_summary,
+        )
 
     def extract_discharge_summary(self, trajectory: Dict, k: int = 1) -> Optional[List[Dict]]:
         """

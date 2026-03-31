@@ -569,14 +569,13 @@ class MetaOracle:
 
         source = _safe_text(pre_icu_history.get("source")).lower()
         raw_content = _safe_text(pre_icu_history.get("content"))
-        raw_baseline_content = _safe_text(pre_icu_history.get("baseline_content"))
         if source == "llm_compressed" and raw_content:
             compression_info = pre_icu_history.get("compression")
             if isinstance(compression_info, dict):
                 return dict(compression_info)
             return {"status": "already_compressed"}
 
-        if not raw_content and not raw_baseline_content:
+        if not raw_content:
             return None
 
         prompt = format_pre_icu_compression_prompt(pre_icu_history)
@@ -613,13 +612,12 @@ class MetaOracle:
             self.total_pre_icu_compression_tokens += compression_tokens
             self.total_tokens_used += compression_tokens
 
-        original_chars = len(raw_content) + len(raw_baseline_content)
+        original_chars = len(raw_content)
         compression_metadata = {
             "method": "llm",
             "step_type": PRE_ICU_COMPRESSION_STEP_TYPE,
             "original_source": source or "unknown",
             "original_content_chars": len(raw_content),
-            "original_baseline_chars": len(raw_baseline_content),
             "compressed_chars": len(compressed_text),
             "parse_source": parse_source,
             "error": compression_error,
@@ -655,7 +653,6 @@ class MetaOracle:
                 "pre_icu_history_items": first_window.get("pre_icu_history_items"),
                 "original_source": source or "unknown",
                 "original_content_chars": len(raw_content),
-                "original_baseline_chars": len(raw_baseline_content),
                 "compressed_chars": len(compressed_text),
                 "compressed_pre_icu_history": compressed_text,
                 "parse_source": parse_source,
@@ -664,9 +661,11 @@ class MetaOracle:
         )
 
         compressed_pre_icu_history = dict(pre_icu_history)
+        compressed_pre_icu_history.pop("baseline_content", None)
+        compressed_pre_icu_history.pop("baseline_events_count", None)
+        compressed_pre_icu_history.pop("fallback_hours", None)
         compressed_pre_icu_history["source"] = "llm_compressed"
         compressed_pre_icu_history["content"] = compressed_text
-        compressed_pre_icu_history["baseline_content"] = ""
         compressed_pre_icu_history["compression"] = compression_metadata
 
         applied_windows = 0
@@ -1403,8 +1402,6 @@ def _build_fallback_pre_icu_compression(pre_icu_history: Dict[str, Any]) -> str:
     items = int(_safe_float(pre_icu_history.get("items")))
     history_hours = _safe_float(pre_icu_history.get("history_hours"))
     content = _safe_text(pre_icu_history.get("content"))
-    baseline_content = _safe_text(pre_icu_history.get("baseline_content"))
-    baseline_events_count = int(_safe_float(pre_icu_history.get("baseline_events_count")))
 
     lines: List[str] = [
         f"Source: {source}",
@@ -1418,12 +1415,6 @@ def _build_fallback_pre_icu_compression(pre_icu_history: Dict[str, Any]) -> str:
         lines.extend(content_lines[:20])
     else:
         lines.append("Historical reports: none")
-
-    if baseline_content:
-        lines.append("")
-        lines.append(f"Baseline labs/vitals snapshot ({baseline_events_count} event(s), truncated):")
-        baseline_lines = [line.strip() for line in baseline_content.splitlines() if line.strip()]
-        lines.extend(baseline_lines[:12])
 
     return _truncate_text("\n".join(lines), max_chars=1800)
 

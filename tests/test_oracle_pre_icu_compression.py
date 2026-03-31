@@ -80,7 +80,7 @@ class FakeCompressionFallbackLLMClient:
 
 def _build_windows() -> list[dict]:
     pre_icu_history = {
-        "source": "reports",
+        "source": "pre_icu_history",
         "items": 2,
         "content": (
             "--- Report 1: Discharge Summary ---\n"
@@ -89,9 +89,6 @@ def _build_windows() -> list[dict]:
             "CXR: bilateral interstitial opacities concerning for pulmonary edema."
         ),
         "history_hours": 72.0,
-        "fallback_hours": 72.0,
-        "baseline_content": "B1. Creatinine 1.6 mg/dL, B2. Lactate 2.2 mmol/L",
-        "baseline_events_count": 2,
     }
     return [
         {
@@ -100,7 +97,7 @@ def _build_windows() -> list[dict]:
             "current_window_start": "2024-01-01T00:00:00",
             "current_window_end": "2024-01-01T00:30:00",
             "hours_since_admission": 0.0,
-            "pre_icu_history_source": "reports",
+            "pre_icu_history_source": "pre_icu_history",
             "pre_icu_history_items": 2,
             "pre_icu_history": dict(pre_icu_history),
         },
@@ -110,7 +107,7 @@ def _build_windows() -> list[dict]:
             "current_window_start": "2024-01-01T00:30:00",
             "current_window_end": "2024-01-01T01:00:00",
             "hours_since_admission": 0.5,
-            "pre_icu_history_source": "reports",
+            "pre_icu_history_source": "pre_icu_history",
             "pre_icu_history_items": 2,
             "pre_icu_history": dict(pre_icu_history),
         },
@@ -135,7 +132,7 @@ def test_pre_icu_history_is_compressed_once_and_reused(monkeypatch):
     for window in windows:
         assert window["pre_icu_history_source"] == "llm_compressed"
         assert window["pre_icu_history"]["source"] == "llm_compressed"
-        assert window["pre_icu_history"]["baseline_content"] == ""
+        assert "baseline_content" not in window["pre_icu_history"]
         assert "compression" in window["pre_icu_history"]
 
     llm_calls = oracle.pop_patient_llm_call_logs(subject_id=1, icu_stay_id=10)

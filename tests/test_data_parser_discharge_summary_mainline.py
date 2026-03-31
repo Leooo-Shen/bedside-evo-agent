@@ -306,7 +306,7 @@ def test_create_time_windows_prefers_selector_backed_discharge_summary(monkeypat
     assert current_summary.get("text_value") == "valid summary stay102"
 
     content = first["pre_icu_history"]["content"]
-    assert first["pre_icu_history_source"] == "reports"
+    assert first["pre_icu_history_source"] == "pre_icu_history"
     assert content is not None
     assert "valid summary stay102" not in content
     assert "early summary stay101" in content
