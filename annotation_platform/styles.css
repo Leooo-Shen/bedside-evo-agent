@@ -11,10 +11,13 @@
   --vital: #0057b8;
   --medication: #7e3af2;
   --procedure: #c2410c;
+  --note: #2563eb;
+  --diagnosis: #7c3aed;
   --neuro: #a16207;
   --vent: #0f766e;
   --lab: #4b5563;
   --disposition: #64748b;
+  --other: #334155;
 }
 
 * {
@@ -224,10 +227,46 @@ button:disabled {
   margin-top: 8px;
   display: flex;
   flex-direction: column;
+  gap: 8px;
 }
 
-.context-section-block .context-pre {
+.context-section-card {
+  border: 1px solid #dbe4ee;
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.context-section-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  padding: 8px 10px;
+  background: #eef5fc;
+}
+
+.context-section-summary::-webkit-details-marker {
+  display: none;
+}
+
+.context-section-summary::before {
+  content: "▸";
+  color: #0f3f73;
+  font-size: 0.78rem;
+  line-height: 1;
+}
+
+.context-section-card[open] .context-section-summary::before {
+  content: "▾";
+}
+
+.context-section-card .context-pre {
   margin: 0;
+  border: 0;
+  border-top: 1px solid #dbe4ee;
+  border-radius: 0;
 }
 
 .context-section-title {
@@ -239,9 +278,8 @@ button:disabled {
   margin: 0 0 6px;
 }
 
-.context-section-separator {
-  margin: 8px 0;
-  border-top: 1px dashed #cbd5e1;
+.context-section-summary .context-section-title {
+  margin: 0;
 }
 
 .history-events-list {
@@ -521,6 +559,14 @@ button:disabled {
   border-left-color: var(--procedure);
 }
 
+.event-note {
+  border-left-color: var(--note);
+}
+
+.event-diagnosis {
+  border-left-color: var(--diagnosis);
+}
+
 .event-neuro {
   border-left-color: var(--neuro);
 }
@@ -535,6 +581,10 @@ button:disabled {
 
 .event-disposition {
   border-left-color: var(--disposition);
+}
+
+.event-other {
+  border-left-color: var(--other);
 }
 
 .task-section {

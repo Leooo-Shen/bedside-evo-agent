@@ -30,8 +30,8 @@ import pandas as pd
 from config.config import get_config
 from data_parser import MIMICDataParser
 from model.llms import LLMClient
-from prompts.predictor_prompts import get_prediction_prompt
-from utils.outcome_utils import evaluate_outcome_match
+from prompts.predictor_prompts import get_survival_prediction_prompt
+from utils.outcome_utils import evaluate_outcome_match, extract_survival_prediction_fields
 from utils.patient_selection import select_balanced_patients
 
 
@@ -108,7 +108,7 @@ def create_baseline_prompt(
     if task == "survival":
         # Build context string with patient info and events
         context = f"## Patient Information\n- Age: {age_str} years\n\n## Clinical Events (First 12 Hours After ICU Admission)\n{events_str}"
-        prompt = get_prediction_prompt().format(context=context)
+        prompt = get_survival_prediction_prompt().format(context=context)
 
     return prompt
 
@@ -171,11 +171,10 @@ def make_baseline_prediction(
     # Parse response
     if llm_call_error is not None:
         prediction = {
-            "survival_prediction": {
-                "outcome": "unknown",
-                "confidence": 0.0,
-                "rationale": f"LLM call failed: {llm_call_error}",
-            }
+            "prediction": "unknown",
+            "confidence": "Low",
+            "supporting_evidence": [],
+            "rationale": f"LLM call failed: {llm_call_error}",
         }
     else:
         try:
@@ -183,11 +182,10 @@ def make_baseline_prediction(
         except (json.JSONDecodeError, KeyError, TypeError):
             # Fallback if JSON parsing fails
             prediction = {
-                "survival_prediction": {
-                    "outcome": "unknown",
-                    "confidence": 0.0,
-                    "rationale": "Failed to parse prediction",
-                }
+                "prediction": "unknown",
+                "confidence": "Low",
+                "supporting_evidence": [],
+                "rationale": "Failed to parse prediction",
             }
 
     if llm_call_error is not None:
@@ -298,15 +296,14 @@ def process_single_patient_baseline(
         prediction = make_baseline_prediction(llm_client, trajectory, all_events, task=task, log_dir=log_dir)
 
         # Extract predicted outcome
-        predicted_outcome = prediction.get("survival_prediction", {}).get("outcome", "unknown")
-        confidence = prediction.get("survival_prediction", {}).get("confidence", 0.0)
+        predicted_outcome, confidence = extract_survival_prediction_fields(prediction)
         is_correct, normalized_predicted_outcome, normalized_actual_outcome = evaluate_outcome_match(
             predicted=predicted_outcome,
             actual=actual_outcome,
         )
 
         # Print summary
-        print(f"   Predicted: {predicted_outcome.upper()} (confidence: {confidence:.2f})")
+        print(f"   Predicted: {predicted_outcome.upper()} (confidence: {confidence})")
         print(f"   Result: {'✓ CORRECT' if is_correct else '✗ INCORRECT'}")
 
         # Get metadata for results
@@ -483,9 +480,18 @@ def main(
             print(f"   Correct: {died_correct}")
             print(f"   Accuracy: {died_accuracy:.2%}")
 
-        # Average confidence
-        avg_confidence = sum(r["confidence"] for r in all_results) / len(all_results)
-        print(f"\nAverage Confidence: {avg_confidence:.2f}")
+        confidence_distribution = {"Low": 0, "Moderate": 0, "High": 0, "Unknown": 0}
+        for item in all_results:
+            label = item.get("confidence", "Unknown")
+            if label in confidence_distribution:
+                confidence_distribution[label] += 1
+            else:
+                confidence_distribution["Unknown"] += 1
+        print("\nConfidence Distribution:")
+        print(f"   Low: {confidence_distribution['Low']}")
+        print(f"   Moderate: {confidence_distribution['Moderate']}")
+        print(f"   High: {confidence_distribution['High']}")
+        print(f"   Unknown: {confidence_distribution['Unknown']}")
 
         # Average events used
         avg_events = sum(r["num_events_used"] for r in all_results) / len(all_results)
@@ -505,7 +511,7 @@ def main(
             "died_patients": len(died_results),
             "died_correct": died_correct if died_results else 0,
             "died_accuracy": died_accuracy if died_results else 0,
-            "average_confidence": avg_confidence,
+            "confidence_distribution": confidence_distribution,
             "average_events_used": avg_events,
             "individual_results": all_results,
         }

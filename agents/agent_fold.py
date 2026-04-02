@@ -559,11 +559,10 @@ class FoldAgent:
         except Exception as e:
             print(f"Error parsing prediction: {e}")
             return {
-                "survival_prediction": {
-                    "outcome": "unknown",
-                    "confidence": 0.0,
-                    "rationale": f"Parsing error: {e}",
-                }
+                "prediction": "unknown",
+                "confidence": "Low",
+                "supporting_evidence": [],
+                "rationale": f"Parsing error: {e}",
             }
 
     def run_patient_trajectory(

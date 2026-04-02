@@ -1,6 +1,6 @@
 """Prompt templates for AgentFold with dynamic trajectory folding."""
 
-from prompts.predictor_prompts import get_prediction_prompt
+from prompts.predictor_prompts import get_survival_prediction_prompt as get_shared_survival_prediction_prompt
 
 
 def get_window_update_prompt() -> str:
@@ -88,4 +88,4 @@ Analyze the latest patient data and provide your update."""
 
 
 def get_survival_prediction_prompt() -> str:
-    return get_prediction_prompt()
+    return get_shared_survival_prediction_prompt()

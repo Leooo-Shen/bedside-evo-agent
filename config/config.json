@@ -32,8 +32,8 @@
     "current_window_hours": 0.5,
     "window_step_hours": 1,
     "include_pre_icu_data": true,
-    "use_discharge_summary_for_history": false,
-    "num_discharge_summaries": 3
+    "use_discharge_summary_for_history": true,
+    "num_discharge_summaries": 2
   },
   "llm": {
     "provider": "openai",

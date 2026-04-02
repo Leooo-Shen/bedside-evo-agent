@@ -217,11 +217,10 @@ class PredictorAgent:
             print(f"Error parsing prediction: {e}")
             return (
                 {
-                    "survival_prediction": {
-                        "outcome": "unknown",
-                        "confidence": 0.0,
-                        "rationale": f"Parsing error: {e}",
-                    }
+                    "prediction": "unknown",
+                    "confidence": "Low",
+                    "supporting_evidence": [],
+                    "rationale": f"Parsing error: {e}",
                 },
                 content,
                 usage,
@@ -607,7 +606,7 @@ class MultiAgent:
         Returns:
             Tuple of (parsed_prediction, raw_response, usage, formatted_prompt)
         """
-        from prompts.predictor_prompts import get_prediction_prompt
+        from prompts.predictor_prompts import get_survival_prediction_prompt
 
         # Build context with patient metadata and observer summaries
         context_parts = []
@@ -672,7 +671,7 @@ class MultiAgent:
             context_parts.append("")
 
         context_text = "\n".join(context_parts)
-        prompt = get_prediction_prompt(
+        prompt = get_survival_prediction_prompt(
             observation_hours=self.observation_hours,
         ).format(context=context_text)
 
@@ -687,11 +686,10 @@ class MultiAgent:
             print(f"Error parsing prediction: {e}")
             return (
                 {
-                    "survival_prediction": {
-                        "outcome": "unknown",
-                        "confidence": 0.0,
-                        "rationale": f"Parsing error: {e}",
-                    }
+                    "prediction": "unknown",
+                    "confidence": "Low",
+                    "supporting_evidence": [],
+                    "rationale": f"Parsing error: {e}",
                 },
                 content,
                 usage,

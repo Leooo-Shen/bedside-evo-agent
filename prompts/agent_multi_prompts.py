@@ -1,6 +1,6 @@
 """Prompt templates for Multi-Agent pipeline (Observer + Memory + Predictor)."""
 
-from prompts.predictor_prompts import get_prediction_prompt
+from prompts.predictor_prompts import get_survival_prediction_prompt
 
 
 def get_observer_prompt() -> str:
@@ -119,7 +119,7 @@ def get_predictor_prompt(observation_hours: float = 12.0) -> str:
     Args:
         observation_hours: Number of hours observed after ICU admission
     """
-    return get_prediction_prompt(observation_hours=observation_hours)
+    return get_survival_prediction_prompt(observation_hours=observation_hours)
 
 
 def get_reflection_agent_prompt() -> str:

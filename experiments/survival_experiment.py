@@ -28,7 +28,7 @@ from agents.remem import PatientState, RememAgent
 from config.config import get_config
 from data_parser import MIMICDataParser
 from utils.llm_log_viewer import build_pipeline_agents, save_llm_calls_html
-from utils.outcome_utils import evaluate_outcome_match
+from utils.outcome_utils import evaluate_outcome_match, extract_survival_prediction_fields
 from utils.patient_selection import select_balanced_patients
 
 OBSERVER_CACHE_VERSION = 1
@@ -381,15 +381,14 @@ def process_single_patient(
             window_states = []  # FoldAgent doesn't use window_states in the same way
 
         # Evaluate prediction
-        predicted_outcome = prediction.get("survival_prediction", {}).get("outcome", "unknown")
-        confidence = prediction.get("survival_prediction", {}).get("confidence", 0.0)
+        predicted_outcome, confidence = extract_survival_prediction_fields(prediction)
         is_correct, normalized_predicted_outcome, normalized_actual_outcome = evaluate_outcome_match(
             predicted=predicted_outcome,
             actual=actual_outcome,
         )
 
         if verbose:
-            print(f"   Predicted: {predicted_outcome.upper()} (confidence: {confidence:.2f})")
+            print(f"   Predicted: {predicted_outcome.upper()} (confidence: {confidence})")
             print(f"   Result: {'✓ CORRECT' if is_correct else '✗ INCORRECT'}")
 
         # Create patient-specific directory
@@ -702,8 +701,18 @@ def run_experiment(
             died_correct = sum(1 for r in died_results if r["is_correct"])
             print(f"Died: {len(died_results)} patients, {died_correct} correct ({died_correct/len(died_results):.2%})")
 
-        avg_confidence = sum(r["confidence"] for r in all_results) / len(all_results)
-        print(f"\nAverage Confidence: {avg_confidence:.2f}")
+        confidence_distribution = {"Low": 0, "Moderate": 0, "High": 0, "Unknown": 0}
+        for item in all_results:
+            label = item.get("confidence", "Unknown")
+            if label in confidence_distribution:
+                confidence_distribution[label] += 1
+            else:
+                confidence_distribution["Unknown"] += 1
+        print("\nConfidence Distribution:")
+        print(f"  Low: {confidence_distribution['Low']}")
+        print(f"  Moderate: {confidence_distribution['Moderate']}")
+        print(f"  High: {confidence_distribution['High']}")
+        print(f"  Unknown: {confidence_distribution['Unknown']}")
 
         # Agent statistics
         stats = agent.get_statistics()
@@ -744,7 +753,7 @@ def run_experiment(
             "total_patients": total,
             "correct_predictions": correct,
             "accuracy": accuracy,
-            "avg_confidence": avg_confidence,
+            "confidence_distribution": confidence_distribution,
             "agent_stats": stats,
             "individual_results": all_results,
         }

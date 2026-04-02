@@ -39,12 +39,18 @@ def get_insight_agent_prompt() -> str:
 You will be given:
 - An observation of the current window, including critical events and a summary
 - The patient's existing hypothesis bank
+- Patient metadata including compressed pre-ICU history
 
 Your task is to update the hypothesis bank by reasoning about what makes THIS patient physiologically or clinically distinct: not to summarize events, but to detect signal that would matter for individualized prognosis or treatment.
 
 
 ## EXISTING HYPOTHESES
 {hypothesis_bank}
+
+---
+
+## PATIENT METADATA
+{patient_metadata}
 
 ---
 

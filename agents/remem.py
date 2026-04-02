@@ -580,11 +580,10 @@ class RememAgent:
         # If loop exhausted, force a prediction
         print(f"Warning: Max iterations reached, forcing prediction")
         return {
-            "survival_prediction": {
-                "outcome": "unknown",
-                "confidence": 0.0,
-                "rationale": "Max iterations reached without valid prediction",
-            },
+            "prediction": "unknown",
+            "confidence": "Low",
+            "supporting_evidence": [],
+            "rationale": "Max iterations reached without valid prediction",
             "prediction_metadata": {
                 "reasoning_iterations": max_iterations,
                 "window_states_pruned": len(pruned_window_ids),

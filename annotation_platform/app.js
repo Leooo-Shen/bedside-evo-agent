@@ -35,6 +35,52 @@ const PLOTTABLE_VITAL_LABEL_PATTERNS = [
 ];
 const MIN_VITAL_STAY_POINTS_FOR_PLOT = 2;
 const MIN_VITAL_STAY_WINDOW_COVERAGE_FOR_PLOT = 0.1;
+const EVENT_TYPE_OPTIONS = [
+  { value: "vital", label: "Vitals" },
+  { value: "medication", label: "Medications" },
+  { value: "procedure", label: "Procedures" },
+  { value: "lab", label: "Labs" },
+  { value: "note", label: "Notes" },
+  { value: "diagnosis", label: "Diagnosis" },
+  { value: "neuro", label: "Neuro" },
+  { value: "vent", label: "Ventilation" },
+  { value: "disposition", label: "Disposition" },
+  { value: "other", label: "Other" },
+];
+const EVENT_CODE_TYPE_MAP = {
+  VITALS: "vital",
+  BODY_INPUT: "vital",
+  BODY_OUTPUT: "vital",
+  DRUG_START: "medication",
+  DRUG_STOP: "medication",
+  DRUG_PRESCRIPTION: "medication",
+  DRUG_PREVIOUSLY: "medication",
+  PROCEDURE: "procedure",
+  ECG: "procedure",
+  ECHO: "procedure",
+  XRAY: "procedure",
+  LAB_TEST: "lab",
+  MICROBIOLOGY_TEST: "lab",
+  DIAGNOSIS: "diagnosis",
+  COMPLAINT: "diagnosis",
+  TRANSFER: "disposition",
+  SERVICE: "disposition",
+  ENTER_HOSPITALIZATION: "disposition",
+  LEAVE_HOSPITALIZATION: "disposition",
+  ENTER_ED: "disposition",
+  LEAVE_ED: "disposition",
+  ENTER_ICU: "disposition",
+  LEAVE_ICU: "disposition",
+  OTHER_EVENT: "other",
+};
+const VENT_EVENT_PATTERN = /\b(fio2|peep|vent(?:ilator|ilation)?|tidal volume|minute volume|etco2|airway pressure|intubat(?:ion|ed|e)?|extubat(?:ion|ed|e)?)\b/i;
+const NEURO_EVENT_PATTERN = /\b(gcs|rass|cam-icu|mental status|neurolog(?:y|ic)|pupil(?:s)?|delirium|sedation score)\b/i;
+const VITAL_EVENT_PATTERN = /\b(vital|heart rate|blood pressure|resp(?:iratory)? rate|spo2|oxygen saturation|temperature|mean arterial pressure|map)\b/i;
+const MEDICATION_EVENT_PATTERN = /\b(drug|medication|infusion|vasopressor|antibiotic|analgesic|sedat(?:ion|ive)|insulin)\b/i;
+const PROCEDURE_EVENT_PATTERN = /\b(procedure|line|catheter|bronch|dialysis|ecg|echo|xray|ultrasound|ct scan|mri)\b/i;
+const LAB_EVENT_PATTERN = /\b(lab(?:_test)?|microbiology|culture|blood gas|electrolyte|creatinine|lactate|hemoglobin|report|exam)\b/i;
+const DIAGNOSIS_EVENT_PATTERN = /\b(diagnosis|diagnoses|dx|problem list|complaint|condition)\b/i;
+const DISPOSITION_EVENT_PATTERN = /\b(transfer|enter|leave|admit|admission|discharge|service)\b/i;
 
 const VITAL_GUIDELINE_RULES = [
   { pattern: /\bheart\s*rate\b/i, low: 60, high: 100, unit: "bpm" },
@@ -130,6 +176,7 @@ const state = {
     totalWindows: 0,
     byLabel: new Map(),
   },
+  dischargeSummaryOpenSectionsByRound: {},
 };
 
 let loaderView = null;
@@ -373,6 +420,7 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
   state.autoSaveErrorShown = false;
   state.errorHighlights = {};
   state.vitalPlotStats = buildStayVitalPlotStats(rounds);
+  state.dischargeSummaryOpenSectionsByRound = {};
   state.currentRoundIndex = 0;
 
   let restoredDraftCount = 0;
@@ -773,6 +821,7 @@ function renderWorkspace() {
   renderCenterPanel();
   renderRightPanel();
   attachEventFilterListeners();
+  attachDischargeSummarySectionListeners();
   renderGlobalMessage();
 }
 
@@ -836,7 +885,7 @@ function renderLeftPanel() {
   const historyWindowLabel = historyHours !== null
     ? `${formatCompactNumber(historyHours)}-hour`
     : "history";
-  const dischargeSummaryHtml = formatDischargeSummaryHtml(dischargeSummaryText);
+  const dischargeSummaryHtml = formatDischargeSummaryHtml(dischargeSummaryText, round.arrayIndex);
   const historyEventsHtml = renderTimelineEvents(
     filteredHistoryEvents,
     `<div class="summary-card">No events match this filter in previous ${historyWindowLabel} window.</div>`
@@ -1649,7 +1698,7 @@ function formatAxisValue(value) {
   return (Math.round(n * 100) / 100).toFixed(2);
 }
 
-function formatDischargeSummaryHtml(dischargeSummaryText) {
+function formatDischargeSummaryHtml(dischargeSummaryText, roundArrayIndex = null) {
   const text = safeString(dischargeSummaryText);
   if (!text) {
     return `<div class="inline-meta">No ICU discharge summary context available.</div>`;
@@ -1660,31 +1709,43 @@ function formatDischargeSummaryHtml(dischargeSummaryText) {
     return `<div class="inline-meta">No ICU discharge summary context available.</div>`;
   }
 
-  const sections = parseDischargeSummarySections(normalized);
-
-  if (sections.length <= 1) {
-    return `<pre class="context-pre">${escapeHtml(normalized)}</pre>`;
-  }
+  const parsedSections = parseDischargeSummarySections(normalized);
+  const sections = parsedSections.length > 0
+    ? parsedSections
+    : [{ title: "Summary", body: normalized }];
+  const openState = getDischargeSummaryOpenSections(roundArrayIndex);
 
   return `
     <div class="context-section-list">
       ${sections
         .map((section, index) => {
-          const titleHtml = section.title
-            ? `<div class="context-section-title">${escapeHtml(section.title)}</div>`
-            : "";
-          const separator = index < sections.length - 1 ? `<div class="context-section-separator"></div>` : "";
+          const sectionTitle = safeString(section.title) || (sections.length === 1 ? "Summary" : `Section ${index + 1}`);
+          const sectionBody = safeString(section.body) || "-";
+          const isOpen = Boolean(openState[index]);
           return `
-            <div class="context-section-block">
-              ${titleHtml}
-              <pre class="context-pre">${escapeHtml(section.body)}</pre>
-            </div>
-            ${separator}
+            <details
+              class="context-section-card discharge-section-card"
+              data-discharge-section-index="${index}"
+              ${isOpen ? "open" : ""}
+            >
+              <summary class="context-section-summary">
+                <span class="context-section-title">${escapeHtml(sectionTitle)}</span>
+              </summary>
+              <pre class="context-pre">${escapeHtml(sectionBody)}</pre>
+            </details>
           `;
         })
         .join("")}
     </div>
   `;
+}
+
+function getDischargeSummaryOpenSections(roundArrayIndex) {
+  if (roundArrayIndex === null || roundArrayIndex === undefined) {
+    return {};
+  }
+  const openState = state.dischargeSummaryOpenSectionsByRound[roundArrayIndex];
+  return isObject(openState) ? openState : {};
 }
 
 function normalizeDischargeSummaryText(text) {
@@ -1699,8 +1760,14 @@ function normalizeDischargeSummaryText(text) {
   // Convert common uppercase banner lines into section headings.
   normalized = normalized.replace(/={3,}\s*([A-Z][A-Z /]+?)\s*={3,}/g, "\n\n## $1\n");
 
-  // Convert inline issue bullets (e.g., "# COPD ...") into their own headings.
-  normalized = normalized.replace(/(^|\s)#\s*([A-Za-z][^\n#]{2,80})/g, "\n\n## $2\n");
+  // Promote common issue block labels to section headings.
+  normalized = normalized.replace(/\b(ACTIVE ISSUES|INACTIVE ISSUES|TRANSITIONAL ISSUES)\b/gi, "\n\n## $1:\n");
+
+  // Convert only standalone, short hash-heading lines (not inline "# ...").
+  normalized = normalized
+    .split("\n")
+    .map((line) => normalizeDischargeSummaryHashHeadingLine(line))
+    .join("\n");
 
   // Add section breaks before common discharge-summary headings even if inline.
   const headingRegex = new RegExp(
@@ -1744,6 +1811,19 @@ function normalizeDischargeSummaryText(text) {
   // Clean up excessive empty lines introduced by normalization.
   normalized = normalized.replace(/\n{3,}/g, "\n\n");
   return normalized.trim();
+}
+
+function normalizeDischargeSummaryHashHeadingLine(line) {
+  const asString = line === null || line === undefined ? "" : String(line);
+  const headingMatch = asString.match(/^\s*#\s*([A-Za-z][A-Za-z0-9/&()'+.,\- ]{1,64})\s*:?\s*$/);
+  if (!headingMatch) {
+    return asString;
+  }
+  const title = safeString(headingMatch[1]).replace(/:\s*$/, "");
+  if (!title) {
+    return asString;
+  }
+  return `## ${title}`;
 }
 
 function parseDischargeSummarySections(normalizedText) {
@@ -3359,19 +3439,13 @@ function filterEventsByType(events, filterType) {
 }
 
 function getEventTypeCounts(events) {
-  const counts = {
-    all: events.length,
-    vital: 0,
-    medication: 0,
-    procedure: 0,
-    neuro: 0,
-    vent: 0,
-    lab: 0,
-    disposition: 0,
-  };
+  const counts = { all: events.length };
+  EVENT_TYPE_OPTIONS.forEach((option) => {
+    counts[option.value] = 0;
+  });
   events.forEach((event) => {
     const type = classifyEventType(event);
-    if (counts.hasOwnProperty(type)) {
+    if (Object.prototype.hasOwnProperty.call(counts, type)) {
       counts[type]++;
     }
   });
@@ -3379,16 +3453,12 @@ function getEventTypeCounts(events) {
 }
 
 function renderEventTypeFilter({ counts, scope = "current", compact = false }) {
-  const filterOptions = [
-    { value: "all", label: "All", count: counts.all },
-    { value: "vital", label: "Vitals", count: counts.vital },
-    { value: "medication", label: "Medications", count: counts.medication },
-    { value: "procedure", label: "Procedures", count: counts.procedure },
-    { value: "lab", label: "Labs", count: counts.lab },
-    { value: "neuro", label: "Neuro", count: counts.neuro },
-    { value: "vent", label: "Ventilation", count: counts.vent },
-    { value: "disposition", label: "Disposition", count: counts.disposition },
-  ];
+  const filterOptions = [{ value: "all", label: "All", count: counts.all }]
+    .concat(EVENT_TYPE_OPTIONS.map((option) => ({
+      value: option.value,
+      label: option.label,
+      count: counts[option.value] || 0,
+    })));
 
   const buttons = filterOptions
     .filter((opt) => opt.value === "all" || opt.count > 0)
@@ -3429,6 +3499,27 @@ function attachEventFilterListeners() {
   });
 }
 
+function attachDischargeSummarySectionListeners() {
+  const sectionCards = document.querySelectorAll(".discharge-section-card");
+  sectionCards.forEach((card) => {
+    card.addEventListener("toggle", (event) => {
+      const detailEl = event.currentTarget;
+      const round = getCurrentRound();
+      if (!round || !detailEl) {
+        return;
+      }
+      const sectionIndex = toInt(detailEl.getAttribute("data-discharge-section-index"), null);
+      if (sectionIndex === null) {
+        return;
+      }
+      if (!isObject(state.dischargeSummaryOpenSectionsByRound[round.arrayIndex])) {
+        state.dischargeSummaryOpenSectionsByRound[round.arrayIndex] = {};
+      }
+      state.dischargeSummaryOpenSectionsByRound[round.arrayIndex][sectionIndex] = detailEl.open === true;
+    });
+  });
+}
+
 function resolveFilterValue(scope) {
   if (scope === "history") {
     return state.historyEventTypeFilter;
@@ -3437,50 +3528,53 @@ function resolveFilterValue(scope) {
 }
 
 function classifyEventType(event) {
-  const code = normalizeLabel(event.code || "");
-  const specifics = normalizeLabel(event.code_specifics || "");
-  const textValue = normalizeLabel(event.text_value || "");
-  const combined = `${code} ${specifics} ${textValue}`;
+  const normalizedEvent = isObject(event) ? event : {};
+  const codeRaw = safeString(normalizedEvent.code);
+  const codeUpper = codeRaw.toUpperCase();
+  const specifics = safeString(normalizedEvent.code_specifics);
+  const textValue = safeString(normalizedEvent.text_value);
+  const combined = normalizeLabel(`${codeRaw} ${specifics} ${textValue}`);
 
-  if (combined.includes("vital")) {
-    if (specifics.includes("gcs") || specifics.includes("rass") || specifics.includes("mental")) {
-      return "neuro";
-    }
-    if (combined.includes("fio2") || combined.includes("peep") || combined.includes("vent")) {
-      return "vent";
-    }
+  const mappedByCode = EVENT_CODE_TYPE_MAP[codeUpper] || null;
+  const canSubClassify = !mappedByCode || ["vital", "procedure", "lab", "other"].includes(mappedByCode);
+  if (codeUpper.startsWith("NOTE_")) {
+    return "note";
+  }
+  if (canSubClassify && VENT_EVENT_PATTERN.test(combined)) {
+    return "vent";
+  }
+  if (canSubClassify && NEURO_EVENT_PATTERN.test(combined)) {
+    return "neuro";
+  }
+
+  if (mappedByCode) {
+    return mappedByCode;
+  }
+
+  if (codeUpper.startsWith("META_")) {
+    return "other";
+  }
+
+  if (DISPOSITION_EVENT_PATTERN.test(combined)) {
+    return "disposition";
+  }
+  if (MEDICATION_EVENT_PATTERN.test(combined)) {
+    return "medication";
+  }
+  if (PROCEDURE_EVENT_PATTERN.test(combined)) {
+    return "procedure";
+  }
+  if (DIAGNOSIS_EVENT_PATTERN.test(combined)) {
+    return "diagnosis";
+  }
+  if (LAB_EVENT_PATTERN.test(combined)) {
+    return "lab";
+  }
+  if (VITAL_EVENT_PATTERN.test(combined)) {
     return "vital";
   }
 
-  if (combined.includes("drug") || combined.includes("med") || combined.includes("iv")) {
-    return "medication";
-  }
-
-  if (
-    combined.includes("procedure")
-    || combined.includes("line")
-    || combined.includes("catheter")
-    || combined.includes("intub")
-    || combined.includes("bronch")
-    || combined.includes("dialysis")
-  ) {
-    return "procedure";
-  }
-
-  if (combined.includes("lab") || combined.includes("report") || combined.includes("exam")) {
-    return "lab";
-  }
-
-  if (
-    combined.includes("transfer")
-    || combined.includes("enter")
-    || combined.includes("leave")
-    || combined.includes("service")
-  ) {
-    return "disposition";
-  }
-
-  return "lab";
+  return "other";
 }
 
 function formatEventSource(source) {

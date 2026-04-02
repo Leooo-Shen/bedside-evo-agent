@@ -10,7 +10,7 @@ may use different prompting strategies.
 
 from typing import Dict, List
 
-from prompts.predictor_prompts import get_prediction_prompt
+from prompts.predictor_prompts import get_survival_prediction_prompt
 
 
 def format_state_update_prompt(context: str) -> str:
@@ -106,4 +106,4 @@ Respond in JSON format:
 
 def format_survival_prediction_prompt(context: str) -> str:
     """Use the shared prediction prompt, formatted with the given context."""
-    return get_prediction_prompt().format(context=context)
+    return get_survival_prediction_prompt().format(context=context)

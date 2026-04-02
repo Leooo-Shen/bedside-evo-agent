@@ -13,9 +13,13 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from model.llms import LLMClient
-from prompts.med_evo_prompts import get_event_agent_prompt, get_insight_agent_prompt, get_med_evo_predictor_prompt
+from prompts.med_evo_prompts import get_event_agent_prompt, get_insight_agent_prompt
+from prompts.oracle_prompt import format_pre_icu_compression_prompt
+from prompts.predictor_prompts import get_survival_prediction_prompt
 from utils.event_format import format_event_line as format_shared_event_line
 from utils.event_format import format_event_lines as format_shared_event_lines
+
+PRE_ICU_COMPRESSION_STEP_TYPE = "med_evo_pre_icu_history_compressor"
 
 
 def _safe_text(value: Any) -> str:
@@ -214,6 +218,36 @@ def _append_hypothesis_evidence_suffix(hypothesis: str, supporting_ids: List[int
     support_text = ", ".join(str(event_id) for event_id in supporting_ids)
     counter_text = ", ".join(str(event_id) for event_id in counter_ids)
     return f"{base} [evidence_ids +:[{support_text}] -:[{counter_text}]]"
+
+
+def _format_patient_metadata_lines(
+    patient_metadata: Optional[Dict[str, Any]],
+    *,
+    include_ids: bool = False,
+) -> List[str]:
+    if not isinstance(patient_metadata, dict) or not patient_metadata:
+        return ["- None"]
+
+    lines: List[str] = []
+    for key, value in patient_metadata.items():
+        if not include_ids and key in {"subject_id", "icu_stay_id"}:
+            continue
+
+        value_text = _safe_text(value)
+        if not value_text:
+            continue
+
+        if "\n" not in value_text:
+            lines.append(f"- {key}: {value_text}")
+            continue
+
+        lines.append(f"- {key}:")
+        for segment in value_text.splitlines():
+            segment_text = _safe_text(segment)
+            if segment_text:
+                lines.append(f"  {segment_text}")
+
+    return lines or ["- None"]
 
 
 @dataclass
@@ -486,13 +520,17 @@ class EventAgent:
     def analyze(
         self,
         working_windows: List[WorkingWindow],
+        patient_metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], str, Dict[str, Any], str, Optional[str]]:
         prompt_template = get_event_agent_prompt()
 
         history_windows = working_windows[:-1]
         current_window = working_windows[-1] if working_windows else None
 
-        window_lines: List[str] = ["## History windows"]
+        window_lines: List[str] = ["## Patient metadata"]
+        window_lines.extend(_format_patient_metadata_lines(patient_metadata))
+        window_lines.append("")
+        window_lines.append("## History windows")
         if history_windows:
             for window in history_windows:
                 window_lines.append(
@@ -546,6 +584,7 @@ class InsightAgent:
         current_insights: List[Insight],
         recent_window_summaries: List[WindowSummary],
         recent_critical_events: List[CriticalEvent],
+        patient_metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], str, Dict[str, Any], str, Optional[str]]:
         prompt_template = get_insight_agent_prompt()
 
@@ -581,7 +620,10 @@ class InsightAgent:
         else:
             critical_text = "Critical Events:\n- None"
 
+        patient_metadata_text = "\n".join(_format_patient_metadata_lines(patient_metadata))
+
         prompt = _fill_prompt_placeholder(prompt_template, "hypothesis_bank", insights_text)
+        prompt = _fill_prompt_placeholder(prompt, "patient_metadata", patient_metadata_text)
         prompt = _fill_prompt_placeholder(prompt, "window_summary", summary_text)
         prompt = _fill_prompt_placeholder(prompt, "critical_events", critical_text)
 
@@ -616,7 +658,7 @@ class PredictorAgent:
         last_window_events: List[Dict[str, Any]],
         observation_hours: float,
     ) -> Tuple[Dict[str, Any], str, Dict[str, Any], str, Optional[str]]:
-        prompt_template = get_med_evo_predictor_prompt(observation_hours=observation_hours)
+        prompt_template = get_survival_prediction_prompt(observation_hours=observation_hours)
 
         last_events_text = "\n".join(_format_event_lines(last_window_events, empty_text="- (No events)"))
 
@@ -641,11 +683,10 @@ class PredictorAgent:
 
         if parse_error is not None:
             parsed = {
-                "survival_prediction": {
-                    "outcome": "unknown",
-                    "confidence": 0.0,
-                    "rationale": f"Parsing error: {parse_error}",
-                }
+                "prediction": "unknown",
+                "confidence": "Low",
+                "supporting_evidence": [],
+                "rationale": f"Parsing error: {parse_error}",
             }
 
         return parsed, raw, usage, prompt, parse_error
@@ -708,6 +749,8 @@ class MedEvoAgent:
         self.total_event_calls = 0
         self.total_insight_calls = 0
         self.total_predictor_calls = 0
+        self.total_pre_icu_compression_calls = 0
+        self.total_pre_icu_compression_tokens = 0
         self.total_grounding_rejections = 0
         self.total_event_name_mismatches = 0
         self.total_insights_pruned = 0
@@ -741,6 +784,8 @@ class MedEvoAgent:
             "total_event_calls": self.total_event_calls,
             "total_insight_calls": self.total_insight_calls,
             "total_predictor_calls": self.total_predictor_calls,
+            "total_pre_icu_compression_calls": self.total_pre_icu_compression_calls,
+            "total_pre_icu_compression_tokens": self.total_pre_icu_compression_tokens,
             "total_grounding_rejections": self.total_grounding_rejections,
             "total_event_name_mismatches": self.total_event_name_mismatches,
             "total_insights_pruned": self.total_insights_pruned,
@@ -790,6 +835,147 @@ class MedEvoAgent:
                 metadata=log_metadata,
             )
         )
+
+    @staticmethod
+    def _first_window_pre_icu_history(windows: List[Dict[str, Any]]) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        if not windows:
+            return None
+        first_window = windows[0]
+        if not isinstance(first_window, dict):
+            return None
+        pre_icu_history = first_window.get("pre_icu_history")
+        if not isinstance(pre_icu_history, dict):
+            return None
+        return first_window, pre_icu_history
+
+    def _compress_pre_icu_history_for_windows(self, windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        first_payload = self._first_window_pre_icu_history(windows)
+        if first_payload is None:
+            return None
+
+        first_window, pre_icu_history = first_payload
+        source = _safe_text(pre_icu_history.get("source")).lower()
+        raw_content = _safe_text(pre_icu_history.get("content"))
+        if source in {"", "none", "disabled"} or not raw_content:
+            return None
+
+        if source == "llm_compressed":
+            return {
+                "summary": raw_content,
+                "source": source,
+                "items": int(_normalize_token_count(pre_icu_history.get("items"))),
+                "history_hours": _to_optional_float(pre_icu_history.get("history_hours")),
+                "historical_discharge_summary_items": int(
+                    _normalize_token_count(pre_icu_history.get("historical_discharge_summary_items"))
+                ),
+                "compression": pre_icu_history.get("compression") if isinstance(pre_icu_history, dict) else None,
+            }
+
+        prompt = format_pre_icu_compression_prompt(pre_icu_history)
+        response = self.llm_client.chat(prompt=prompt, response_format="text")
+        response_raw = _safe_text(response.get("content"))
+        response_usage = response.get("usage", {})
+
+        parse_error: Optional[str] = None
+        parsed: Dict[str, Any] = {}
+        for candidate in (response.get("parsed"), response_raw):
+            if candidate is None:
+                continue
+            try:
+                parsed = _parse_json_response(candidate)
+                parse_error = None
+                break
+            except Exception as exc:
+                parse_error = str(exc)
+
+        compressed_text = _safe_text(parsed.get("compressed_pre_icu_history"))
+        if not compressed_text and parse_error is None:
+            parse_error = "compressed_pre_icu_history missing in LLM response."
+
+        input_tokens = _normalize_token_count(response_usage.get("input_tokens", 0))
+        output_tokens = _normalize_token_count(response_usage.get("output_tokens", 0))
+        self.total_pre_icu_compression_calls += 1
+        self.total_pre_icu_compression_tokens += input_tokens + output_tokens
+
+        self._log_call(
+            step_type=PRE_ICU_COMPRESSION_STEP_TYPE,
+            window_index=-1,
+            hours_since_admission=float(first_window.get("hours_since_admission", 0.0)),
+            prompt=prompt,
+            response=response_raw,
+            usage=response_usage if isinstance(response_usage, dict) else {},
+            parsed_response=parsed if isinstance(parsed, dict) else None,
+            metadata={
+                "pre_icu_history_source": first_window.get("pre_icu_history_source"),
+                "pre_icu_history_items": first_window.get("pre_icu_history_items"),
+                "original_source": source or "unknown",
+                "original_content_chars": len(raw_content),
+                "compressed_chars": len(compressed_text),
+                "parse_error": parse_error,
+            },
+        )
+
+        if not compressed_text:
+            return None
+
+        compression_metadata = {
+            "method": "llm",
+            "step_type": PRE_ICU_COMPRESSION_STEP_TYPE,
+            "original_source": source or "unknown",
+            "original_content_chars": len(raw_content),
+            "compressed_chars": len(compressed_text),
+        }
+
+        compressed_pre_icu_history = dict(pre_icu_history)
+        compressed_pre_icu_history["source"] = "llm_compressed"
+        compressed_pre_icu_history["content"] = compressed_text
+        compressed_pre_icu_history["compression"] = compression_metadata
+
+        for window in windows:
+            if not isinstance(window, dict):
+                continue
+            if not isinstance(window.get("pre_icu_history"), dict):
+                continue
+            window["pre_icu_history"] = dict(compressed_pre_icu_history)
+            window["pre_icu_history_source"] = "llm_compressed"
+
+        return {
+            "summary": compressed_text,
+            "source": "llm_compressed",
+            "items": int(_normalize_token_count(pre_icu_history.get("items"))),
+            "history_hours": _to_optional_float(pre_icu_history.get("history_hours")),
+            "historical_discharge_summary_items": int(
+                _normalize_token_count(pre_icu_history.get("historical_discharge_summary_items"))
+            ),
+            "compression": compression_metadata,
+        }
+
+    def _build_patient_metadata_with_pre_icu_summary(
+        self,
+        *,
+        windows: List[Dict[str, Any]],
+        patient_metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        enriched = deepcopy(patient_metadata)
+        compressed_pre_icu = self._compress_pre_icu_history_for_windows(windows)
+        if not isinstance(compressed_pre_icu, dict):
+            return enriched
+
+        summary = _safe_text(compressed_pre_icu.get("summary"))
+        if not summary:
+            return enriched
+
+        enriched["pre_icu_history_summary"] = summary
+        enriched["pre_icu_history_source"] = _safe_text(compressed_pre_icu.get("source")) or "llm_compressed"
+        enriched["pre_icu_history_items"] = int(_normalize_token_count(compressed_pre_icu.get("items")))
+        history_hours = _to_optional_float(compressed_pre_icu.get("history_hours"))
+        if history_hours is not None:
+            enriched["pre_icu_history_hours"] = history_hours
+        enriched["historical_discharge_summary_items"] = int(
+            _normalize_token_count(compressed_pre_icu.get("historical_discharge_summary_items"))
+        )
+
+        return enriched
 
     def _register_event_ids(self, current_events: List[Dict[str, Any]], window_index: int) -> None:
         for event in current_events:
@@ -1152,11 +1338,18 @@ class MedEvoAgent:
         self._event_id_to_name_str = {}
         self._next_insight_id = 1
 
-        memory = MedEvoMemory(patient_metadata=deepcopy(patient_metadata))
+        patient_metadata_with_pre_icu = self._build_patient_metadata_with_pre_icu_summary(
+            windows=windows,
+            patient_metadata=patient_metadata,
+        )
+        memory = MedEvoMemory(patient_metadata=deepcopy(patient_metadata_with_pre_icu))
         memory_db = MedEvoMemoryDatabase()
 
         if verbose:
             print(f"Processing patient with {len(windows)} windows...")
+            pre_icu_summary = _safe_text(memory.patient_metadata.get("pre_icu_history_summary"))
+            if pre_icu_summary:
+                print(f"  Pre-ICU summary prepared ({len(pre_icu_summary)} chars)")
 
         processed_window_count = 0
         pending_summaries_for_insight: List[WindowSummary] = []
@@ -1181,7 +1374,8 @@ class MedEvoAgent:
             )
 
             event_parsed, event_raw, event_usage, event_prompt, event_parse_error = self.event_agent.analyze(
-                memory.working_memory
+                memory.working_memory,
+                patient_metadata=memory.patient_metadata,
             )
             self.total_event_calls += 1
 
@@ -1242,6 +1436,7 @@ class MedEvoAgent:
                         current_insights=memory.insights,
                         recent_window_summaries=pending_summaries_for_insight,
                         recent_critical_events=pending_critical_for_insight,
+                        patient_metadata=memory.patient_metadata,
                     )
                 )
                 self.total_insight_calls += 1
