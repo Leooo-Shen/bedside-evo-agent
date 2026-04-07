@@ -1,10 +1,8 @@
 "use strict";
 
 const REQUIRED_ORACLE_OUTPUT_KEYS = [
-  "patient_status",
-  "action_evaluations",
-  "recommendations",
-  "overall_window_summary",
+  "patient_assessment",
+  "action_review",
 ];
 const DOMAIN_KEYS = ["hemodynamics", "respiratory", "renal_metabolic", "neurology"];
 const PLOTTABLE_VITAL_LABEL_PATTERNS = [
@@ -108,7 +106,13 @@ const VITAL_GUIDELINE_RULES = [
 ];
 
 const STATUS_CORRECTION_OPTIONS = ["improving", "stable", "deteriorating", "insufficient_data"];
-const ACTION_CORRECTION_OPTIONS = ["appropriate", "suboptimal", "potentially_harmful", "insufficient_data"];
+const ACTION_CORRECTION_OPTIONS = ["best_practice", "acceptable", "potentially_harmful", "insufficient_data"];
+const ACTION_URGENCY_OPTIONS = [
+  { value: "immediate", label: "immediate" },
+  { value: "within_1h", label: "within_1h" },
+  { value: "within_6h", label: "within_6h" },
+  { value: "not_sure", label: "not sure" },
+];
 const RECOMMENDATION_AGREED_URGENCY_OPTIONS = [
   { value: "urgent", label: "Urgent" },
   { value: "nice_to_have", label: "Nice to have" },
@@ -141,9 +145,13 @@ const ICU_ACTION_CATEGORIES = [
   "Others",
 ];
 const MAX_ADDITIONAL_ACTION_EVIDENCE_IDS = 5;
+const VITAL_TREND_RELATIVE_CHANGE_THRESHOLD = 0.25;
+const VITAL_TREND_BASELINE_RANGE_FRACTION_THRESHOLD = 0.15;
+const VITAL_TREND_BASELINE_FRACTION_THRESHOLD = 0.2;
 const VERDICT_VALUES = new Set(["agree", "disagree", "uncertain"]);
 const STATUS_CORRECTION_VALUES = new Set(STATUS_CORRECTION_OPTIONS);
 const ACTION_CORRECTION_VALUES = new Set(ACTION_CORRECTION_OPTIONS);
+const ACTION_URGENCY_VALUES = new Set(ACTION_URGENCY_OPTIONS.map((option) => option.value));
 const RECOMMENDATION_URGENCY_VALUES = new Set(RECOMMENDATION_AGREED_URGENCY_OPTIONS.map((option) => option.value));
 const RECOMMENDATION_DOSE_VALUES = new Set(RECOMMENDATION_AGREED_DOSE_OPTIONS.map((option) => option.value));
 const AUTO_SAVE_DEBOUNCE_MS = 900;
@@ -153,9 +161,11 @@ const state = {
   loaded: false,
   predictionsData: null,
   windowContextsData: null,
+  fullWindowContextsData: null,
   sourceFiles: {
     oracle_predictions: null,
     window_contexts: null,
+    full_window_contexts: null,
   },
   rounds: [],
   invalidWindows: [],
@@ -241,25 +251,35 @@ async function onLoadFolder() {
   }
 
   const windowContextFile = resolveWindowContextsFileFromFolder(selectedFiles, predictionsFile);
+  const fullWindowContextFile = resolveFullWindowContextsFileFromFolder(selectedFiles, predictionsFile);
   await loadSessionFromFiles({
     predictionsFile,
     windowContextFile,
+    fullWindowContextFile,
     loadingMessage: "Loading case folder...",
   });
 }
 
-async function loadSessionFromFiles({ predictionsFile, windowContextFile = null, loadingMessage = "Loading files..." }) {
+async function loadSessionFromFiles({
+  predictionsFile,
+  windowContextFile = null,
+  fullWindowContextFile = null,
+  loadingMessage = "Loading files...",
+}) {
   try {
     setLoaderMessage(loadingMessage, "info");
     const predictionsData = await readJsonFile(predictionsFile);
     const windowContextsData = windowContextFile ? await readJsonFile(windowContextFile) : null;
+    const fullWindowContextsData = fullWindowContextFile ? await readJsonFile(fullWindowContextFile) : null;
 
     initializeSession({
       predictionsData,
       windowContextsData,
+      fullWindowContextsData,
       sourceFiles: {
         oracle_predictions: fileDisplayName(predictionsFile),
         window_contexts: windowContextFile ? fileDisplayName(windowContextFile) : null,
+        full_window_contexts: fullWindowContextFile ? fileDisplayName(fullWindowContextFile) : null,
       },
     });
     setLoaderMessage("", "");
@@ -305,6 +325,25 @@ function resolveWindowContextsFileFromFolder(files, predictionsFile) {
   return sameParent || pickBestRelativePathFile(candidates);
 }
 
+function resolveFullWindowContextsFileFromFolder(files, predictionsFile) {
+  const allFiles = Array.isArray(files) ? files : [];
+  const candidates = allFiles.filter((file) => safeString(file.name) === "full_window_contexts.json");
+  if (candidates.length === 0) {
+    return null;
+  }
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  const predictionsParent = fileParentPath(predictionsFile);
+  if (!predictionsParent) {
+    return pickBestRelativePathFile(candidates);
+  }
+
+  const sameParent = candidates.find((file) => fileParentPath(file) === predictionsParent);
+  return sameParent || pickBestRelativePathFile(candidates);
+}
+
 function fileParentPath(file) {
   const relative = fileDisplayName(file);
   const slashIndex = relative.lastIndexOf("/");
@@ -327,7 +366,7 @@ function pickBestRelativePathFile(files) {
   return safeFiles[0];
 }
 
-function initializeSession({ predictionsData, windowContextsData, sourceFiles }) {
+function initializeSession({ predictionsData, windowContextsData, fullWindowContextsData, sourceFiles }) {
   if (!isObject(predictionsData)) {
     throw new Error("oracle_predictions.json must contain a top-level JSON object.");
   }
@@ -346,6 +385,15 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
 
   predictionsData.window_outputs.forEach((windowOutput, arrayIndex) => {
     const windowIndex = toInt(windowOutput && windowOutput.window_index, arrayIndex + 1);
+    const metadata = isObject(windowOutput && windowOutput.window_metadata) ? windowOutput.window_metadata : {};
+    const sourceWindowIndex = toInt(
+      windowOutput && windowOutput.source_window_index,
+      toInt(metadata.source_window_index, windowIndex - 1)
+    );
+    const sourceWindowPosition = toInt(
+      windowOutput && windowOutput.source_window_position,
+      toInt(metadata.source_window_position, sourceWindowIndex + 1)
+    );
     const validation = validateWindowOutput(windowOutput);
 
     if (!validation.valid) {
@@ -357,8 +405,9 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
       return;
     }
 
-    const normalizedActions = normalizeActions(windowOutput.oracle_output.action_evaluations);
-    const normalizedRecommendations = normalizeRecommendations(windowOutput.oracle_output.recommendations);
+    const actionReview = isObject(windowOutput.oracle_output.action_review) ? windowOutput.oracle_output.action_review : {};
+    const normalizedActions = normalizeActions(actionReview.evaluations);
+    const normalizedRecommendations = normalizeRecommendations(actionReview.red_flags);
     const contextEntry = resolveWindowContextEntry(windowIndex, arrayIndex, windowContextByIndex);
     const eventsResolution = resolveCurrentWindowEvents({
       windowOutput,
@@ -379,6 +428,8 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
     const round = {
       arrayIndex,
       windowIndex,
+      sourceWindowIndex,
+      sourceWindowPosition,
       windowOutput,
       oracleOutput: windowOutput.oracle_output,
       actions: normalizedActions,
@@ -408,6 +459,7 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
   state.loaded = true;
   state.predictionsData = predictionsData;
   state.windowContextsData = windowContextsData;
+  state.fullWindowContextsData = fullWindowContextsData;
   state.sourceFiles = sourceFiles;
   state.rounds = rounds;
   state.invalidWindows = invalidWindows;
@@ -419,7 +471,7 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
   state.draftKey = buildDraftStorageKey(predictionsData);
   state.autoSaveErrorShown = false;
   state.errorHighlights = {};
-  state.vitalPlotStats = buildStayVitalPlotStats(rounds);
+  state.vitalPlotStats = buildStayVitalPlotStats(rounds, fullWindowContextsData);
   state.dischargeSummaryOpenSectionsByRound = {};
   state.currentRoundIndex = 0;
 
@@ -438,6 +490,9 @@ function initializeSession({ predictionsData, windowContextsData, sourceFiles })
   }
   if (restoredDraftCount > 0) {
     statusMessages.push(`Auto-restored local draft for ${restoredDraftCount} window(s).`);
+  }
+  if (fullWindowContextsData && Array.isArray(fullWindowContextsData.window_contexts)) {
+    statusMessages.push(`Loaded full timeline contexts (${fullWindowContextsData.window_contexts.length} windows).`);
   }
   setGlobalMessage(statusMessages.join(" "), invalidWindows.length ? "warn" : "info");
 
@@ -464,30 +519,31 @@ function validateWindowOutput(windowOutput) {
     }
   });
 
-  if (!isObject(oracleOutput.patient_status)) {
-    reasons.push("oracle_output.patient_status is not an object");
+  if (!isObject(oracleOutput.patient_assessment)) {
+    reasons.push("oracle_output.patient_assessment is not an object");
   }
 
-  const overall = isObject(oracleOutput.patient_status) ? oracleOutput.patient_status.overall : null;
+  const overall = isObject(oracleOutput.patient_assessment) ? oracleOutput.patient_assessment.overall : null;
   if (!isObject(overall)) {
-    reasons.push("oracle_output.patient_status.overall is not an object");
+    reasons.push("oracle_output.patient_assessment.overall is not an object");
   } else {
     if (!safeString(overall.label)) {
-      reasons.push("oracle_output.patient_status.overall.label missing");
+      reasons.push("oracle_output.patient_assessment.overall.label missing");
     }
     if (!safeString(overall.rationale)) {
-      reasons.push("oracle_output.patient_status.overall.rationale missing");
+      reasons.push("oracle_output.patient_assessment.overall.rationale missing");
     }
   }
 
-  if (!Array.isArray(oracleOutput.action_evaluations)) {
-    reasons.push("oracle_output.action_evaluations is not an array");
-  }
-  if (!Array.isArray(oracleOutput.recommendations)) {
-    reasons.push("oracle_output.recommendations is not an array");
-  }
-  if (typeof oracleOutput.overall_window_summary !== "string") {
-    reasons.push("oracle_output.overall_window_summary is not a string");
+  if (!isObject(oracleOutput.action_review)) {
+    reasons.push("oracle_output.action_review is not an object");
+  } else {
+    if (!Array.isArray(oracleOutput.action_review.evaluations)) {
+      reasons.push("oracle_output.action_review.evaluations is not an array");
+    }
+    if (!Array.isArray(oracleOutput.action_review.red_flags)) {
+      reasons.push("oracle_output.action_review.red_flags is not an array");
+    }
   }
 
   return {
@@ -500,20 +556,14 @@ function normalizeActions(actionEvaluations) {
   const safeActions = Array.isArray(actionEvaluations) ? actionEvaluations : [];
   const normalized = safeActions.map((rawAction, index) => {
     const action = isObject(rawAction) ? rawAction : {};
-    const overall = isObject(action.overall) ? action.overall : {};
-    const contextual = isObject(action.contextual_appropriateness) ? action.contextual_appropriateness : {};
-    const guideline = isObject(action.guideline_adherence) ? action.guideline_adherence : {};
 
     const actionId = safeString(action.action_id) || `ACTION_${index + 1}`;
-    const description = safeString(action.action_description)
-      || safeString(action.action_name)
+    const description = safeString(action.action_name)
       || safeString(action.action)
+      || safeString(action.action_description)
       || "No description";
-    const overallLabel = normalizeLabel(overall.label) || normalizeLabel(contextual.label);
-    const overallRationale = safeString(overall.rationale)
-      || safeString(contextual.rationale)
-      || safeString(contextual.hindsight_usage)
-      || safeString(guideline.rationale);
+    const overallLabel = normalizeLabel(action.label);
+    const overallRationale = safeString(action.rationale);
 
     return {
       originalIndex: index,
@@ -521,8 +571,6 @@ function normalizeActions(actionEvaluations) {
       action_description: description,
       overall_label: overallLabel || "unknown",
       overall_rationale: overallRationale,
-      contextual,
-      guideline,
     };
   });
 
@@ -542,19 +590,23 @@ function normalizeRecommendations(recommendations) {
   const safeRecs = Array.isArray(recommendations) ? recommendations : [];
   const normalized = safeRecs.map((rawRec, index) => {
     const rec = isObject(rawRec) ? rawRec : {};
+    const action = safeString(rec.contraindicated_action)
+      || safeString(rec.action)
+      || safeString(rec.action_name)
+      || safeString(rec.title)
+      || "No action title";
+    const rationale = safeString(rec.reason)
+      || safeString(rec.rationale)
+      || safeString(rec.justification)
+      || safeString(rec.reasoning)
+      || "";
     return {
       originalIndex: index,
       rank: toIntOrNull(rec.rank),
       urgency: safeString(rec.urgency) || "",
-      action: safeString(rec.action)
-        || safeString(rec.action_name)
-        || safeString(rec.title)
-        || "No action title",
-      action_description: safeString(rec.action_description) || "",
-      rationale: safeString(rec.rationale)
-        || safeString(rec.justification)
-        || safeString(rec.reasoning)
-        || "",
+      action,
+      action_description: rationale,
+      rationale,
     };
   });
 
@@ -687,21 +739,30 @@ function resolveWindowContextEntry(windowIndex, arrayIndex, contextMap) {
   return null;
 }
 
+function resolveSourceWindowIndexFromContextEntry(contextEntry, fallbackWindowIndex = null) {
+  if (!isObject(contextEntry)) {
+    return toInt(fallbackWindowIndex, null);
+  }
+  const metadata = isObject(contextEntry.window_metadata) ? contextEntry.window_metadata : {};
+  return toInt(
+    contextEntry.source_window_index,
+    toInt(metadata.source_window_index, toInt(fallbackWindowIndex, null))
+  );
+}
+
 function buildInitialAnnotation(round) {
   return {
     window_key: round.windowKey,
     skip_annotation: false,
     task1_status: {
-      verdict: null,
-      correction_label: null,
-      correction_domains: [],
-      comment: null,
+      selected_label: null,
+      selected_risks: [],
+      additional_risks: [],
     },
     task2_actions: round.actions.map((action) => ({
       action_id: action.action_id,
-      verdict: null,
-      correction_label: null,
-      comment: null,
+      selected_label: null,
+      selected_urgency: null,
     })),
     task3_recommendations: round.recommendations.map((rec) => ({
       rank: rec.rank,
@@ -711,11 +772,11 @@ function buildInitialAnnotation(round) {
       agreed_dose: null,
     })),
     task3_additional_recommendations: {
-      has_additional: null,
       actions: [],
     },
     task3_red_flag_actions: {
-      actions: [],
+      selected_actions: [],
+      additional_actions: [],
     },
     task4_patient_insights: {
       insights: [],
@@ -733,12 +794,12 @@ function normalizeAnnotationForRound(round, rawAnnotation) {
   normalized.skip_annotation = skipAnnotation === true;
 
   const rawTask1 = isObject(rawAnnotation.task1_status) ? rawAnnotation.task1_status : {};
-  normalized.task1_status.verdict = normalizeEnumValue(rawTask1.verdict, VERDICT_VALUES);
-  normalized.task1_status.correction_label = normalizeEnumValue(rawTask1.correction_label, STATUS_CORRECTION_VALUES);
-  normalized.task1_status.correction_domains = Array.isArray(rawTask1.correction_domains)
-    ? rawTask1.correction_domains.map((item) => safeString(item)).filter((item) => item.length > 0)
-    : [];
-  normalized.task1_status.comment = safeString(rawTask1.comment) || null;
+  const activeRiskNames = getOracleActiveRiskNames(round.oracleOutput.patient_assessment);
+  const activeRiskNameSet = new Set(activeRiskNames.map((name) => normalizeLabel(name)));
+  normalized.task1_status.selected_label = normalizeEnumValue(rawTask1.selected_label, STATUS_CORRECTION_VALUES);
+  normalized.task1_status.selected_risks = normalizeRiskNameList(rawTask1.selected_risks)
+    .filter((riskName) => activeRiskNameSet.has(normalizeLabel(riskName)));
+  normalized.task1_status.additional_risks = normalizeRiskNameList(rawTask1.additional_risks);
 
   const rawTask2 = Array.isArray(rawAnnotation.task2_actions) ? rawAnnotation.task2_actions : [];
   const rawTask2ByActionId = new Map();
@@ -756,11 +817,16 @@ function normalizeAnnotationForRound(round, rawAnnotation) {
     if (!rawEntry) {
       return entry;
     }
+    const selectedLabel = normalizeEnumValue(rawEntry.selected_label, ACTION_CORRECTION_VALUES);
+    const selectedUrgency = normalizeEnumValue(rawEntry.selected_urgency, ACTION_URGENCY_VALUES);
     return {
       ...entry,
-      verdict: normalizeEnumValue(rawEntry.verdict, VERDICT_VALUES),
-      correction_label: normalizeEnumValue(rawEntry.correction_label, ACTION_CORRECTION_VALUES),
-      comment: safeString(rawEntry.comment) || null,
+      selected_label: selectedLabel,
+      selected_urgency: (
+        selectedLabel === "best_practice" || selectedLabel === "acceptable"
+          ? selectedUrgency
+          : null
+      ),
     };
   });
 
@@ -781,11 +847,14 @@ function normalizeAnnotationForRound(round, rawAnnotation) {
   const rawAdditional = isObject(rawAnnotation.task3_additional_recommendations)
     ? rawAnnotation.task3_additional_recommendations
     : {};
-  normalized.task3_additional_recommendations.has_additional = normalizeNullableBoolean(rawAdditional.has_additional);
   normalized.task3_additional_recommendations.actions = getTextConfidenceItems(rawAdditional.actions);
 
   const rawRedFlags = isObject(rawAnnotation.task3_red_flag_actions) ? rawAnnotation.task3_red_flag_actions : {};
-  normalized.task3_red_flag_actions.actions = getTextConfidenceItems(rawRedFlags.actions);
+  const oracleRedFlagActions = getOracleContraindicatedActionNames(round.recommendations);
+  const oracleRedFlagActionSet = new Set(oracleRedFlagActions.map((action) => normalizeLabel(action)));
+  normalized.task3_red_flag_actions.selected_actions = normalizeRedFlagActionList(rawRedFlags.selected_actions)
+    .filter((action) => oracleRedFlagActionSet.has(normalizeLabel(action)));
+  normalized.task3_red_flag_actions.additional_actions = normalizeRedFlagActionList(rawRedFlags.additional_actions);
 
   const rawInsights = isObject(rawAnnotation.task4_patient_insights) ? rawAnnotation.task4_patient_insights : {};
   normalized.task4_patient_insights.insights = getTextConfidenceItems(rawInsights.insights);
@@ -888,7 +957,8 @@ function renderLeftPanel() {
   const dischargeSummaryHtml = formatDischargeSummaryHtml(dischargeSummaryText, round.arrayIndex);
   const historyEventsHtml = renderTimelineEvents(
     filteredHistoryEvents,
-    `<div class="summary-card">No events match this filter in previous ${historyWindowLabel} window.</div>`
+    `<div class="summary-card">No events match this filter in previous ${historyWindowLabel} window.</div>`,
+    { scope: "history" }
   );
 
   leftPanelEl.innerHTML = `
@@ -936,9 +1006,8 @@ function renderLeftPanel() {
         <div class="stat-grid">
           <div class="stat-pill">Task 1: ${stats.task1Done ? "Reviewed" : "Pending"}</div>
           <div class="stat-pill">Actions: ${stats.reviewedActions}/${stats.totalActions}</div>
-          <div class="stat-pill">Recs: ${stats.reviewedRecs}/${stats.totalRecs}</div>
-          <div class="stat-pill">Extra recs Q: ${stats.additionalRecommendationsDone ? "Answered" : "Pending"}</div>
-          <div class="stat-pill">Task 4: ${stats.task4Done ? "Reviewed" : "Pending"}</div>
+          <div class="stat-pill">More recommended actions: ${stats.otherActionsCount}</div>
+          <div class="stat-pill">Task 3 (optional): ${stats.task3InsightCount > 0 ? `${stats.task3InsightCount} filled` : "Not filled"}</div>
         </div>
       `
       }
@@ -959,6 +1028,8 @@ function renderCenterPanel() {
     ? "window_contexts.prompt_sections.current_observation_window"
     : (rawEvents.length > 0 ? round.rawEventSource : round.eventSource);
   const historyEvents = getPlotHistoryEvents(state.currentRoundIndex);
+  const previousWindowEvents = getPreviousWindowEvents(state.currentRoundIndex);
+  const previousWindowVitalsByLabel = buildLatestVitalValueByLabel(previousWindowEvents);
   const timelineStartMs = getTimelineStartMs();
 
   const vitalSeries = buildVitalSeries(historyEvents, currentEvents);
@@ -979,7 +1050,11 @@ function renderCenterPanel() {
   const filteredEvents = filterEventsByType(eventsForDisplay, state.currentEventTypeFilter);
   const eventListHtml = renderTimelineEvents(
     filteredEvents,
-    `<div class="summary-card">No events available for this filter in current window.</div>`
+    `<div class="summary-card">No events available for this filter in current window.</div>`,
+    {
+      scope: "current",
+      previousWindowVitalsByLabel,
+    }
   );
 
   const eventTypeCounts = getEventTypeCounts(eventsForDisplay);
@@ -1005,18 +1080,33 @@ function renderCenterPanel() {
   `;
 }
 
-function renderTimelineEvents(events, emptyHtml) {
+function renderTimelineEvents(events, emptyHtml, options = {}) {
   const safeEvents = Array.isArray(events) ? events : [];
   if (safeEvents.length === 0) {
     return emptyHtml || `<div class="summary-card">No events available.</div>`;
   }
+  const scope = safeString(options.scope) || "generic";
+  const previousWindowVitalsByLabel = options.previousWindowVitalsByLabel instanceof Map
+    ? options.previousWindowVitalsByLabel
+    : new Map();
+
   return safeEvents
     .map((event) => {
       const eventType = classifyEventType(event);
       const eventValue = formatEventValue(event);
       const eventId = resolveEventEvidenceId(event);
+      const anomalyInfo = getVitalTimelineAnomalyInfo(event, {
+        scope,
+        previousWindowVitalsByLabel,
+      });
+      const anomalyClasses = anomalyInfo && Array.isArray(anomalyInfo.classes)
+        ? anomalyInfo.classes.join(" ")
+        : "";
+      const anomalyNote = anomalyInfo && safeString(anomalyInfo.note)
+        ? `<div class="inline-meta anomaly-note">${escapeHtml(anomalyInfo.note)}</div>`
+        : "";
       return `
-        <article class="timeline-event event-${eventType}">
+        <article class="timeline-event event-${eventType} ${anomalyClasses}">
           <div class="event-top">
             <span class="time">${escapeHtml(formatTime(event.time || event.start_time || ""))}</span>
             ${eventId ? `<span class="event-id">${escapeHtml(eventId)}</span>` : ""}
@@ -1024,6 +1114,7 @@ function renderTimelineEvents(events, emptyHtml) {
           </div>
           <div>${escapeHtml(formatEventDescription(event))}</div>
           ${eventValue ? `<div class="inline-meta">Value: ${escapeHtml(eventValue)}</div>` : ""}
+          ${anomalyNote}
         </article>
       `;
     })
@@ -1034,8 +1125,7 @@ function renderRightPanel() {
   const round = getCurrentRound();
   const annotation = getCurrentAnnotation();
   const isSkipped = annotation.skip_annotation === true;
-  const patientStatus = round.oracleOutput.patient_status;
-  const overall = isObject(patientStatus.overall) ? patientStatus.overall : {};
+  const patientStatus = round.oracleOutput.patient_assessment;
 
   rightPanelEl.innerHTML = `
     <h2>Annotation Tasks</h2>
@@ -1049,10 +1139,11 @@ function renderRightPanel() {
       </section>
     `
         : `
-      ${renderTask1(overall, annotation)}
-      ${renderTask2(round, annotation)}
-      ${renderTask3(round, annotation)}
-      ${renderTask4(annotation)}
+      ${renderTask1(patientStatus, annotation)}
+      ${renderTask12RiskFactors(patientStatus, annotation)}
+      ${renderTask21ActionEvaluation(round, annotation)}
+      ${renderTask22RedFlags(round, annotation)}
+      ${renderTask3PatientInsights(annotation)}
     `
     }
   `;
@@ -1076,302 +1167,263 @@ function renderSkipControl(annotation) {
   `;
 }
 
-function renderTask1(overall, annotation) {
+function renderTask1(patientStatus, annotation) {
   const task1 = annotation.task1_status;
+  const overall = isObject(patientStatus && patientStatus.overall) ? patientStatus.overall : {};
   const overallLabel = normalizeLabel(overall.label) || "unknown";
   const overallTone = overallToneClass(overallLabel);
-  const verdictErrorClass = hasCurrentHighlight("task1.verdict") ? "error-highlight" : "";
-  const correctionErrorClass = hasCurrentHighlight("task1.correction_label") ? "error-highlight" : "";
-
-  const disagreeFields = task1.verdict === "disagree"
-    ? `
-      <div class="control-group ${correctionErrorClass}">
-        <label for="task1-correction-label">Correct label</label>
-        <select id="task1-correction-label" name="task1-correction-label">
-          <option value="">Select label</option>
-          ${STATUS_CORRECTION_OPTIONS.map((item) => {
-            const selected = task1.correction_label === item ? "selected" : "";
-            return `<option value="${item}" ${selected}>${item}</option>`;
-          }).join("")}
-        </select>
-      </div>
-
-      
-      <div class="control-group">
-        <label for="task1-comment">Comment</label>
-        <textarea id="task1-comment" placeholder="Briefly explain why you chose this label.">${escapeHtml(
-          safeString(task1.comment)
-        )}</textarea>
-      </div>
-    `
-    : "";
+  const labelErrorClass = hasCurrentHighlight("task1.selected_label") ? "error-highlight" : "";
+  const selectedLabel = normalizeEnumValue(task1.selected_label, STATUS_CORRECTION_VALUES);
 
   return `
     <section class="task-section" id="task1-section">
       <h3 class="task-title">Task 1: Patient Status</h3>
       <div class="summary-card overall-card overall-${escapeHtml(overallTone)}">
-        <div class="inline-meta"><strong>overall:</strong> <span class="badge badge-${escapeHtml(overallLabel)}">${escapeHtml(
+        <div class="inline-meta"><strong>Overall status:</strong> <span class="badge badge-${escapeHtml(overallLabel)}">${escapeHtml(
           overallLabel
         )}</span></div>
-        <div>${escapeHtml(safeString(overall.rationale) || "-")}</div>
+        <div class="inline-meta"><strong>Reason:</strong> ${escapeHtml(safeString(overall.rationale) || "-")}</div>
       </div>
 
-      <div class="verdict-row ${verdictErrorClass}">
-        ${renderVerdictChips("task1-verdict", task1.verdict)}
+      <div class="verdict-row ${labelErrorClass}">
+        ${renderOptionChips("task1-label", STATUS_CORRECTION_OPTIONS, selectedLabel)}
       </div>
-
-      ${disagreeFields}
     </section>
   `;
 }
 
-function renderTask2(round, annotation) {
+function renderTask12RiskFactors(patientStatus, annotation) {
+  const task1 = annotation.task1_status;
+  const predefinedRisks = getOracleActiveRiskNames(patientStatus);
+  const selectedRiskNames = normalizeRiskNameList(task1.selected_risks);
+  const selectedRiskKeySet = new Set(selectedRiskNames.map((riskName) => normalizeLabel(riskName)));
+  const additionalRisks = ensureStringList(task1, "additional_risks");
+  const riskOptions = predefinedRisks.length > 0
+    ? `
+      <div class="risk-chip-grid">
+        ${
+          predefinedRisks.map((riskName) => {
+            const isSelected = selectedRiskKeySet.has(normalizeLabel(riskName));
+            const selectedClass = isSelected ? "is-selected" : "";
+            return `
+              <button
+                type="button"
+                class="risk-chip ${selectedClass}"
+                data-task1-predefined-risk-name="${escapeHtml(riskName)}"
+              >${escapeHtml(riskName)}</button>
+            `;
+          }).join("")
+        }
+      </div>
+    `
+    : `<div class="inline-meta">No oracle active risks in this window.</div>`;
+
+  return `
+    <section class="task-section" id="task1-2-section">
+      <h3 class="task-title">Task 1.2: Potential Risk Factors</h3>
+      <div class="summary-card">
+        ${riskOptions}
+        <div class="task1-risk-list">
+          ${
+            additionalRisks.map((riskText, index) => `
+              <div class="task1-risk-row">
+                <input
+                  type="text"
+                  value="${escapeHtml(riskText)}"
+                  data-task1-additional-risk-index="${index}"
+                  placeholder="e.g., AKI progression"
+                />
+                <button type="button" class="secondary-btn" data-task1-additional-risk-remove-index="${index}">Remove</button>
+              </div>
+            `).join("")
+          }
+        </div>
+        <button type="button" class="secondary-btn" data-task1-additional-risk-add="1">Add more risks</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderTask21ActionEvaluation(round, annotation) {
+  const additionalRecs = annotation.task3_additional_recommendations;
+  const additionalActions = getTextConfidenceItems(additionalRecs.actions);
   const actionCards = round.actions
     .map((action, index) => {
-      const actionAnn = annotation.task2_actions[index];
+      const actionAnn = annotation.task2_actions[index] || { selected_label: null, selected_urgency: null };
       const overallTone = overallToneClass(action.overall_label);
-      const correctionErrorClass = hasCurrentHighlight(`action.${index}.correction_label`) ? "error-highlight" : "";
-      const cardErrorClass = correctionErrorClass ? "error-highlight" : "";
-      const disagreementFields = actionAnn.verdict === "disagree"
-        ? `
-          <div class="control-group ${correctionErrorClass}">
-            <label for="action-correction-${index}">Correct overall label</label>
-            <select id="action-correction-${index}" data-action-correction-index="${index}">
-              <option value="">Select label</option>
-              ${ACTION_CORRECTION_OPTIONS.map((option) => {
-                const selected = actionAnn.correction_label === option ? "selected" : "";
-                return `<option value="${option}" ${selected}>${option}</option>`;
-              }).join("")}
-            </select>
-          </div>
-
-          <div class="control-group">
-            <label for="action-comment-${index}">Comment</label>
-            <textarea id="action-comment-${index}" data-action-comment-index="${index}" placeholder="Briefly explain why you chose this label.">${escapeHtml(
-              safeString(actionAnn.comment)
-            )}</textarea>
-          </div>
-        `
-        : "";
+      const labelErrorClass = hasCurrentHighlight(`action.${index}.selected_label`) ? "error-highlight" : "";
+      const urgencyErrorClass = hasCurrentHighlight(`action.${index}.selected_urgency`) ? "error-highlight" : "";
+      const cardErrorClass = (labelErrorClass || urgencyErrorClass) ? "error-highlight" : "";
+      const selectedLabel = normalizeEnumValue(actionAnn.selected_label, ACTION_CORRECTION_VALUES);
+      const selectedUrgency = normalizeEnumValue(actionAnn.selected_urgency, ACTION_URGENCY_VALUES);
+      const needsUrgency = selectedLabel === "best_practice" || selectedLabel === "acceptable";
 
       return `
         <article class="action-card overall-card overall-${escapeHtml(overallTone)} ${cardErrorClass}" id="action-card-${index}">
           <div><strong>${escapeHtml(action.action_id)}</strong> - ${escapeHtml(action.action_description)}</div>
-          <div class="inline-meta"><strong>overall:</strong> <span class="badge badge-${escapeHtml(action.overall_label)}">${escapeHtml(
+          <div class="inline-meta"><strong>Overall label:</strong> <span class="badge badge-${escapeHtml(action.overall_label)}">${escapeHtml(
             action.overall_label
           )}</span></div>
-          <div>${escapeHtml(action.overall_rationale || "No rationale provided.")}</div>
+          <div class="inline-meta"><strong>Reason:</strong> ${escapeHtml(action.overall_rationale || "No rationale provided.")}</div>
 
-          <div class="verdict-row">
-            ${renderVerdictChips(`action-verdict-${index}`, actionAnn.verdict, {
+          <div class="verdict-row ${labelErrorClass}">
+            ${renderOptionChips(`action-label-${index}`, ACTION_CORRECTION_OPTIONS, selectedLabel, {
               "data-action-index": String(index),
             })}
           </div>
-
-          ${disagreementFields}
+          ${
+            needsUrgency
+              ? `
+                <div class="inline-meta"><strong>Urgency</strong></div>
+                <div class="verdict-row ${urgencyErrorClass}">
+                  ${renderOptionChips(`action-urgency-${index}`, ACTION_URGENCY_OPTIONS, selectedUrgency, {
+                    "data-action-urgency-index": String(index),
+                  })}
+                </div>
+              `
+              : ""
+          }
         </article>
       `;
     })
     .join("");
 
-  return `
-    <section class="task-section" id="task2-section">
-      <h3 class="task-title">Task 2: Action Evaluation</h3>
-      <div class="review-note">No routine-tier suppression. All listed actions are available for review.</div>
-      ${actionCards || `<div class="summary-card">No actions in this window.</div>`}
-    </section>
-  `;
-}
-
-function renderTask3(round, annotation) {
-  const additionalRecs = annotation.task3_additional_recommendations;
-  const additionalActions = getTextConfidenceItems(additionalRecs.actions);
-  const redFlagActions = getTextConfidenceItems(annotation.task3_red_flag_actions.actions);
-  const recommendationCards = round.recommendations
-    .map((rec, index) => {
-      const recAnn = annotation.task3_recommendations[index];
-      const urgencyErrorClass = hasCurrentHighlight(`recommendation.${index}.urgency`) ? "error-highlight" : "";
-      const doseErrorClass = hasCurrentHighlight(`recommendation.${index}.dose`) ? "error-highlight" : "";
-      const cardErrorClass = urgencyErrorClass || doseErrorClass ? "error-highlight" : "";
-      const agreementFields = recAnn.verdict === "agree"
-        ? `
-          <div class="control-group ${urgencyErrorClass}">
-            <label for="rec-urgency-${index}">Urgency</label>
-            <select id="rec-urgency-${index}" data-rec-agree-urgency-index="${index}">
-              <option value="">Select urgency</option>
-              ${RECOMMENDATION_AGREED_URGENCY_OPTIONS.map((option) => {
-                const selected = recAnn.agreed_urgency === option.value ? "selected" : "";
-                return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
-              }).join("")}
-            </select>
-          </div>
-          <div class="control-group ${doseErrorClass}">
-            <label for="rec-dose-${index}">Dose</label>
-            <select id="rec-dose-${index}" data-rec-agree-dose-index="${index}">
-              <option value="">Select dose</option>
-              ${RECOMMENDATION_AGREED_DOSE_OPTIONS.map((option) => {
-                const selected = recAnn.agreed_dose === option.value ? "selected" : "";
-                return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
-              }).join("")}
-            </select>
-          </div>
-        `
-        : "";
-
-      return `
-        <article class="rec-card ${cardErrorClass}">
-          <div><strong>${escapeHtml(formatRecommendationRank(rec))} ${escapeHtml(rec.action)}</strong></div>
-          ${rec.action_description ? `<div>${escapeHtml(rec.action_description)}</div>` : ""}
-
-          <div class="verdict-row">
-            ${renderVerdictChips(`rec-verdict-${index}`, recAnn.verdict, {
-              "data-rec-index": String(index),
-            })}
-          </div>
-
-          ${agreementFields}
-        </article>
-      `;
-    })
-    .join("");
-
-  const additionalRecommendationBlock = `
+  const additionalActionsBlock = `
     <div class="summary-card">
-      <strong>Any other recommended actions to add?</strong>
-      <div class="verdict-row ${hasCurrentHighlight("task3_additional_recommendations.has_additional") ? "error-highlight" : ""}">
-        <label class="verdict-chip"><input type="radio" name="additional-rec-verdict" value="true" ${
-          additionalRecs.has_additional === true ? "checked" : ""
-        } /> Yes</label>
-        <label class="verdict-chip"><input type="radio" name="additional-rec-verdict" value="false" ${
-          additionalRecs.has_additional === false ? "checked" : ""
-        } /> No</label>
-      </div>
-
-      ${
-        additionalRecs.has_additional === true
-          ? `
-        <div class="control-group ${hasCurrentHighlight("task3_additional_recommendations.actions") ? "error-highlight" : ""}">
-          <label>Additional recommended action(s)</label>
-          <div class="inline-meta">Choose category first, then write free text. Evidence event IDs are optional (if provided, use comma-separated IDs like 12345).</div>
-          <div class="additional-actions-list">
-            ${
-              additionalActions.map((actionItem, actionIndex) => {
-                const categoryToken = `task3_additional_recommendations.actions.${actionIndex}.category`;
-                const evidenceToken = `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`;
-                const categoryErrorClass = hasCurrentHighlight(categoryToken) ? "error-highlight" : "";
-                const evidenceErrorClass = hasCurrentHighlight(evidenceToken) ? "error-highlight" : "";
-                const categoryValue = normalizeAdditionalActionCategory(actionItem.category);
-                return `
-                  <div class="additional-action-block">
-                    <div class="additional-action-block-row">
-                      <select
-                        class="additional-action-category-select ${categoryErrorClass}"
-                        data-additional-action-category-index="${actionIndex}"
-                      >
-                        <option value="">Select category first</option>
-                        ${ICU_ACTION_CATEGORIES.map((categoryOption) => {
-                          const selected = categoryValue === categoryOption ? "selected" : "";
-                          return `<option value="${escapeHtml(categoryOption)}" ${selected}>${escapeHtml(categoryOption)}</option>`;
-                        }).join("")}
-                      </select>
-                      <select class="additional-action-confidence-select" data-additional-action-confidence-index="${actionIndex}">
-                        <option value="">confidence</option>
-                        ${FREE_TEXT_CONFIDENCE_OPTIONS.map((option) => {
-                          const selected = actionItem.confidence === option.value ? "selected" : "";
-                          return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
-                        }).join("")}
-                      </select>
-                      <button
-                        type="button"
-                        class="secondary-btn additional-action-remove-btn"
-                        data-additional-action-remove-index="${actionIndex}"
-                      >Remove block</button>
-                    </div>
-                    <div class="additional-action-block-row">
-                      <input
-                        type="text"
-                        class="additional-action-text-input"
-                        ${categoryValue ? "" : "disabled"}
-                        value="${escapeHtml(actionItem.text)}"
-                        data-additional-action-index="${actionIndex}"
-                        placeholder="${categoryValue ? "Enter one action" : "Select category first"}"
-                      />
-                      <input
-                        type="text"
-                        class="evidence-ids-input ${evidenceErrorClass}"
-                        value="${escapeHtml(actionItem.evidence_event_ids_text || "")}"
-                        data-additional-action-evidence-index="${actionIndex}"
-                        placeholder="Evidence IDs (optional): 12345"
-                      />
-                    </div>
-                  </div>
-                `;
-              }).join("")
-            }
-          </div>
-          <button type="button" class="secondary-btn" data-additional-action-add="1">Add action</button>
-        </div>
-      `
-          : ""
-      }
-    </div>
-  `;
-
-  const redFlagActionsBlock = `
-    <div class="summary-card">
-      <strong>Red flag actions to avoid</strong>
-      <div class="inline-meta">Mark clear contraindications and likely harmful actions in the current window.</div>
-      <div class="control-group">
-        <label>Actions to avoid</label>
+      <strong>More Recommended Actions?</strong>
+      <div class="control-group ${hasCurrentHighlight("task3_additional_recommendations.actions") ? "error-highlight" : ""}">
+        <label>Additional action(s)</label>
+        <div class="inline-meta">Choose category first, then write free text. Evidence event IDs are optional (if provided, use comma-separated IDs like 12345).</div>
         <div class="additional-actions-list">
           ${
-            redFlagActions.map((actionItem, actionIndex) => {
+            additionalActions.map((actionItem, actionIndex) => {
+              const categoryToken = `task3_additional_recommendations.actions.${actionIndex}.category`;
+              const evidenceToken = `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`;
+              const categoryErrorClass = hasCurrentHighlight(categoryToken) ? "error-highlight" : "";
+              const evidenceErrorClass = hasCurrentHighlight(evidenceToken) ? "error-highlight" : "";
+              const categoryValue = normalizeAdditionalActionCategory(actionItem.category);
               return `
-                <div class="additional-action-row">
-                  <input
-                    type="text"
-                    value="${escapeHtml(actionItem.text)}"
-                    data-red-flag-action-index="${actionIndex}"
-                    placeholder="Enter one red flag action per line"
-                  />
-                  <select data-red-flag-action-confidence-index="${actionIndex}">
-                    <option value="">confidence</option>
-                    ${FREE_TEXT_CONFIDENCE_OPTIONS.map((option) => {
-                      const selected = actionItem.confidence === option.value ? "selected" : "";
-                      return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
-                    }).join("")}
-                  </select>
-                  <button type="button" class="secondary-btn" data-red-flag-action-remove-index="${actionIndex}">Remove</button>
+                <div class="additional-action-block">
+                  <div class="additional-action-block-row">
+                    <select
+                      class="additional-action-category-select ${categoryErrorClass}"
+                      data-additional-action-category-index="${actionIndex}"
+                    >
+                      <option value="">Select category first</option>
+                      ${ICU_ACTION_CATEGORIES.map((categoryOption) => {
+                        const selected = categoryValue === categoryOption ? "selected" : "";
+                        return `<option value="${escapeHtml(categoryOption)}" ${selected}>${escapeHtml(categoryOption)}</option>`;
+                      }).join("")}
+                    </select>
+                    <select class="additional-action-confidence-select" data-additional-action-confidence-index="${actionIndex}">
+                      <option value="">confidence</option>
+                      ${FREE_TEXT_CONFIDENCE_OPTIONS.map((option) => {
+                        const selected = actionItem.confidence === option.value ? "selected" : "";
+                        return `<option value="${escapeHtml(option.value)}" ${selected}>${escapeHtml(option.label)}</option>`;
+                      }).join("")}
+                    </select>
+                    <button
+                      type="button"
+                      class="secondary-btn additional-action-remove-btn"
+                      data-additional-action-remove-index="${actionIndex}"
+                    >Remove block</button>
+                  </div>
+                  <div class="additional-action-block-row">
+                    <input
+                      type="text"
+                      class="additional-action-text-input"
+                      ${categoryValue ? "" : "disabled"}
+                      value="${escapeHtml(actionItem.text)}"
+                      data-additional-action-index="${actionIndex}"
+                      placeholder="${categoryValue ? "Enter one action" : "Select category first"}"
+                    />
+                    <input
+                      type="text"
+                      class="evidence-ids-input ${evidenceErrorClass}"
+                      value="${escapeHtml(actionItem.evidence_event_ids_text || "")}"
+                      data-additional-action-evidence-index="${actionIndex}"
+                      placeholder="Evidence IDs (optional): 12345"
+                    />
+                  </div>
                 </div>
               `;
             }).join("")
           }
         </div>
-        <button type="button" class="secondary-btn" data-red-flag-action-add="1">Add red flag action</button>
+        <button type="button" class="secondary-btn" data-additional-action-add="1">Add action</button>
       </div>
     </div>
   `;
 
   return `
-    <section class="task-section" id="task3-section">
-      <h3 class="task-title">Task 3: Clinical Recommendations</h3>
-      <div class="review-note">Recommendations are sorted by rank; null ranks are shown last.</div>
-      ${recommendationCards || `<div class="summary-card">No recommendations in this window.</div>`}
-      ${additionalRecommendationBlock}
-      ${redFlagActionsBlock}
+    <section class="task-section" id="task2-1-section">
+      <h3 class="task-title">Task 2.1: Action Evaluation</h3>
+      ${actionCards || `<div class="summary-card">No actions in this window.</div>`}
+      ${additionalActionsBlock}
     </section>
   `;
 }
 
-function renderTask4(annotation) {
+function renderTask22RedFlags(round, annotation) {
+  const predefinedRedFlags = getOracleContraindicatedActionNames(round.recommendations);
+  const selectedActions = normalizeRedFlagActionList(annotation.task3_red_flag_actions.selected_actions);
+  const selectedActionSet = new Set(selectedActions.map((action) => normalizeLabel(action)));
+  const additionalActions = ensureStringList(annotation.task3_red_flag_actions, "additional_actions");
+  const redFlagOptions = predefinedRedFlags.length > 0
+    ? `
+      <div class="risk-chip-grid">
+        ${
+          predefinedRedFlags.map((actionText) => {
+            const isSelected = selectedActionSet.has(normalizeLabel(actionText));
+            const selectedClass = isSelected ? "is-selected" : "";
+            return `
+              <button
+                type="button"
+                class="risk-chip ${selectedClass}"
+                data-task22-predefined-red-flag-action="${escapeHtml(actionText)}"
+              >${escapeHtml(actionText)}</button>
+            `;
+          }).join("")
+        }
+      </div>
+    `
+    : `<div class="inline-meta">No oracle red flag actions in this window.</div>`;
+
+  return `
+    <section class="task-section" id="task2-2-section">
+      <h3 class="task-title">Task 2.2: Red Flags</h3>
+      <div class="summary-card">
+        ${redFlagOptions}
+        <div class="task1-risk-list">
+          ${
+            additionalActions.map((actionText, actionIndex) => `
+              <div class="task1-risk-row">
+                <input
+                  type="text"
+                  value="${escapeHtml(actionText)}"
+                  data-task22-additional-red-flag-index="${actionIndex}"
+                  placeholder="e.g., Avoid aggressive BP lowering"
+                />
+                <button type="button" class="secondary-btn" data-task22-additional-red-flag-remove-index="${actionIndex}">Remove</button>
+              </div>
+            `).join("")
+          }
+        </div>
+        <button type="button" class="secondary-btn" data-task22-additional-red-flag-add="1">Add red flag actions</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderTask3PatientInsights(annotation) {
   const insights = getTextConfidenceItems(
     isObject(annotation.task4_patient_insights) ? annotation.task4_patient_insights.insights : []
   );
   const insightsErrorClass = hasCurrentHighlight("task4_patient_insights.insights") ? "error-highlight" : "";
 
   return `
-    <section class="task-section" id="task4-section">
-      <h3 class="task-title">Task 4: Patient Insights</h3>
+    <section class="task-section" id="task3-section">
+      <h3 class="task-title">Task 3: Patient Insights (Optional)</h3>
       <div class="review-note">Use 1-2 sentences per item to describe what is uniquely notable about this patient vs average patients.</div>
       <div class="control-group ${insightsErrorClass}">
         <label>Unique patient insights</label>
@@ -1405,20 +1457,24 @@ function renderTask4(annotation) {
   `;
 }
 
-function renderVerdictChips(name, selectedVerdict, extraAttributes = {}) {
-  const options = [
-    { value: "agree", label: "Agree" },
-    { value: "disagree", label: "Disagree" },
-    { value: "uncertain", label: "Not sure" },
-  ];
-
+function renderOptionChips(name, options, selectedValue, extraAttributes = {}) {
+  const normalizedOptions = (Array.isArray(options) ? options : []).map((option) => {
+    if (isObject(option)) {
+      return {
+        value: safeString(option.value),
+        label: safeString(option.label || option.value),
+      };
+    }
+    const value = safeString(option);
+    return { value, label: value };
+  }).filter((option) => option.value.length > 0);
   const attrs = Object.entries(extraAttributes)
     .map(([k, v]) => `${k}="${escapeHtml(v)}"`)
     .join(" ");
 
-  return options
+  return normalizedOptions
     .map((option) => {
-      const checked = selectedVerdict === option.value ? "checked" : "";
+      const checked = selectedValue === option.value ? "checked" : "";
       return `
         <label class="verdict-chip">
           <input type="radio" name="${escapeHtml(name)}" value="${option.value}" ${attrs} ${checked} />
@@ -1889,6 +1945,37 @@ function onWorkspaceClick(event) {
   clearCurrentRoundErrorHighlights();
   let shouldRender = false;
 
+  if (target.dataset.task1PredefinedRiskName !== undefined) {
+    const riskName = safeString(target.dataset.task1PredefinedRiskName);
+    if (riskName) {
+      const selectedRisks = normalizeRiskNameList(annotation.task1_status.selected_risks);
+      const targetKey = normalizeLabel(riskName);
+      const existingIndex = selectedRisks.findIndex((item) => normalizeLabel(item) === targetKey);
+      if (existingIndex >= 0) {
+        selectedRisks.splice(existingIndex, 1);
+      } else {
+        selectedRisks.push(riskName);
+      }
+      annotation.task1_status.selected_risks = selectedRisks;
+      shouldRender = true;
+    }
+  }
+
+  if (target.dataset.task1AdditionalRiskAdd) {
+    const additionalRisks = ensureStringList(annotation.task1_status, "additional_risks");
+    additionalRisks.push("");
+    shouldRender = true;
+  }
+
+  if (target.dataset.task1AdditionalRiskRemoveIndex) {
+    const removeIndex = toInt(target.dataset.task1AdditionalRiskRemoveIndex, null);
+    const additionalRisks = ensureStringList(annotation.task1_status, "additional_risks");
+    if (removeIndex !== null && removeIndex >= 0 && removeIndex < additionalRisks.length) {
+      additionalRisks.splice(removeIndex, 1);
+      shouldRender = true;
+    }
+  }
+
   if (target.dataset.additionalActionAdd) {
     const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
     items.push(buildTextConfidenceItem());
@@ -1904,20 +1991,33 @@ function onWorkspaceClick(event) {
     }
   }
 
-  if (target.dataset.redFlagActionAdd) {
-    if (!isObject(annotation.task3_red_flag_actions)) {
-      annotation.task3_red_flag_actions = { actions: [] };
+  if (target.dataset.task22PredefinedRedFlagAction !== undefined) {
+    const actionText = safeString(target.dataset.task22PredefinedRedFlagAction);
+    if (actionText) {
+      const selectedActions = normalizeRedFlagActionList(annotation.task3_red_flag_actions.selected_actions);
+      const actionKey = normalizeLabel(actionText);
+      const existingIndex = selectedActions.findIndex((item) => normalizeLabel(item) === actionKey);
+      if (existingIndex >= 0) {
+        selectedActions.splice(existingIndex, 1);
+      } else {
+        selectedActions.push(actionText);
+      }
+      annotation.task3_red_flag_actions.selected_actions = selectedActions;
+      shouldRender = true;
     }
-    const items = ensureTextConfidenceList(annotation.task3_red_flag_actions, "actions");
-    items.push(buildTextConfidenceItem());
+  }
+
+  if (target.dataset.task22AdditionalRedFlagAdd) {
+    const additionalActions = ensureStringList(annotation.task3_red_flag_actions, "additional_actions");
+    additionalActions.push("");
     shouldRender = true;
   }
 
-  if (target.dataset.redFlagActionRemoveIndex) {
-    const removeIndex = toInt(target.dataset.redFlagActionRemoveIndex, null);
-    const items = ensureTextConfidenceList(annotation.task3_red_flag_actions, "actions");
-    if (removeIndex !== null && Array.isArray(items) && removeIndex >= 0 && removeIndex < items.length) {
-      items.splice(removeIndex, 1);
+  if (target.dataset.task22AdditionalRedFlagRemoveIndex) {
+    const removeIndex = toInt(target.dataset.task22AdditionalRedFlagRemoveIndex, null);
+    const additionalActions = ensureStringList(annotation.task3_red_flag_actions, "additional_actions");
+    if (removeIndex !== null && removeIndex >= 0 && removeIndex < additionalActions.length) {
+      additionalActions.splice(removeIndex, 1);
       shouldRender = true;
     }
   }
@@ -1961,40 +2061,28 @@ function onWorkspaceChange(event) {
     shouldRender = true;
   }
 
-  if (target.name === "task1-verdict") {
-    annotation.task1_status.verdict = target.value;
-    if (target.value !== "disagree") {
-      annotation.task1_status.correction_label = null;
-      annotation.task1_status.correction_domains = [];
-      annotation.task1_status.comment = null;
-    }
+  if (target.name === "task1-label") {
+    annotation.task1_status.selected_label = normalizeEnumValue(target.value, STATUS_CORRECTION_VALUES);
     shouldRender = true;
   }
 
-  if (target.name === "task1-correction-label") {
-    annotation.task1_status.correction_label = target.value || null;
-  }
-
-  if (target.dataset.task1Domain) {
-    toggleSelection(annotation.task1_status.correction_domains, target.dataset.task1Domain, target.checked);
-  }
-
-  if (target.name.startsWith("action-verdict-")) {
+  if (target.name.startsWith("action-label-")) {
     const actionIndex = toInt(target.dataset.actionIndex, null);
     if (actionIndex !== null && annotation.task2_actions[actionIndex]) {
-      annotation.task2_actions[actionIndex].verdict = target.value;
-      if (target.value !== "disagree") {
-        annotation.task2_actions[actionIndex].correction_label = null;
-        annotation.task2_actions[actionIndex].comment = null;
+      const selectedLabel = normalizeEnumValue(target.value, ACTION_CORRECTION_VALUES);
+      annotation.task2_actions[actionIndex].selected_label = selectedLabel;
+      if (selectedLabel !== "best_practice" && selectedLabel !== "acceptable") {
+        annotation.task2_actions[actionIndex].selected_urgency = null;
       }
       shouldRender = true;
     }
   }
 
-  if (target.dataset.actionCorrectionIndex) {
-    const actionIndex = toInt(target.dataset.actionCorrectionIndex, null);
+  if (target.name.startsWith("action-urgency-")) {
+    const actionIndex = toInt(target.dataset.actionUrgencyIndex, null);
     if (actionIndex !== null && annotation.task2_actions[actionIndex]) {
-      annotation.task2_actions[actionIndex].correction_label = target.value || null;
+      annotation.task2_actions[actionIndex].selected_urgency = normalizeEnumValue(target.value, ACTION_URGENCY_VALUES);
+      shouldRender = true;
     }
   }
 
@@ -2024,23 +2112,6 @@ function onWorkspaceChange(event) {
     }
   }
 
-  if (target.name === "additional-rec-verdict") {
-    if (target.value === "true") {
-      annotation.task3_additional_recommendations.has_additional = true;
-      const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
-      if (items.length === 0) {
-        items.push(buildTextConfidenceItem());
-      }
-    } else if (target.value === "false") {
-      annotation.task3_additional_recommendations.has_additional = false;
-      annotation.task3_additional_recommendations.actions = [];
-    } else {
-      annotation.task3_additional_recommendations.has_additional = null;
-      annotation.task3_additional_recommendations.actions = [];
-    }
-    shouldRender = true;
-  }
-
   if (target.dataset.additionalActionConfidenceIndex) {
     const actionIndex = toInt(target.dataset.additionalActionConfidenceIndex, null);
     const items = ensureTextConfidenceList(annotation.task3_additional_recommendations, "actions");
@@ -2055,14 +2126,6 @@ function onWorkspaceChange(event) {
     if (actionIndex !== null && actionIndex >= 0 && actionIndex < items.length) {
       items[actionIndex].category = normalizeAdditionalActionCategory(target.value);
       shouldRender = true;
-    }
-  }
-
-  if (target.dataset.redFlagActionConfidenceIndex) {
-    const actionIndex = toInt(target.dataset.redFlagActionConfidenceIndex, null);
-    const items = ensureTextConfidenceList(annotation.task3_red_flag_actions, "actions");
-    if (actionIndex !== null && actionIndex >= 0 && actionIndex < items.length) {
-      items[actionIndex].confidence = normalizeConfidence(target.value);
     }
   }
 
@@ -2089,14 +2152,11 @@ function onWorkspaceInput(event) {
   const annotation = getCurrentAnnotation();
   clearCurrentRoundErrorHighlights();
 
-  if (target.id === "task1-comment") {
-    annotation.task1_status.comment = safeString(target.value) || null;
-  }
-
-  if (target.dataset.actionCommentIndex) {
-    const actionIndex = toInt(target.dataset.actionCommentIndex, null);
-    if (actionIndex !== null && annotation.task2_actions[actionIndex]) {
-      annotation.task2_actions[actionIndex].comment = safeString(target.value) || null;
+  if (target.dataset.task1AdditionalRiskIndex) {
+    const riskIndex = toInt(target.dataset.task1AdditionalRiskIndex, null);
+    const additionalRisks = ensureStringList(annotation.task1_status, "additional_risks");
+    if (riskIndex !== null && riskIndex >= 0 && riskIndex < additionalRisks.length) {
+      additionalRisks[riskIndex] = target.value;
     }
   }
 
@@ -2116,11 +2176,11 @@ function onWorkspaceInput(event) {
     }
   }
 
-  if (target.dataset.redFlagActionIndex) {
-    const actionIndex = toInt(target.dataset.redFlagActionIndex, null);
-    const items = ensureTextConfidenceList(annotation.task3_red_flag_actions, "actions");
-    if (actionIndex !== null && Array.isArray(items) && actionIndex >= 0 && actionIndex < items.length) {
-      items[actionIndex].text = target.value;
+  if (target.dataset.task22AdditionalRedFlagIndex) {
+    const actionIndex = toInt(target.dataset.task22AdditionalRedFlagIndex, null);
+    const additionalActions = ensureStringList(annotation.task3_red_flag_actions, "additional_actions");
+    if (actionIndex !== null && actionIndex >= 0 && actionIndex < additionalActions.length) {
+      additionalActions[actionIndex] = target.value;
     }
   }
 
@@ -2173,6 +2233,12 @@ function onExport() {
   const output = cloneData(state.predictionsData);
   state.rounds.forEach((round) => {
     const annotation = state.annotations[round.arrayIndex];
+    const activeRiskSet = new Set(
+      getOracleActiveRiskNames(round.oracleOutput.patient_assessment).map((name) => normalizeLabel(name))
+    );
+    const oracleRedFlagSet = new Set(
+      getOracleContraindicatedActionNames(round.recommendations).map((action) => normalizeLabel(action))
+    );
     const warnings = validation.windowWarnings[round.arrayIndex] || {
       unreviewed_actions: [],
       unreviewed_recommendations: [],
@@ -2184,17 +2250,24 @@ function onExport() {
       annotated_at: nowIso,
       duration_seconds: durationSeconds,
       task1_status: {
-        verdict: annotation.task1_status.verdict,
-        correction_label: annotation.task1_status.correction_label,
-        correction_domains: annotation.task1_status.correction_domains.slice(),
-        comment: annotation.task1_status.comment,
+        selected_label: normalizeEnumValue(annotation.task1_status.selected_label, STATUS_CORRECTION_VALUES),
+        selected_risks: normalizeRiskNameList(annotation.task1_status.selected_risks)
+          .filter((riskName) => activeRiskSet.has(normalizeLabel(riskName))),
+        additional_risks: normalizeRiskNameList(annotation.task1_status.additional_risks),
       },
-      task2_actions: annotation.task2_actions.map((entry) => ({
-        action_id: entry.action_id,
-        verdict: entry.verdict,
-        correction_label: entry.correction_label,
-        comment: entry.comment,
-      })),
+      task2_actions: annotation.task2_actions.map((entry) => {
+        const selectedLabel = normalizeEnumValue(entry.selected_label, ACTION_CORRECTION_VALUES);
+        const selectedUrgency = normalizeEnumValue(entry.selected_urgency, ACTION_URGENCY_VALUES);
+        return {
+          action_id: entry.action_id,
+          selected_label: selectedLabel,
+          selected_urgency: (
+            selectedLabel === "best_practice" || selectedLabel === "acceptable"
+              ? selectedUrgency
+              : null
+          ),
+        };
+      }),
       task3_recommendations: annotation.task3_recommendations.map((entry) => ({
         rank: entry.rank,
         position_index: entry.position_index,
@@ -2203,11 +2276,12 @@ function onExport() {
         agreed_dose: entry.agreed_dose,
       })),
       task3_additional_recommendations: {
-        has_additional: annotation.task3_additional_recommendations.has_additional,
         actions: exportAdditionalRecommendationItems(annotation.task3_additional_recommendations.actions),
       },
       task3_red_flag_actions: {
-        actions: exportTextConfidenceItems(annotation.task3_red_flag_actions.actions, "action"),
+        selected_actions: normalizeRedFlagActionList(annotation.task3_red_flag_actions.selected_actions)
+          .filter((action) => oracleRedFlagSet.has(normalizeLabel(action))),
+        additional_actions: normalizeRedFlagActionList(annotation.task3_red_flag_actions.additional_actions),
       },
       task4_patient_insights: {
         insights: exportTextConfidenceItems(annotation.task4_patient_insights.insights, "insight"),
@@ -2223,6 +2297,7 @@ function onExport() {
     source_files: {
       oracle_predictions: state.sourceFiles.oracle_predictions,
       window_contexts: state.sourceFiles.window_contexts,
+      full_window_contexts: state.sourceFiles.full_window_contexts,
     },
   };
 
@@ -2441,23 +2516,15 @@ function collectValidationReport() {
 
     const unreviewedActions = isSkipped
       ? []
-      : annotation.task2_actions.filter((action) => action.verdict === null).map((action) => action.action_id);
-    const unreviewedRecommendations = isSkipped
-      ? []
-      : annotation.task3_recommendations
-        .filter((rec) => rec.verdict === null)
-        .map((rec) => formatRecommendationId(rec));
+      : annotation.task2_actions.filter((action) => action.selected_label === null).map((action) => action.action_id);
 
     windowWarnings[round.arrayIndex] = {
       unreviewed_actions: unreviewedActions,
-      unreviewed_recommendations: unreviewedRecommendations,
+      unreviewed_recommendations: [],
     };
 
     if (!isSkipped && unreviewedActions.length > 0) {
       warnings.push(`${labelPrefix}: unreviewed actions (${unreviewedActions.join(", ")})`);
-    }
-    if (!isSkipped && unreviewedRecommendations.length > 0) {
-      warnings.push(`${labelPrefix}: unreviewed recommendations (${unreviewedRecommendations.join(", ")})`);
     }
   });
 
@@ -2475,105 +2542,63 @@ function collectRoundBlockingIssues(round, annotation) {
     return issues;
   }
 
-  if (!annotation.task1_status.verdict) {
+  if (!annotation.task1_status.selected_label) {
     issues.push({
-      token: "task1.verdict",
-      message: "Task 1 verdict is missing.",
+      token: "task1.selected_label",
+      message: "Task 1 label is missing.",
     });
   }
 
-  if (annotation.task1_status.verdict === "disagree" && !annotation.task1_status.correction_label) {
-    issues.push({
-      token: "task1.correction_label",
-      message: "Task 1 disagree requires a corrected label.",
-    });
-  }
-
-  annotation.task2_actions.forEach((action, actionIndex) => {
-    if (action.verdict !== "disagree") {
+  annotation.task2_actions.forEach((entry, actionIndex) => {
+    const selectedLabel = normalizeEnumValue(entry && entry.selected_label, ACTION_CORRECTION_VALUES);
+    if (selectedLabel) {
+      if (selectedLabel === "best_practice" || selectedLabel === "acceptable") {
+        const selectedUrgency = normalizeEnumValue(entry && entry.selected_urgency, ACTION_URGENCY_VALUES);
+        if (!selectedUrgency) {
+          const actionId = safeString(entry && entry.action_id) || `#${actionIndex + 1}`;
+          issues.push({
+            token: `action.${actionIndex}.selected_urgency`,
+            message: `Task 2.1 urgency is missing for action ${actionId}.`,
+          });
+        }
+      }
       return;
     }
-    if (!action.correction_label) {
-      issues.push({
-        token: `action.${actionIndex}.correction_label`,
-        message: `Action ${action.action_id} disagree requires corrected label.`,
-      });
-    }
-  });
-
-  annotation.task3_recommendations.forEach((rec, recIndex) => {
-    if (rec.verdict !== "agree") {
-      return;
-    }
-    if (!safeString(rec.agreed_urgency)) {
-      issues.push({
-        token: `recommendation.${recIndex}.urgency`,
-        message: `Recommendation ${formatRecommendationId(rec)} agree requires urgency.`,
-      });
-    }
-    if (!safeString(rec.agreed_dose)) {
-      issues.push({
-        token: `recommendation.${recIndex}.dose`,
-        message: `Recommendation ${formatRecommendationId(rec)} agree requires dose.`,
-      });
-    }
-  });
-
-  if (annotation.task3_additional_recommendations.has_additional === null) {
+    const actionId = safeString(entry && entry.action_id) || `#${actionIndex + 1}`;
     issues.push({
-      token: "task3_additional_recommendations.has_additional",
-      message: "Please answer whether there are additional recommended actions.",
+      token: `action.${actionIndex}.selected_label`,
+      message: `Task 2.1 label is missing for action ${actionId}.`,
     });
-  }
+  });
 
   const additionalActions = getTextConfidenceItems(annotation.task3_additional_recommendations.actions);
-  const hasAtLeastOneAdditionalAction = additionalActions.some((item) => item.text.length > 0);
-  if (annotation.task3_additional_recommendations.has_additional === true && !hasAtLeastOneAdditionalAction) {
-    issues.push({
-      token: "task3_additional_recommendations.actions",
-      message: "At least one additional action is required when answer is Yes.",
-    });
-  }
-  if (annotation.task3_additional_recommendations.has_additional === true) {
-    additionalActions.forEach((item, actionIndex) => {
-      if (!safeString(item.text)) {
-        return;
-      }
-      const category = normalizeAdditionalActionCategory(item.category);
-      if (!category) {
-        issues.push({
-          token: `task3_additional_recommendations.actions.${actionIndex}.category`,
-          message: `Additional action ${actionIndex + 1} requires selecting a category.`,
-        });
-      }
-      const evidenceParse = parseEvidenceEventIdsInput(item.evidence_event_ids_text || "");
-      if (evidenceParse.invalid.length > 0) {
-        issues.push({
-          token: `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`,
-          message: `Additional action ${actionIndex + 1} has invalid event IDs: ${evidenceParse.invalid.join(", ")}.`,
-        });
-      }
-      if (evidenceParse.valid.length > MAX_ADDITIONAL_ACTION_EVIDENCE_IDS) {
-        issues.push({
-          token: `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`,
-          message:
-            `Additional action ${actionIndex + 1} allows at most `
-            + `${MAX_ADDITIONAL_ACTION_EVIDENCE_IDS} evidence event IDs.`,
-        });
-      }
-    });
-  }
-
-  const patientInsights = getTextConfidenceItems(
-    isObject(annotation.task4_patient_insights) ? annotation.task4_patient_insights.insights : []
-  );
-  const hasPatientInsight = patientInsights.some((item) => item.text.length > 0);
-  if (!hasPatientInsight) {
-    issues.push({
-      token: "task4_patient_insights.insights",
-      message: "Task 4 requires at least one patient insight (1-2 sentences).",
-    });
-  }
+  additionalActions.forEach((item, actionIndex) => {
+    if (!safeString(item.text)) {
+      return;
+    }
+    const category = normalizeAdditionalActionCategory(item.category);
+    if (!category) {
+      issues.push({
+        token: `task3_additional_recommendations.actions.${actionIndex}.category`,
+        message: `Additional action ${actionIndex + 1} requires selecting a category.`,
+      });
+    }
+    const evidenceParse = parseEvidenceEventIdsInput(item.evidence_event_ids_text || "");
+    if (evidenceParse.invalid.length > 0) {
+      issues.push({
+        token: `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`,
+        message: `Additional action ${actionIndex + 1} has invalid event IDs: ${evidenceParse.invalid.join(", ")}.`,
+      });
+    }
+    if (evidenceParse.valid.length > MAX_ADDITIONAL_ACTION_EVIDENCE_IDS) {
+      issues.push({
+        token: `task3_additional_recommendations.actions.${actionIndex}.evidence_event_ids`,
+        message:
+          `Additional action ${actionIndex + 1} allows at most `
+          + `${MAX_ADDITIONAL_ACTION_EVIDENCE_IDS} evidence event IDs.`,
+      });
+    }
+  });
 
   return issues;
 }
@@ -2601,35 +2626,34 @@ function getRoundReviewStats(round, annotation) {
       task1Done: true,
       reviewedActions: round.actions.length,
       totalActions: round.actions.length,
-      reviewedRecs: round.recommendations.length,
-      totalRecs: round.recommendations.length,
-      additionalRecommendationsDone: true,
-      task4Done: true,
+      otherActionsCount: 0,
+      task3InsightCount: 0,
     };
   }
 
-  const reviewedActions = annotation.task2_actions.filter((entry) => entry.verdict !== null).length;
-  const reviewedRecs = annotation.task3_recommendations.filter((entry) => entry.verdict !== null).length;
+  const reviewedActions = annotation.task2_actions.filter((entry) => entry.selected_label !== null).length;
+  const otherActionsCount = getTextConfidenceItems(annotation.task3_additional_recommendations.actions)
+    .filter((item) => item.text.length > 0)
+    .length;
+  const task3InsightCount = getTextConfidenceItems(
+    isObject(annotation.task4_patient_insights) ? annotation.task4_patient_insights.insights : []
+  ).filter((item) => item.text.length > 0).length;
 
   return {
     isSkipped: false,
-    task1Done: annotation.task1_status.verdict !== null,
+    task1Done: annotation.task1_status.selected_label !== null,
     reviewedActions,
     totalActions: round.actions.length,
-    reviewedRecs,
-    totalRecs: round.recommendations.length,
-    additionalRecommendationsDone: annotation.task3_additional_recommendations.has_additional !== null,
-    task4Done: (
-      getTextConfidenceItems(isObject(annotation.task4_patient_insights) ? annotation.task4_patient_insights.insights : [])
-        .some((item) => item.text.length > 0)
-    ),
+    otherActionsCount,
+    task3InsightCount,
   };
 }
 
 function getPlotHistoryEvents(roundPosition) {
   const currentRound = state.rounds[roundPosition];
   const currentStartMs = getWindowStartMs(currentRound);
-  const priorEvents = collectPriorEvents(roundPosition);
+  const fullTimelinePriorEvents = collectPriorEventsFromFullTimeline(roundPosition);
+  const priorEvents = fullTimelinePriorEvents === null ? collectPriorEvents(roundPosition) : fullTimelinePriorEvents;
   if (currentStartMs === null) {
     return priorEvents;
   }
@@ -2642,14 +2666,14 @@ function getPlotHistoryEvents(roundPosition) {
 function getRecentHistoryEvents(roundPosition, minutes) {
   const currentRound = state.rounds[roundPosition];
   const currentStartMs = getWindowStartMs(currentRound);
-  const priorEvents = collectPriorEvents(roundPosition);
+  const fullTimelinePriorEvents = collectPriorEventsFromFullTimeline(roundPosition);
+  const priorEvents = fullTimelinePriorEvents === null ? collectPriorEvents(roundPosition) : fullTimelinePriorEvents;
   if (priorEvents.length === 0) {
     return [];
   }
 
   if (currentStartMs === null) {
-    const previousRound = roundPosition > 0 ? state.rounds[roundPosition - 1] : null;
-    return previousRound && Array.isArray(previousRound.events) ? previousRound.events.slice() : [];
+    return getPreviousWindowEvents(roundPosition);
   }
 
   const windowMs = Math.max(1, Number(minutes) || 30) * 60 * 1000;
@@ -2664,6 +2688,125 @@ function getRecentHistoryEvents(roundPosition, minutes) {
       const tb = parseEventTimeMs(b) || 0;
       return ta - tb;
     });
+}
+
+function getPreviousWindowEvents(roundPosition) {
+  if (!Number.isFinite(roundPosition) || roundPosition < 0) {
+    return [];
+  }
+  const fullTimelinePreviousEvents = getPreviousWindowEventsFromFullTimeline(roundPosition);
+  if (fullTimelinePreviousEvents !== null) {
+    return fullTimelinePreviousEvents;
+  }
+  if (roundPosition <= 0) {
+    return [];
+  }
+  const previousRound = state.rounds[roundPosition - 1];
+  return previousRound && Array.isArray(previousRound.events) ? previousRound.events.slice() : [];
+}
+
+function buildLatestVitalValueByLabel(events) {
+  const latestByLabel = new Map();
+  const normalizedEvents = normalizeEventsForTrend(events, "previous_window");
+
+  normalizedEvents.forEach((normalizedEvent) => {
+    if (!isVitalEvent(normalizedEvent)) {
+      return;
+    }
+    const label = extractVitalLabel(normalizedEvent);
+    const labelKey = normalizeLabel(label);
+    if (!labelKey) {
+      return;
+    }
+    const numeric = extractEventNumericValue(normalizedEvent);
+    if (!Number.isFinite(numeric)) {
+      return;
+    }
+
+    const point = {
+      timeMs: normalizedEvent.timeMs,
+      order: normalizedEvent.order,
+      source: normalizedEvent.source,
+    };
+    const existing = latestByLabel.get(labelKey);
+    if (!existing || compareTrendPoints(existing.point, point) < 0) {
+      latestByLabel.set(labelKey, {
+        value: numeric,
+        point,
+      });
+    }
+  });
+
+  return latestByLabel;
+}
+
+function getVitalTimelineAnomalyInfo(event, { scope = "generic", previousWindowVitalsByLabel = new Map() } = {}) {
+  const normalizedEvent = {
+    event,
+    source: scope || "timeline",
+    order: 0,
+    time: safeString(event && (event.time || event.start_time)),
+    timeMs: parseEventTimeMs(event),
+  };
+  if (!isVitalEvent(normalizedEvent)) {
+    return null;
+  }
+
+  const label = extractVitalLabel(normalizedEvent);
+  const labelKey = normalizeLabel(label);
+  if (!labelKey) {
+    return null;
+  }
+  const numericValue = extractEventNumericValue(normalizedEvent);
+  if (!Number.isFinite(numericValue)) {
+    return null;
+  }
+
+  const guideline = resolveVitalGuideline(label);
+  const classes = [];
+  const notes = [];
+
+  if (guideline && Number.isFinite(guideline.low) && Number.isFinite(guideline.high)) {
+    const outOfRange = numericValue < guideline.low || numericValue > guideline.high;
+    if (outOfRange) {
+      classes.push("event-anomaly", "event-anomaly-range");
+      const rangeText = `${formatCompactNumber(guideline.low)}-${formatCompactNumber(guideline.high)}`
+        + (safeString(guideline.unit) ? ` ${safeString(guideline.unit)}` : "");
+      notes.push(`Abnormal vital: outside healthy range (${rangeText})`);
+    }
+  }
+
+  if (scope === "current" && previousWindowVitalsByLabel instanceof Map) {
+    const baseline = previousWindowVitalsByLabel.get(labelKey);
+    if (baseline && Number.isFinite(baseline.value)) {
+      const delta = numericValue - baseline.value;
+      const absDelta = Math.abs(delta);
+      const relativeDelta = absDelta / Math.max(Math.abs(baseline.value), 1);
+      const absThreshold = resolveVitalTrendAbsoluteThreshold(guideline, baseline.value);
+      if (absDelta >= absThreshold && relativeDelta >= VITAL_TREND_RELATIVE_CHANGE_THRESHOLD) {
+        classes.push("event-anomaly", delta > 0 ? "event-anomaly-trend-up" : "event-anomaly-trend-down");
+        const direction = delta > 0 ? "sharp rise" : "sharp drop";
+        const percent = Math.round(relativeDelta * 100);
+        notes.push(`Abnormal vital: ${direction} vs previous window (${percent}%)`);
+      }
+    }
+  }
+
+  if (classes.length === 0 || notes.length === 0) {
+    return null;
+  }
+  return {
+    classes: Array.from(new Set(classes)),
+    note: notes.join(" | "),
+  };
+}
+
+function resolveVitalTrendAbsoluteThreshold(guideline, baselineValue) {
+  if (guideline && Number.isFinite(guideline.low) && Number.isFinite(guideline.high)) {
+    const rangeWidth = Math.abs(guideline.high - guideline.low);
+    return Math.max(1, rangeWidth * VITAL_TREND_BASELINE_RANGE_FRACTION_THRESHOLD);
+  }
+  return Math.max(1, Math.abs(baselineValue) * VITAL_TREND_BASELINE_FRACTION_THRESHOLD);
 }
 
 function parsePromptHistorySection(sectionText) {
@@ -2895,6 +3038,89 @@ function collectPriorEvents(roundPosition) {
   return events;
 }
 
+function collectFullTimelineWindowEntries(fullWindowContextsData = state.fullWindowContextsData) {
+  if (!isObject(fullWindowContextsData) || !Array.isArray(fullWindowContextsData.window_contexts)) {
+    return [];
+  }
+
+  const entries = fullWindowContextsData.window_contexts
+    .map((item, arrayIndex) => {
+      if (!isObject(item)) {
+        return null;
+      }
+      const sourceWindowIndex = resolveSourceWindowIndexFromContextEntry(
+        item,
+        toInt(item.window_index, arrayIndex + 1) - 1
+      );
+      if (!Number.isFinite(sourceWindowIndex)) {
+        return null;
+      }
+      const currentEvents = Array.isArray(item.current_events) ? item.current_events : [];
+      return {
+        sourceWindowIndex,
+        arrayIndex,
+        currentEvents,
+        contextEntry: item,
+      };
+    })
+    .filter((item) => item !== null);
+
+  entries.sort((a, b) => {
+    if (a.sourceWindowIndex !== b.sourceWindowIndex) {
+      return a.sourceWindowIndex - b.sourceWindowIndex;
+    }
+    return a.arrayIndex - b.arrayIndex;
+  });
+  return entries;
+}
+
+function collectPriorEventsFromFullTimeline(roundPosition) {
+  const currentRound = state.rounds[roundPosition];
+  if (!currentRound || !Number.isFinite(currentRound.sourceWindowIndex)) {
+    return null;
+  }
+
+  const fullEntries = collectFullTimelineWindowEntries();
+  if (fullEntries.length === 0) {
+    return null;
+  }
+
+  const events = [];
+  const signatures = new Set();
+  fullEntries.forEach((entry) => {
+    if (entry.sourceWindowIndex >= currentRound.sourceWindowIndex) {
+      return;
+    }
+    entry.currentEvents.forEach((event) => {
+      const signature = buildEventSignature(event);
+      if (signatures.has(signature)) {
+        return;
+      }
+      signatures.add(signature);
+      events.push(event);
+    });
+  });
+  return events;
+}
+
+function getPreviousWindowEventsFromFullTimeline(roundPosition) {
+  const currentRound = state.rounds[roundPosition];
+  if (!currentRound || !Number.isFinite(currentRound.sourceWindowIndex)) {
+    return null;
+  }
+  const targetSourceWindowIndex = currentRound.sourceWindowIndex - 1;
+  if (targetSourceWindowIndex < 0) {
+    return [];
+  }
+
+  const fullEntries = collectFullTimelineWindowEntries();
+  if (fullEntries.length === 0) {
+    return null;
+  }
+  const matched = fullEntries.find((entry) => entry.sourceWindowIndex === targetSourceWindowIndex);
+  return matched ? matched.currentEvents.slice() : [];
+}
+
 function buildEventSignature(event) {
   return [
     safeString(event.time || event.start_time),
@@ -2913,7 +3139,31 @@ function getWindowStartMs(round) {
   return parseEventTimeMs({ time: startCandidate });
 }
 
+function getFullContextWindowStartMs(contextEntry) {
+  if (!isObject(contextEntry)) {
+    return null;
+  }
+  const metadata = isObject(contextEntry.window_metadata) ? contextEntry.window_metadata : {};
+  const startCandidate = (
+    metadata.window_start_time
+    || contextEntry.current_window_start
+    || contextEntry.current_window_start_time
+    || ""
+  );
+  return parseEventTimeMs({ time: startCandidate });
+}
+
 function getTimelineStartMs() {
+  const fullEntries = collectFullTimelineWindowEntries();
+  if (fullEntries.length > 0) {
+    const fullContextStarts = fullEntries
+      .map((entry) => getFullContextWindowStartMs(entry.contextEntry))
+      .filter((value) => Number.isFinite(value));
+    if (fullContextStarts.length > 0) {
+      return Math.min(...fullContextStarts);
+    }
+  }
+
   if (!Array.isArray(state.rounds) || state.rounds.length === 0) {
     return null;
   }
@@ -2933,9 +3183,19 @@ function getTimelineStartMs() {
   return null;
 }
 
-function buildStayVitalPlotStats(rounds) {
-  const safeRounds = Array.isArray(rounds) ? rounds : [];
+function buildStayVitalPlotStats(rounds, fullWindowContextsData = null) {
+  let safeRounds = Array.isArray(rounds) ? rounds : [];
+  const fullEntries = collectFullTimelineWindowEntries(fullWindowContextsData);
+  if (fullEntries.length > 0) {
+    safeRounds = fullEntries.map((entry) => ({
+      windowIndex: entry.sourceWindowIndex + 1,
+      events: entry.currentEvents,
+    }));
+  }
+
   const byLabel = new Map();
+  const orderByLabel = new Map();
+  let nextStableOrder = 0;
   const signatures = new Set();
 
   safeRounds.forEach((round, roundPosition) => {
@@ -2978,6 +3238,8 @@ function buildStayVitalPlotStats(rounds) {
           pointCount: 0,
           windows: new Set(),
         });
+        orderByLabel.set(labelKey, nextStableOrder);
+        nextStableOrder += 1;
       }
 
       const stats = byLabel.get(labelKey);
@@ -2989,6 +3251,7 @@ function buildStayVitalPlotStats(rounds) {
   return {
     totalWindows: safeRounds.length,
     byLabel,
+    orderByLabel,
   };
 }
 
@@ -3325,6 +3588,20 @@ function formatHistoryEventLine(event) {
 }
 
 function buildVitalSeries(historyEvents, currentEvents) {
+  const stableOrderByLabel = (
+    state.vitalPlotStats
+    && state.vitalPlotStats.orderByLabel instanceof Map
+  )
+    ? state.vitalPlotStats.orderByLabel
+    : null;
+  const resolveStableOrder = (labelKey) => {
+    if (!stableOrderByLabel) {
+      return Number.POSITIVE_INFINITY;
+    }
+    const value = stableOrderByLabel.get(labelKey);
+    return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+  };
+
   const seriesByLabel = new Map();
   const normalizedHistory = normalizeEventsForTrend(historyEvents, "history");
   const normalizedCurrent = normalizeEventsForTrend(currentEvents, "current");
@@ -3392,6 +3669,11 @@ function buildVitalSeries(historyEvents, currentEvents) {
       rank: rankVitalSeries(entry),
     }))
     .sort((a, b) => {
+      const aStableOrder = resolveStableOrder(a.entry.labelKey);
+      const bStableOrder = resolveStableOrder(b.entry.labelKey);
+      if (aStableOrder !== bStableOrder) {
+        return aStableOrder - bStableOrder;
+      }
       if (a.rank.score !== b.rank.score) {
         return b.rank.score - a.rank.score;
       }
@@ -3597,10 +3879,10 @@ function actionSeverityRank(label) {
   if (normalized === "potentially_harmful") {
     return 0;
   }
-  if (normalized === "suboptimal") {
+  if (normalized === "acceptable") {
     return 1;
   }
-  if (normalized === "appropriate") {
+  if (normalized === "best_practice") {
     return 2;
   }
   return 3;
@@ -3608,14 +3890,17 @@ function actionSeverityRank(label) {
 
 function overallToneClass(label) {
   const normalized = normalizeLabel(label);
-  if (normalized === "improving" || normalized === "appropriate") {
+  if (normalized === "improving" || normalized === "best_practice") {
     return "positive";
   }
   if (normalized === "deteriorating" || normalized === "potentially_harmful") {
     return "danger";
   }
-  if (normalized === "suboptimal") {
-    return "warning";
+  if (normalized === "stable" || normalized === "acceptable" || normalized === "suboptimal") {
+    return "info";
+  }
+  if (normalized === "insufficient_data" || normalized === "not_enough_context") {
+    return "neutral";
   }
   return "neutral";
 }
@@ -4020,6 +4305,96 @@ function normalizeAdditionalActionCategory(value) {
     return "";
   }
   return ICU_ACTION_CATEGORIES.includes(raw) ? raw : "";
+}
+
+function normalizeRiskNameList(items) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const normalized = [];
+  const seen = new Set();
+  safeItems.forEach((item) => {
+    const riskName = safeString(item);
+    if (!riskName) {
+      return;
+    }
+    const riskKey = normalizeLabel(riskName);
+    if (seen.has(riskKey)) {
+      return;
+    }
+    seen.add(riskKey);
+    normalized.push(riskName);
+  });
+  return normalized;
+}
+
+function normalizeRedFlagActionList(items) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const normalized = [];
+  const seen = new Set();
+  safeItems.forEach((item) => {
+    const actionText = safeString(item);
+    if (!actionText) {
+      return;
+    }
+    const actionKey = normalizeLabel(actionText);
+    if (seen.has(actionKey)) {
+      return;
+    }
+    seen.add(actionKey);
+    normalized.push(actionText);
+  });
+  return normalized;
+}
+
+function getOracleActiveRiskNames(patientAssessment) {
+  const activeRisks = (isObject(patientAssessment) && Array.isArray(patientAssessment.active_risks))
+    ? patientAssessment.active_risks
+    : [];
+  const riskNames = [];
+  const seen = new Set();
+  activeRisks.forEach((risk) => {
+    const riskName = isObject(risk) ? safeString(risk.risk_name) : safeString(risk);
+    if (!riskName) {
+      return;
+    }
+    const riskKey = normalizeLabel(riskName);
+    if (seen.has(riskKey)) {
+      return;
+    }
+    seen.add(riskKey);
+    riskNames.push(riskName);
+  });
+  return riskNames;
+}
+
+function getOracleContraindicatedActionNames(recommendations) {
+  const safeRecommendations = Array.isArray(recommendations) ? recommendations : [];
+  const actionNames = [];
+  const seen = new Set();
+  safeRecommendations.forEach((rec) => {
+    const actionText = isObject(rec)
+      ? safeString(rec.action || rec.contraindicated_action || rec.action_name)
+      : safeString(rec);
+    if (!actionText) {
+      return;
+    }
+    const actionKey = normalizeLabel(actionText);
+    if (seen.has(actionKey)) {
+      return;
+    }
+    seen.add(actionKey);
+    actionNames.push(actionText);
+  });
+  return actionNames;
+}
+
+function ensureStringList(container, key) {
+  if (!isObject(container)) {
+    return [];
+  }
+  const source = Array.isArray(container[key]) ? container[key] : [];
+  const normalized = source.map((item) => (item === null || item === undefined ? "" : String(item)));
+  container[key] = normalized;
+  return normalized;
 }
 
 function buildTextConfidenceItem(text = "", confidence = null, evidenceEventIdsText = "", category = "") {

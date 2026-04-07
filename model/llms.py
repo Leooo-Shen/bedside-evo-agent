@@ -88,25 +88,51 @@ class LLMClient:
         elif self.provider in {"google", "gemini"}:
             self.model = model or "gemini-1.5-flash"
             api_key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-            if not api_key:
-                raise ValueError("GOOGLE_API_KEY (or GEMINI_API_KEY) not found in environment")
-            if google_genai_sdk is not None:
+            use_vertex_ai = self._resolve_google_vertexai_mode()
+
+            if use_vertex_ai:
+                if google_genai_sdk is None:
+                    raise ImportError("Vertex AI mode requires google-genai. Install with: pip install google-genai")
+                project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_PROJECT_ID")
+                location = os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("GOOGLE_LOCATION") or "us-central1"
+                if not project:
+                    raise ValueError("GOOGLE_CLOUD_PROJECT (or GOOGLE_PROJECT_ID) not found in environment")
+
                 self.google_sdk = "google_genai"
-                client_kwargs: Dict[str, Any] = {"api_key": api_key}
+                client_kwargs = {
+                    "vertexai": True,
+                    "project": project,
+                    "location": location,
+                }
                 timeout_seconds = self._resolve_timeout_seconds()
                 if timeout_seconds is not None and hasattr(google_genai_sdk, "types"):
                     # google-genai HttpOptions.timeout is in milliseconds.
                     timeout_millis = max(int(timeout_seconds * 1000.0), 10_000)
                     client_kwargs["http_options"] = google_genai_sdk.types.HttpOptions(timeout=timeout_millis)
                 self.client = google_genai_sdk.Client(**client_kwargs)
-            elif google_generativeai_sdk is not None:
-                self.google_sdk = "google_generativeai"
-                google_generativeai_sdk.configure(api_key=api_key)
-                self.client = google_generativeai_sdk
             else:
-                raise ImportError(
-                    "No Gemini SDK found. Install one of: pip install google-genai OR pip install google-generativeai"
-                )
+                if not api_key:
+                    raise ValueError(
+                        "GOOGLE_API_KEY (or GEMINI_API_KEY) not found in environment. "
+                        "For Vertex AI, set GOOGLE_GENAI_USE_VERTEXAI=true and configure GOOGLE_CLOUD_PROJECT."
+                    )
+                if google_genai_sdk is not None:
+                    self.google_sdk = "google_genai"
+                    client_kwargs = {"api_key": api_key}
+                    timeout_seconds = self._resolve_timeout_seconds()
+                    if timeout_seconds is not None and hasattr(google_genai_sdk, "types"):
+                        # google-genai HttpOptions.timeout is in milliseconds.
+                        timeout_millis = max(int(timeout_seconds * 1000.0), 10_000)
+                        client_kwargs["http_options"] = google_genai_sdk.types.HttpOptions(timeout=timeout_millis)
+                    self.client = google_genai_sdk.Client(**client_kwargs)
+                elif google_generativeai_sdk is not None:
+                    self.google_sdk = "google_generativeai"
+                    google_generativeai_sdk.configure(api_key=api_key)
+                    self.client = google_generativeai_sdk
+                else:
+                    raise ImportError(
+                        "No Gemini SDK found. Install one of: pip install google-genai OR pip install google-generativeai"
+                    )
 
         else:
             raise ValueError(f"Unsupported provider: {provider}")
@@ -204,6 +230,17 @@ class LLMClient:
         except (TypeError, ValueError):
             return None
         return parsed
+
+    def _resolve_google_vertexai_mode(self) -> bool:
+        """Whether Gemini client should use Vertex AI credentials flow."""
+        env_value = os.getenv("GOOGLE_GENAI_USE_VERTEXAI")
+        if env_value is not None:
+            return env_value.strip().lower() in {"1", "true", "yes", "on"}
+
+        # Auto-enable Vertex mode when a project is configured and no API key is present.
+        project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_PROJECT_ID")
+        has_api_key = bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
+        return bool(project) and not has_api_key
 
     def _extract_status_code(self, error: Exception) -> Optional[int]:
         """Extract HTTP status code from SDK exceptions when available."""

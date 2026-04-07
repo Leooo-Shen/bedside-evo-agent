@@ -165,13 +165,11 @@ def _build_patient_level_trajectory(windows: Sequence[Dict[str, Any]]) -> Dict[s
 
 def _build_error_report(window: Dict[str, Any], error_message: str) -> OracleReport:
     return OracleReport(
-        patient_status={
-            "domains": {},
+        patient_assessment={
             "overall": {"label": "insufficient_data", "rationale": "Oracle evaluation failed."},
-            "overall_status": "unknown",
-            "summary": "Oracle evaluation failed.",
+            "active_risks": [],
         },
-        doctor_actions=[],
+        action_review={"evaluations": [], "red_flags": []},
         window_data=window,
         context_mode="raw_local_trajectory_icu_events_only",
         context_stats={},
@@ -184,6 +182,7 @@ def process_jsonl_for_oracle(
     config: Config,
     input_jsonl: str,
     output_dir: str,
+    full_windows_jsonl: Optional[str] = None,
     provider: str = "anthropic",
     model: Optional[str] = None,
     use_discharge_summary: Optional[bool] = None,
@@ -223,14 +222,14 @@ def process_jsonl_for_oracle(
     print("=" * 80)
     print(f"Run ID: {run_id}")
     print(f"Input JSONL: {input_jsonl}")
+    if full_windows_jsonl:
+        print(f"Full-window JSONL: {full_windows_jsonl}")
     print(f"Output Run Directory: {run_dir}")
 
     print("\nLoading JSONL windows...")
     raw_records = _load_jsonl_records(Path(input_jsonl), max_windows=max_windows)
     if not raw_records:
         raise ValueError(f"No windows found in JSONL: {input_jsonl}")
-
-    raw_records = raw_records[10:15]
 
     grouped: Dict[str, Dict[str, Any]] = {}
     patient_order: List[str] = []
@@ -266,6 +265,35 @@ def process_jsonl_for_oracle(
 
         grouped[patient_id]["windows"] = windows
         grouped[patient_id]["patient_trajectory"] = _build_patient_level_trajectory(windows)
+
+    full_windows_by_patient: Dict[str, List[Dict[str, Any]]] = {}
+    if full_windows_jsonl:
+        print("\nLoading full-window JSONL...")
+        full_raw_records = _load_jsonl_records(Path(full_windows_jsonl), max_windows=None)
+        full_raw_by_patient: Dict[str, List[Dict[str, Any]]] = {}
+        selected_patient_ids = set(patient_order)
+        for record in full_raw_records:
+            subject_id = _safe_int(record.get("subject_id"), default=-1)
+            icu_stay_id = _safe_int(record.get("icu_stay_id"), default=-1)
+            if subject_id < 0 or icu_stay_id < 0:
+                continue
+            patient_id = f"{subject_id}_{icu_stay_id}"
+            if patient_id not in selected_patient_ids:
+                continue
+            if patient_id not in full_raw_by_patient:
+                full_raw_by_patient[patient_id] = []
+            full_raw_by_patient[patient_id].append(record)
+
+        for patient_id in patient_order:
+            raw_windows = full_raw_by_patient.get(patient_id, [])
+            raw_windows.sort(key=_window_sort_key)
+            prepared_windows: List[Dict[str, Any]] = []
+            for local_index, raw_window in enumerate(raw_windows):
+                prepared_windows.append(_prepare_window_for_evaluation(raw_window, local_index=local_index))
+            full_windows_by_patient[patient_id] = prepared_windows
+
+        matched_patients = sum(1 for patient_id in patient_order if len(full_windows_by_patient.get(patient_id, [])) > 0)
+        print(f"  Loaded full windows for selected patients: {matched_patients}/{len(patient_order)}")
 
     print(f"  Loaded windows: {len(raw_records)}")
     print(f"  Patients in JSONL: {len(grouped)}")
@@ -370,14 +398,16 @@ def process_jsonl_for_oracle(
         "run_id": run_id,
         "run_directory": str(run_dir),
         "input_jsonl": str(input_jsonl),
+        "full_windows_jsonl": str(full_windows_jsonl) if full_windows_jsonl else None,
         "total_patients": len(grouped),
         "total_windows_input": len(raw_records),
         "total_windows_evaluated": 0,
         "windows_failed": 0,
         "patients_processed": 0,
         "patients_failed": 0,
+        "patients_with_full_window_contexts": 0,
         "overall_status_distribution": {},
-        "total_doctor_actions": 0,
+        "total_action_evaluations": 0,
     }
 
     print(f"\n{'=' * 80}")
@@ -414,17 +444,20 @@ def process_jsonl_for_oracle(
                     summary_stats["windows_failed"] += 1
 
             patient_status_counts: Dict[str, int] = {}
-            doctor_actions_count = 0
+            action_evaluations_count = 0
             for report in reports:
                 report_dict = report.to_dict()
                 status = _safe_status(report_dict)
                 patient_status_counts[status] = patient_status_counts.get(status, 0) + 1
-                doctor_actions_count += len(report_dict.get("doctor_actions", []))
+                action_review = report_dict.get("action_review")
+                evaluations = action_review.get("evaluations") if isinstance(action_review, dict) else []
+                if isinstance(evaluations, list):
+                    action_evaluations_count += len(evaluations)
                 summary_stats["overall_status_distribution"][status] = (
                     summary_stats["overall_status_distribution"].get(status, 0) + 1
                 )
 
-            summary_stats["total_doctor_actions"] += doctor_actions_count
+            summary_stats["total_action_evaluations"] += action_evaluations_count
             summary_stats["total_windows_evaluated"] += len(reports)
 
             patient_dir = patients_dir / patient_id
@@ -466,6 +499,22 @@ def process_jsonl_for_oracle(
             with open(window_contexts_path, "w", encoding="utf-8") as f:
                 json.dump(window_contexts_payload, f, indent=2, ensure_ascii=False, default=_json_default)
 
+            full_windows = full_windows_by_patient.get(patient_id, [])
+            if full_windows:
+                full_window_trajectory = _build_patient_level_trajectory(full_windows)
+                full_window_contexts_payload = _build_window_contexts_payload(
+                    run_id=run_id,
+                    trajectory=full_window_trajectory,
+                    windows=full_windows,
+                    llm_calls=[],
+                    history_hours=float(config.oracle_context_history_hours),
+                    future_hours=float(config.oracle_context_future_hours),
+                )
+                full_window_contexts_path = patient_dir / "full_window_contexts.json"
+                with open(full_window_contexts_path, "w", encoding="utf-8") as f:
+                    json.dump(full_window_contexts_payload, f, indent=2, ensure_ascii=False, default=_json_default)
+                summary_stats["patients_with_full_window_contexts"] += 1
+
             summary_stats["patients_processed"] += 1
             compression_used = bool(patient_eval.get("compression_used")) if isinstance(patient_eval, dict) else False
             compression_error = (
@@ -478,7 +527,7 @@ def process_jsonl_for_oracle(
             elif compression_error:
                 print(f"  Pre-ICU compression error (fallback to raw history): {compression_error}")
             print(f"  Status distribution: {patient_status_counts}")
-            print(f"  Total doctor actions extracted: {doctor_actions_count}")
+            print(f"  Total action evaluations: {action_evaluations_count}")
 
         except Exception as e:
             print(f"  ERROR: Failed to save patient outputs: {e}")
@@ -495,7 +544,8 @@ def process_jsonl_for_oracle(
     print(f"  Patients failed: {summary_stats['patients_failed']}")
     print(f"  Total windows evaluated: {summary_stats['total_windows_evaluated']}")
     print(f"  Failed windows: {summary_stats['windows_failed']}")
-    print(f"  Total doctor actions: {summary_stats['total_doctor_actions']}")
+    print(f"  Patients with full-window contexts: {summary_stats['patients_with_full_window_contexts']}")
+    print(f"  Total action evaluations: {summary_stats['total_action_evaluations']}")
     print(f"  Status distribution: {summary_stats['overall_status_distribution']}")
     print(f"  Total tokens used: {summary_stats['total_tokens_used']:,}")
     print(f"  Avg tokens per evaluation: {summary_stats['avg_tokens_per_evaluation']:.0f}")
@@ -504,6 +554,8 @@ def process_jsonl_for_oracle(
     print(f"  - Summary: {summary_file.name}")
     print("  - Per-patient predictions: patients/<subject_id>_<icu_stay_id>/oracle_predictions.json")
     print("  - Per-patient window context: patients/<subject_id>_<icu_stay_id>/window_contexts.json")
+    if full_windows_jsonl:
+        print("  - Per-patient full timeline context: patients/<subject_id>_<icu_stay_id>/full_window_contexts.json")
 
     print(f"\n{'=' * 80}")
     print("PROCESSING COMPLETE")
@@ -519,6 +571,15 @@ def main() -> None:
         type=str,
         required=True,
         help="Path to selected window JSONL file.",
+    )
+    parser.add_argument(
+        "--full-windows-jsonl",
+        type=str,
+        default=None,
+        help=(
+            "Optional full-window JSONL path (all windows for the same selected patients). "
+            "If provided, exports per-patient full_window_contexts.json for annotation plotting."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -597,6 +658,7 @@ def main() -> None:
     process_jsonl_for_oracle(
         config=config,
         input_jsonl=args.input_jsonl,
+        full_windows_jsonl=args.full_windows_jsonl,
         output_dir=args.output,
         provider=args.provider,
         model=args.model,

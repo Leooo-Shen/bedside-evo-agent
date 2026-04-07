@@ -12,7 +12,7 @@ This folder contains a standalone browser-based annotation app for Oracle window
 ## Usage
 
 1. Open `annotation/index.html` in a browser.
-2. Choose the patient case folder and click **Load From Folder** (auto-detects `oracle_predictions.json` and `window_contexts.json`).
+2. Choose the patient case folder and click **Load From Folder** (auto-detects `oracle_predictions.json`, `window_contexts.json`, and optional `full_window_contexts.json`).
 3. Annotate each valid window round.
 4. Draft handling:
    - Auto-save runs locally in browser storage and auto-restores on next load for the same case.
@@ -29,6 +29,9 @@ This folder contains a standalone browser-based annotation app for Oracle window
 - Context source priority:
   - `window_contexts.json` (if provided)
   - `oracle_predictions.json` raw event fields
+- Vital trend source priority:
+  - `full_window_contexts.json` prior windows by `source_window_index` (if provided)
+  - sparse loaded rounds fallback (from selected windows only)
 - The "Previous k-hour Observation" section uses the configured Oracle context `history_hours` (with per-window prompt metadata fallback).
 - "Previous k-hour Observation" event source priority:
   - `window_contexts.window_contexts[i].oracle_context_history_events` (preferred)

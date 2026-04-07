@@ -4,7 +4,7 @@
 
 1. Python 3.8 or higher
 2. MIMIC-demo dataset in `data/mimic-demo/`
-3. OpenAI, Anthropic, or Google Gemini API key
+3. OpenAI, Anthropic, or Google Gemini credentials (API key or Vertex AI service account)
 
 ## Installation
 
@@ -26,6 +26,17 @@ export GOOGLE_API_KEY="your-google-key"
 ```
 
 **Note:** The `.env` file is automatically loaded by the system. The system is configured to use OpenAI by default. You can switch providers with `--provider anthropic` or `--provider google`.
+
+For Vertex AI (Gemini on Google Cloud), use:
+
+```bash
+export GOOGLE_GENAI_USE_VERTEXAI=true
+export GOOGLE_APPLICATION_CREDENTIALS="/absolute/path/to/service-account.json"
+export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
+export GOOGLE_CLOUD_LOCATION="global"
+```
+
+`GOOGLE_PROJECT_ID` is also supported as an alternative to `GOOGLE_CLOUD_PROJECT`.
 
 ## Verify Setup
 
@@ -135,6 +146,11 @@ To use Google Gemini:
 python run_oracle.py --provider google --model gemini-1.5-flash
 ```
 
+To use Google Vertex AI Gemini:
+```bash
+python run_oracle.py --provider google --model gemini-2.5-flash
+```
+
 ## Programmatic Usage
 
 ```python
@@ -194,6 +210,13 @@ echo $ANTHROPIC_API_KEY
 export ANTHROPIC_API_KEY="your-key"
 # Or for Gemini:
 export GOOGLE_API_KEY="your-key"
+```
+
+For Vertex AI setup issues:
+```bash
+echo $GOOGLE_GENAI_USE_VERTEXAI
+echo $GOOGLE_CLOUD_PROJECT
+echo $GOOGLE_APPLICATION_CREDENTIALS
 ```
 
 ### "No windows generated"

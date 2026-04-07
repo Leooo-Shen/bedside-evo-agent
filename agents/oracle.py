@@ -23,22 +23,8 @@ except ImportError:  # pragma: no cover - optional dependency
     tiktoken = None
 
 
-DOMAIN_KEYS = ("hemodynamics", "respiratory", "renal_metabolic", "neurology")
-VALID_STATUS = {"improving", "stable", "deteriorating", "fluctuating", "insufficient_data"}
-VALID_ACTION_CATEGORY = {"medication_start", "medication_order", "procedure", "transfer", "other"}
-VALID_QUALITY_RATING = {"optimal", "neutral", "sub_optimal"}
-VALID_GUIDELINE_ADHERENCE = {"adherent", "non_adherent", "not_applicable", "guideline_unclear"}
-VALID_CONTEXTUAL_APPROPRIATENESS = {
-    "appropriate",
-    "suboptimal",
-    "potentially_harmful",
-    "insufficient_data",
-    "not_enough_context",
-}
-CONTEXTUAL_APPROPRIATENESS_ALIASES = {
-    "insufficient": "insufficient_data",
-    "not_enough_context": "insufficient_data",
-}
+VALID_STATUS = {"improving", "stable", "deteriorating", "insufficient_data"}
+VALID_ACTION_REVIEW_LABEL = {"best_practice", "acceptable", "potentially_harmful", "insufficient_data"}
 OUTCOME_MASK_TOKEN = "[OUTCOME_MASKED]"
 OUTCOME_LEAK_TERMS_PATTERN = re.compile(
     r"(?i)\b(expired|deceased|dead|died|passed\s+away|death|hospice|comfort\s+measures)\b"
@@ -60,29 +46,15 @@ class OracleReport:
 
     def __init__(
         self,
-        patient_status: Dict[str, Any],
-        doctor_actions: List[Dict[str, Any]],
-        action_evaluations: Optional[List[Dict[str, Any]]] = None,
-        overall_window_summary: str = "",
-        clinical_quality: Optional[Dict[str, Any]] = None,
-        primary_clinical_driver: str = "",
-        clinical_pearl: str = "",
+        patient_assessment: Optional[Dict[str, Any]] = None,
+        action_review: Optional[Dict[str, Any]] = None,
         window_data: Optional[Dict[str, Any]] = None,
         context_mode: str = "raw_local_trajectory_icu_events_only",
         context_stats: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
     ):
-        self.patient_status = patient_status
-        self.doctor_actions = doctor_actions
-        self.action_evaluations = _normalize_action_evaluations(action_evaluations)
-        self.overall_window_summary = _normalize_overall_window_summary(overall_window_summary)
-        self.clinical_quality = _normalize_clinical_quality(
-            clinical_quality,
-            action_evaluations=self.action_evaluations,
-            overall_window_summary=self.overall_window_summary,
-        )
-        self.primary_clinical_driver = _normalize_primary_clinical_driver(primary_clinical_driver)
-        self.clinical_pearl = _normalize_clinical_pearl(clinical_pearl)
+        self.patient_assessment = _normalize_patient_assessment(patient_assessment)
+        self.action_review = _normalize_action_review(action_review)
         self.window_data = window_data
         self.context_mode = context_mode
         self.context_stats = context_stats or {}
@@ -90,13 +62,8 @@ class OracleReport:
 
     def to_dict(self) -> Dict[str, Any]:
         payload = {
-            "patient_status": self.patient_status,
-            "action_evaluations": self.action_evaluations,
-            "overall_window_summary": self.overall_window_summary,
-            "doctor_actions": self.doctor_actions,
-            "clinical_quality": self.clinical_quality,
-            "primary_clinical_driver": self.primary_clinical_driver,
-            "clinical_pearl": self.clinical_pearl,
+            "patient_assessment": self.patient_assessment,
+            "action_review": self.action_review,
             "context_mode": self.context_mode,
             "context_stats": self.context_stats,
         }
@@ -115,37 +82,9 @@ class OracleReport:
         context_mode: str = "raw_local_trajectory_icu_events_only",
         context_stats: Optional[Dict[str, Any]] = None,
     ) -> "OracleReport":
-        patient_status = _normalize_patient_status(data.get("patient_status"))
-        action_evaluations = _normalize_action_evaluations(data.get("action_evaluations"))
-        doctor_actions = _normalize_doctor_actions(data.get("doctor_actions"))
-        if not doctor_actions and action_evaluations:
-            doctor_actions = _derive_doctor_actions_from_action_evaluations(action_evaluations)
-
-        overall_window_summary = _normalize_overall_window_summary(data.get("overall_window_summary"))
-        if not overall_window_summary:
-            overall_window_summary = _safe_text(patient_status.get("summary"))
-
-        clinical_quality = _normalize_clinical_quality(
-            data.get("clinical_quality"),
-            action_evaluations=action_evaluations,
-            overall_window_summary=overall_window_summary,
-        )
-
-        primary_driver = _safe_text(data.get("primary_clinical_driver"))
-        if not primary_driver:
-            audit_metadata = data.get("audit_metadata")
-            if isinstance(audit_metadata, dict):
-                primary_driver = _safe_text(audit_metadata.get("primary_clinical_driver"))
-
-        clinical_pearl = _normalize_clinical_pearl(data.get("clinical_pearl"))
         return cls(
-            patient_status=patient_status,
-            doctor_actions=doctor_actions,
-            action_evaluations=action_evaluations,
-            overall_window_summary=overall_window_summary,
-            clinical_quality=clinical_quality,
-            primary_clinical_driver=primary_driver,
-            clinical_pearl=clinical_pearl,
+            patient_assessment=data.get("patient_assessment"),
+            action_review=data.get("action_review"),
             window_data=window_data,
             context_mode=context_mode,
             context_stats=context_stats or {},
@@ -817,8 +756,8 @@ class MetaOracle:
                 )
 
             report = OracleReport(
-                patient_status=_normalize_patient_status({}),
-                doctor_actions=[],
+                patient_assessment=_normalize_patient_assessment({}),
+                action_review=_normalize_action_review({}),
                 window_data=window_data,
                 context_mode=context_info.get("mode", "raw_local_trajectory_icu_events_only"),
                 context_stats={
@@ -908,8 +847,8 @@ class MetaOracle:
                 except Exception as e:
                     print(f"Error evaluating window {index} (Hour {window_hour}): {e}")
                     results[index] = OracleReport(
-                        patient_status=_normalize_patient_status({}),
-                        doctor_actions=[],
+                        patient_assessment=_normalize_patient_assessment({}),
+                        action_review=_normalize_action_review({}),
                         window_data=window,
                         context_mode="raw_local_trajectory_icu_events_only",
                         context_stats={
@@ -930,8 +869,8 @@ class MetaOracle:
             window = windows_with_index[index]
             reports.append(
                 OracleReport(
-                    patient_status=_normalize_patient_status({}),
-                    doctor_actions=[],
+                    patient_assessment=_normalize_patient_assessment({}),
+                    action_review=_normalize_action_review({}),
                     window_data=window,
                     context_mode="raw_local_trajectory_icu_events_only",
                     context_stats={
@@ -1286,440 +1225,136 @@ def _build_fallback_pre_icu_compression(pre_icu_history: Dict[str, Any]) -> str:
     return _truncate_text("\n".join(lines), max_chars=1800)
 
 
-def _normalize_domain_assessments(
-    domains_value: Any,
-    fallback_physiology: Any,
-) -> Dict[str, Dict[str, Any]]:
-    domains_data = domains_value if isinstance(domains_value, dict) else {}
-    fallback = _normalize_physiology_trends(fallback_physiology)
-
-    normalized: Dict[str, Dict[str, Any]] = {}
-    for key in DOMAIN_KEYS:
-        item = domains_data.get(key)
-        if not isinstance(item, dict):
-            item = {}
-
-        label = _safe_text(item.get("label")).lower()
-        if label not in VALID_STATUS:
-            label = fallback.get(key, {}).get("status", "insufficient_data")
-        if label not in VALID_STATUS:
-            label = "insufficient_data"
-
-        rationale = _safe_text(item.get("rationale"))
-        if not rationale:
-            rationale = fallback.get(key, {}).get("rationale", "")
-        if not rationale:
-            rationale = "No rationale provided."
-
-        key_signals_raw = item.get("key_signals")
-        if not isinstance(key_signals_raw, list):
-            key_signals_raw = item.get("key_evidence")
-        key_signals: List[str] = []
-        if isinstance(key_signals_raw, list):
-            for signal in key_signals_raw:
-                if isinstance(signal, dict):
-                    signal_text = _safe_text(signal.get("id") or signal.get("event_id") or signal.get("ref"))
-                else:
-                    signal_text = _safe_text(signal)
-                if signal_text:
-                    key_signals.append(signal_text)
-
-        normalized[key] = {
-            "label": label,
-            "key_signals": key_signals,
-            "rationale": rationale,
-        }
-
-    return normalized
-
-
-def _domains_to_physiology_trends(domains: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
-    normalized: Dict[str, Dict[str, str]] = {}
-    for key in DOMAIN_KEYS:
-        item = domains.get(key, {})
-        status = _safe_text(item.get("label")).lower()
-        if status not in VALID_STATUS:
-            status = "insufficient_data"
-
-        rationale = _safe_text(item.get("rationale"))
-        if not rationale:
-            rationale = "No rationale provided."
-
-        normalized[key] = {
-            "status": status,
-            "rationale": rationale,
-        }
-
-    return normalized
-
-
-def _normalize_patient_status(value: Any) -> Dict[str, Any]:
-    data = value if isinstance(value, dict) else {}
-
-    domains = _normalize_domain_assessments(data.get("domains"), data.get("physiology_trends"))
-    physiology = _domains_to_physiology_trends(domains)
-
-    overall_data = data.get("overall") if isinstance(data.get("overall"), dict) else {}
-    overall = _safe_text(overall_data.get("label")).lower()
-    if overall not in VALID_STATUS:
-        overall = _safe_text(data.get("overall_status")).lower()
-    if overall not in VALID_STATUS:
-        overall = _infer_overall_from_domains(physiology)
-
-    overall_rationale = _safe_text(overall_data.get("rationale"))
-    summary = _safe_text(data.get("summary"))
-    if overall_rationale and not summary:
-        summary = overall_rationale
-    if summary and not overall_rationale:
-        overall_rationale = summary
-    if not summary:
-        summary = "Insufficient data to provide detailed status summary."
-    if not overall_rationale:
-        overall_rationale = summary
-
-    return {
-        "domains": domains,
-        "overall": {
-            "label": overall,
-            "rationale": overall_rationale,
-        },
-        # Backward-compatible fields used by existing analytics scripts.
-        "overall_status": overall,
-        "physiology_trends": physiology,
-        "summary": summary,
-    }
-
-
-def _normalize_physiology_trends(value: Any) -> Dict[str, Dict[str, str]]:
-    data = value if isinstance(value, dict) else {}
-
-    normalized: Dict[str, Dict[str, str]] = {}
-    for key in DOMAIN_KEYS:
-        item = data.get(key)
-        if not isinstance(item, dict):
-            item = {}
-
-        status = _safe_text(item.get("status")).lower()
-        if status not in VALID_STATUS:
-            status = "insufficient_data"
-
-        rationale = _safe_text(item.get("rationale"))
-        if not rationale:
-            rationale = "No rationale provided."
-
-        normalized[key] = {
-            "status": status,
-            "rationale": rationale,
-        }
-
-    return normalized
-
-
-def _infer_overall_from_domains(physiology: Dict[str, Dict[str, str]]) -> str:
-    statuses = [item.get("status", "insufficient_data") for item in physiology.values()]
-    if all(status == "insufficient_data" for status in statuses):
-        return "insufficient_data"
-    if "deteriorating" in statuses:
-        return "deteriorating"
-    if "fluctuating" in statuses:
-        return "fluctuating"
-    if "improving" in statuses and "stable" not in statuses:
-        return "improving"
-    return "stable"
-
-
-def _normalize_doctor_actions(value: Any) -> List[Dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-
-    normalized: List[Dict[str, Any]] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-
-        action = _safe_text(item.get("action"))
-        if not action:
-            action = _safe_text(item.get("action_name"))
-        if not action:
-            action = _safe_text(item.get("action_description"))
-        if not action:
-            continue
-
-        category = _safe_text(item.get("category")).lower()
-        if category not in VALID_ACTION_CATEGORY:
-            category = "other"
-
-        refs_raw = item.get("evidence_event_refs")
-        if not isinstance(refs_raw, list):
-            refs_raw = item.get("key_evidence") if isinstance(item.get("key_evidence"), list) else []
-        refs: List[str] = []
-        for ref in refs_raw:
-            if isinstance(ref, dict):
-                ref_text = _safe_text(ref.get("id") or ref.get("event_id") or ref.get("ref"))
-            else:
-                ref_text = _safe_text(ref)
-            if ref_text:
-                refs.append(ref_text)
-
-        normalized.append(
-            {
-                "time": item.get("time"),
-                "action": action,
-                "category": category,
-                "evidence_event_refs": refs,
-            }
-        )
-
-    return normalized
-
-
-def _normalize_action_evaluations(value: Any) -> List[Dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-
-    normalized: List[Dict[str, Any]] = []
-    for index, item in enumerate(value, start=1):
-        if not isinstance(item, dict):
-            continue
-
-        action_name = _safe_text(item.get("action_name"))
-        action_description = _safe_text(item.get("action_description"))
-        if not action_description:
-            action_description = action_name
-        if not action_description:
-            action_description = _safe_text(item.get("action"))
-        if not action_description:
-            continue
-        if not action_name:
-            action_name = action_description
-
-        action_id = _safe_text(item.get("action_id")) or f"A{index}"
-
-        guideline = item.get("guideline_adherence") if isinstance(item.get("guideline_adherence"), dict) else {}
-        guideline_label = _safe_text(guideline.get("label")).lower()
-        if guideline_label not in VALID_GUIDELINE_ADHERENCE:
-            guideline_label = "guideline_unclear"
-        guideline_reference = guideline.get("guideline_reference")
-        if guideline_reference is None:
-            guideline_reference = guideline.get("reference")
-        if guideline_reference is not None:
-            guideline_reference = _safe_text(guideline_reference) or None
-        guideline_rationale = _safe_text(guideline.get("rationale"))
-        if not guideline_rationale:
-            guideline_rationale = "No guideline adherence rationale provided."
-
-        contextual = (
-            item.get("contextual_appropriateness") if isinstance(item.get("contextual_appropriateness"), dict) else {}
-        )
-        contextual_label = _normalize_contextual_appropriateness_label(contextual.get("label"))
-        contextual_rationale = _safe_text(contextual.get("rationale"))
-        if not contextual_rationale:
-            contextual_rationale = _safe_text(contextual.get("hindsight_usage"))
-        if not contextual_rationale:
-            contextual_rationale = "No contextual appropriateness rationale provided."
-        hindsight_caveat = _safe_text(contextual.get("hindsight_caveat")) or _safe_text(
-            contextual.get("hindsight_usage")
-        )
-        if not hindsight_caveat:
-            hindsight_caveat = None
-
-        overall = item.get("overall") if isinstance(item.get("overall"), dict) else {}
-        overall_label = _normalize_contextual_appropriateness_label(overall.get("label"))
-        overall_rationale = _safe_text(overall.get("rationale"))
-        if not overall_rationale:
-            overall_rationale = contextual_rationale
-
-        normalized.append(
-            {
-                "action_id": action_id,
-                "action_name": action_name,
-                "action_description": action_description,
-                "guideline_adherence": {
-                    "label": guideline_label,
-                    "guideline_reference": guideline_reference,
-                    "rationale": guideline_rationale,
-                },
-                "contextual_appropriateness": {
-                    "label": contextual_label,
-                    "rationale": contextual_rationale,
-                    "hindsight_caveat": hindsight_caveat,
-                    "hindsight_usage": hindsight_caveat,
-                },
-                "overall": {
-                    "label": overall_label,
-                    "rationale": overall_rationale,
-                },
-            }
-        )
-
-    return normalized
-
-
-def _normalize_overall_window_summary(value: Any) -> str:
-    return _safe_text(value)
-
-
-def _extract_event_refs(text: Any) -> List[str]:
-    candidate = _safe_text(text)
-    if not candidate:
-        return []
-
-    refs: List[str] = []
-    seen = set()
-
-    for ref in re.findall(r"\bevent_id\s*[:=]\s*(\d+)\b", candidate, flags=re.IGNORECASE):
-        if ref not in seen:
-            seen.add(ref)
-            refs.append(ref)
-
-    for ref in re.findall(r"\[(\d+)\]", candidate):
-        if ref not in seen:
-            seen.add(ref)
-            refs.append(ref)
-
-    stripped = candidate.strip()
-    if re.fullmatch(r"[\d,\s;|]+", stripped):
-        for ref in re.findall(r"\d+", stripped):
-            if ref not in seen:
-                seen.add(ref)
-                refs.append(ref)
-    return refs
-
-
-def _derive_doctor_actions_from_action_evaluations(action_evaluations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    derived: List[Dict[str, Any]] = []
-    for action in action_evaluations:
-        action_description = _safe_text(action.get("action_description"))
-        if not action_description:
-            action_description = _safe_text(action.get("action_name"))
-        if not action_description:
-            continue
-
-        refs = _extract_event_refs(action.get("action_id"))
-        if not refs:
-            refs = _extract_event_refs(action_description)
-
-        derived.append(
-            {
-                "time": None,
-                "action": action_description,
-                "category": "other",
-                "evidence_event_refs": refs,
-            }
-        )
-
-    return derived
-
-
-def _infer_clinical_quality_from_actions(
-    action_evaluations: Optional[List[Dict[str, Any]]] = None,
-    overall_window_summary: str = "",
-) -> Dict[str, str]:
-    actions = action_evaluations if isinstance(action_evaluations, list) else []
-    summary = _safe_text(overall_window_summary)
-
-    if not actions:
-        return {
-            "rating": "neutral",
-            "rationale": summary or "No clinical quality rationale provided.",
-            "guideline_adherence": "not_specified",
-        }
-
-    guideline_labels = [
-        _safe_text(action.get("guideline_adherence", {}).get("label")).lower()
-        for action in actions
-        if isinstance(action, dict)
-    ]
-    contextual_labels = [
-        _safe_text(action.get("contextual_appropriateness", {}).get("label")).lower()
-        for action in actions
-        if isinstance(action, dict)
-    ]
-
-    has_non_adherent = "non_adherent" in guideline_labels
-    has_potential_harm = "potentially_harmful" in contextual_labels
-    all_context_acceptable = all(
-        label in {"appropriate", "not_enough_context", "insufficient_data"} for label in contextual_labels if label
-    ) and any(label == "appropriate" for label in contextual_labels)
-    all_guideline_non_negative = all(
-        label in {"adherent", "not_applicable", "guideline_unclear"} for label in guideline_labels if label
-    )
-
-    if has_non_adherent or has_potential_harm:
-        rating = "sub_optimal"
-    elif all_context_acceptable and all_guideline_non_negative:
-        rating = "optimal"
-    else:
-        rating = "neutral"
-
-    guideline_counts = {
-        label: guideline_labels.count(label)
-        for label in ["adherent", "non_adherent", "not_applicable", "guideline_unclear"]
-    }
-    guideline_adherence = ", ".join(f"{k}={v}" for k, v in guideline_counts.items())
-
-    rationale = summary
-    if not rationale:
-        rationale = f"Quality inferred from {len(actions)} action evaluations."
-
-    return {
-        "rating": rating,
-        "rationale": rationale,
-        "guideline_adherence": guideline_adherence,
-    }
-
-
-def _normalize_clinical_quality(
-    value: Any,
-    action_evaluations: Optional[List[Dict[str, Any]]] = None,
-    overall_window_summary: str = "",
-) -> Dict[str, str]:
-    data = value if isinstance(value, dict) else {}
-    inferred = _infer_clinical_quality_from_actions(action_evaluations, overall_window_summary)
-
-    rating = _safe_text(data.get("rating")).lower().replace("-", "_")
-    if rating not in VALID_QUALITY_RATING:
-        rating = inferred["rating"]
-
-    rationale = _safe_text(data.get("rationale"))
-    if not rationale:
-        rationale = inferred["rationale"]
-    if not rationale:
-        rationale = "No clinical quality rationale provided."
-
-    guideline_adherence = _safe_text(data.get("guideline_adherence"))
-    if not guideline_adherence:
-        guideline_adherence = inferred["guideline_adherence"]
-    if not guideline_adherence:
-        guideline_adherence = "not_specified"
-
-    return {
-        "rating": rating,
-        "rationale": rationale,
-        "guideline_adherence": guideline_adherence,
-    }
-
-
-def _normalize_primary_clinical_driver(value: Any) -> str:
-    text = _safe_text(value)
-    if not text:
-        return "Unspecified primary clinical driver."
-    return text
-
-
-def _normalize_clinical_pearl(value: Any) -> str:
-    text = _safe_text(value)
-    if not text:
-        return "No clinical pearl provided."
-    return text
-
-
-def _normalize_contextual_appropriateness_label(value: Any) -> str:
+def _normalize_overall_label(value: Any) -> str:
     label = _safe_text(value).lower().replace("-", "_").replace(" ", "_")
-    label = CONTEXTUAL_APPROPRIATENESS_ALIASES.get(label, label)
-    if label not in VALID_CONTEXTUAL_APPROPRIATENESS:
+    label = {
+        "insufficient": "insufficient_data",
+        "not_enough_data": "insufficient_data",
+        "unknown": "insufficient_data",
+    }.get(label, label)
+    if label not in VALID_STATUS:
         return "insufficient_data"
     return label
+
+
+def _normalize_action_review_label(value: Any) -> str:
+    label = _safe_text(value).lower().replace("-", "_").replace(" ", "_")
+    label = {
+        "best": "best_practice",
+        "good": "acceptable",
+        "harmful": "potentially_harmful",
+        "potential_harm": "potentially_harmful",
+        "insufficient": "insufficient_data",
+        "unknown": "insufficient_data",
+    }.get(label, label)
+    if label not in VALID_ACTION_REVIEW_LABEL:
+        return "insufficient_data"
+    return label
+
+
+def _normalize_key_evidence(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    key_evidence: List[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            token = _safe_text(item.get("id") or item.get("event_id") or item.get("ref"))
+        else:
+            token = _safe_text(item)
+        if token:
+            key_evidence.append(token)
+    return key_evidence
+
+
+def _normalize_patient_assessment(value: Any) -> Dict[str, Any]:
+    data = value if isinstance(value, dict) else {}
+    overall_data = data.get("overall") if isinstance(data.get("overall"), dict) else {}
+
+    overall_label = _normalize_overall_label(overall_data.get("label"))
+    overall_rationale = _safe_text(overall_data.get("rationale"))
+    if not overall_rationale:
+        overall_rationale = "Insufficient data to assess patient trajectory at this window."
+
+    active_risks: List[Dict[str, Any]] = []
+    active_risks_raw = data.get("active_risks")
+    if isinstance(active_risks_raw, list):
+        for risk in active_risks_raw:
+            if not isinstance(risk, dict):
+                continue
+            risk_name = _safe_text(risk.get("risk_name"))
+            if not risk_name:
+                continue
+            active_risks.append(
+                {
+                    "risk_name": risk_name,
+                    "key_evidence": _normalize_key_evidence(risk.get("key_evidence")),
+                }
+            )
+
+    return {
+        "overall": {
+            "label": overall_label,
+            "rationale": overall_rationale,
+        },
+        "active_risks": active_risks,
+    }
+
+
+def _normalize_action_review(value: Any) -> Dict[str, Any]:
+    data = value if isinstance(value, dict) else {}
+
+    evaluations: List[Dict[str, Any]] = []
+    evaluations_raw = data.get("evaluations")
+    if isinstance(evaluations_raw, list):
+        for index, evaluation in enumerate(evaluations_raw, start=1):
+            if not isinstance(evaluation, dict):
+                continue
+
+            action_name = _safe_text(evaluation.get("action_name"))
+            if not action_name:
+                action_name = _safe_text(evaluation.get("action"))
+            if not action_name:
+                action_name = _safe_text(evaluation.get("action_description"))
+            if not action_name:
+                continue
+
+            action_id = _safe_text(evaluation.get("action_id")) or str(index)
+            label = _normalize_action_review_label(evaluation.get("label"))
+            rationale = _safe_text(evaluation.get("rationale"))
+            if not rationale:
+                rationale = "No rationale provided."
+
+            evaluations.append(
+                {
+                    "action_id": action_id,
+                    "action_name": action_name,
+                    "label": label,
+                    "rationale": rationale,
+                }
+            )
+
+    red_flags: List[Dict[str, Any]] = []
+    red_flags_raw = data.get("red_flags")
+    if isinstance(red_flags_raw, list):
+        for red_flag in red_flags_raw:
+            if not isinstance(red_flag, dict):
+                continue
+            contraindicated_action = _safe_text(red_flag.get("contraindicated_action"))
+            reason = _safe_text(red_flag.get("reason"))
+            if not contraindicated_action or not reason:
+                continue
+            red_flags.append(
+                {
+                    "contraindicated_action": contraindicated_action,
+                    "reason": reason,
+                    "key_evidence": _normalize_key_evidence(red_flag.get("key_evidence")),
+                }
+            )
+
+    return {
+        "evaluations": evaluations,
+        "red_flags": red_flags,
+    }
 
 
 def _best_effort_parse_json(content: str) -> Dict[str, Any]:

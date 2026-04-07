@@ -7,12 +7,12 @@ import argparse
 import io
 import json
 import math
-import random
 import sys
+from collections import deque
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 import matplotlib
 import pandas as pd
@@ -55,6 +55,12 @@ PATIENT_STATS_COLUMNS: Sequence[str] = (
     "survived",
     "generated_windows",
     "selected_windows",
+    "selected_valid_windows",
+    "selected_invalid_windows",
+    "selected_valid_ratio",
+    "ratio_gap_to_target",
+    "meets_min_windows",
+    "selected_for_final_cohort",
     "selected_ratio",
     "window_generation_current_hours",
     "window_generation_step_hours",
@@ -68,6 +74,8 @@ SELECTED_WINDOW_STATS_COLUMNS: Sequence[str] = (
     "num_current_events",
     "num_history_events",
     "num_total_events",
+    "action_event_ratio",
+    "window_bucket",
     "has_current_discharge_summary",
     "icu_timeline_fraction",
     "icu_timeline_segment",
@@ -84,8 +92,8 @@ ICU_TIMELINE_SEGMENT_ORDER: Sequence[str] = (
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate windows from sampled ICU stays, filter by action-event ratio, "
-            "and save Oracle-ready window JSONL."
+            "Generate windows from all ICU stays in the dataset, apply timeline-first "
+            "valid/invalid selection, and save Oracle-ready window JSONL."
         )
     )
     parser.add_argument(
@@ -97,7 +105,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--subset-dir",
         type=Path,
-        default=Path("data/mimic-demo/anno_subset_140"),
+        default=Path("data/mimic-demo/anno_subset_160"),
         help="Directory containing sampled subset parquet files.",
     )
     parser.add_argument(
@@ -131,6 +139,15 @@ def _parse_args() -> argparse.Namespace:
         help="Output JSONL path (default: <subset-dir>/selected_windows_action_ratio_0p5.jsonl).",
     )
     parser.add_argument(
+        "--output-full-jsonl",
+        type=Path,
+        default=None,
+        help=(
+            "Optional full-window JSONL path for final selected patients. "
+            "If provided, exports all windows of those patients for annotation timeline plotting."
+        ),
+    )
+    parser.add_argument(
         "--patient-stats-csv",
         type=Path,
         default=None,
@@ -149,36 +166,42 @@ def _parse_args() -> argparse.Namespace:
         help="Statistics output directory (default: <subset-dir>/statistics).",
     )
     parser.add_argument(
-        "--max-patients",
+        "--min-windows-per-patient",
         type=int,
-        default=None,
-        help="Optional cap for number of ICU stays processed.",
-    )
-    parser.add_argument(
-        "--target-survived",
-        type=int,
-        default=None,
-        help=("Target number of survived patients with at least one selected window. " "Requires --target-died."),
-    )
-    parser.add_argument(
-        "--target-died",
-        type=int,
-        default=None,
-        help=("Target number of died patients with at least one selected window. " "Requires --target-survived."),
-    )
-    parser.add_argument(
-        "--sampling-seed",
-        type=int,
-        default=1,
-        help="Random seed used to shuffle top-up candidates by outcome.",
+        default=5,
+        help="Preferred minimum selected windows per patient (default: 5).",
     )
     parser.add_argument(
         "--max-windows-per-patient",
         type=int,
-        default=20,
+        default=10,
+        help="Maximum selected windows per patient (default: 10).",
+    )
+    parser.add_argument(
+        "--selected-survived-count",
+        type=int,
+        default=50,
+        help="Number of survived patients kept after quality ranking (default: 50).",
+    )
+    parser.add_argument(
+        "--selected-died-count",
+        type=int,
+        default=50,
+        help="Number of died patients kept after quality ranking (default: 50).",
+    )
+    parser.add_argument(
+        "--valid-window-ratio-target",
+        type=float,
+        default=0.8,
+        help=("Target fraction of selected windows that satisfy ratio>=threshold " "(default: 0.8)."),
+    )
+    parser.add_argument(
+        "--late-segment-boost",
+        type=int,
+        default=2,
         help=(
-            "If set, cap selected windows per patient to this number by random sampling "
-            "after all filters are applied."
+            "Sampling weight multiplier for late_1_3 during timeline balancing. "
+            "1 means no boost; 2 means late gets roughly double chances per round (default: 2)."
         ),
     )
     parser.add_argument(
@@ -471,7 +494,7 @@ def _save_timeline_segment_barplot(timeline_segment_counts_df: pd.DataFrame, out
     plt.close(fig)
 
 
-def _resolve_paths(args: argparse.Namespace) -> Dict[str, Path]:
+def _resolve_paths(args: argparse.Namespace) -> Dict[str, Any]:
     events_path = args.events_path or (args.subset_dir / "events.parquet")
     icu_stay_path = args.icu_stay_path or (args.subset_dir / "icu_stay.parquet")
 
@@ -484,6 +507,7 @@ def _resolve_paths(args: argparse.Namespace) -> Dict[str, Path]:
         args.subset_dir / f"selected_windows_action_ratio_{str(args.ratio_threshold).replace('.', 'p')}.jsonl"
     )
     output_jsonl = args.output_jsonl or default_output_jsonl
+    output_full_jsonl = Path(args.output_full_jsonl) if args.output_full_jsonl else None
     patient_stats_csv = args.patient_stats_csv or (args.subset_dir / "patient_window_selection_stats.csv")
     summary_json = args.summary_json or (args.subset_dir / "window_selection_summary.json")
     statistics_dir = args.statistics_dir or (args.subset_dir / "statistics")
@@ -492,6 +516,7 @@ def _resolve_paths(args: argparse.Namespace) -> Dict[str, Path]:
         "events_path": Path(events_path),
         "icu_stay_path": Path(icu_stay_path),
         "output_jsonl": Path(output_jsonl),
+        "output_full_jsonl": output_full_jsonl,
         "patient_stats_csv": Path(patient_stats_csv),
         "summary_json": Path(summary_json),
         "statistics_dir": Path(statistics_dir),
@@ -546,76 +571,246 @@ def _create_windows_for_trajectory(
         return parser.create_time_windows(**kwargs)
 
 
-def _parse_target_patient_counts(args: argparse.Namespace) -> Optional[Dict[str, int]]:
-    if args.target_survived is None and args.target_died is None:
-        return None
-    if args.target_survived is None or args.target_died is None:
-        raise ValueError("Both --target-survived and --target-died must be provided together.")
-
-    target_survived = int(args.target_survived)
-    target_died = int(args.target_died)
-    if target_survived < 0 or target_died < 0:
-        raise ValueError("--target-survived and --target-died must be >= 0")
-
-    return {
-        "survived": target_survived,
-        "died": target_died,
-    }
-
-
 def _outcome_key_from_survived(value: Any) -> str:
     return "survived" if bool(value) else "died"
 
 
-def _balance_deficits(
-    target_counts: Mapping[str, int],
-    observed_counts: Mapping[str, int],
-) -> Dict[str, int]:
+def _record_action_ratio(record: Mapping[str, Any]) -> float:
+    selection_metadata = record.get("selection_metadata")
+    if isinstance(selection_metadata, Mapping):
+        return _safe_float(selection_metadata.get("action_event_ratio"), default=0.0)
+    return 0.0
+
+
+def _record_timeline_segment(record: Mapping[str, Any]) -> str:
+    selection_metadata = record.get("selection_metadata")
+    if isinstance(selection_metadata, Mapping):
+        segment = str(selection_metadata.get("icu_timeline_segment") or "unassigned")
+        if segment in ICU_TIMELINE_SEGMENT_ORDER:
+            return segment
+    return "unassigned"
+
+
+def _sample_records_evenly_across_timeline(
+    records: Sequence[Dict[str, Any]],
+    *,
+    target_count: int,
+    start_segment_offset: int = 0,
+    late_segment_boost: int = 1,
+) -> List[Dict[str, Any]]:
+    if target_count <= 0:
+        return []
+    if not records:
+        return []
+
+    timeline_buckets: Dict[str, List[Dict[str, Any]]] = {segment: [] for segment in ICU_TIMELINE_SEGMENT_ORDER}
+    for record in records:
+        segment = _record_timeline_segment(record)
+        if segment not in timeline_buckets:
+            segment = "unassigned"
+        timeline_buckets[segment].append(record)
+
+    def sort_key(record: Mapping[str, Any]) -> int:
+        return _safe_int(record.get("window_position"), default=10**9)
+
+    timeline_queues: Dict[str, deque] = {}
+    for segment in ICU_TIMELINE_SEGMENT_ORDER:
+        timeline_queues[segment] = deque(sorted(timeline_buckets[segment], key=sort_key))
+
+    primary_segments = list(ICU_TIMELINE_SEGMENT_ORDER[:-1])
+    if len(primary_segments) > 0:
+        offset = int(start_segment_offset) % len(primary_segments)
+        primary_segments = primary_segments[offset:] + primary_segments[:offset]
+    late_segment_name = "late_1_3"
+    weighted_primary_segments: List[str] = []
+    normalized_late_boost = max(int(late_segment_boost), 1)
+    for segment in primary_segments:
+        repeat_count = normalized_late_boost if segment == late_segment_name else 1
+        for _ in range(repeat_count):
+            weighted_primary_segments.append(segment)
+    fallback_segment = ICU_TIMELINE_SEGMENT_ORDER[-1]
+
+    selected_records: List[Dict[str, Any]] = []
+    while len(selected_records) < target_count:
+        picked_any = False
+        for segment in weighted_primary_segments:
+            queue = timeline_queues[segment]
+            if len(queue) == 0:
+                continue
+            selected_records.append(queue.popleft())
+            picked_any = True
+            if len(selected_records) >= target_count:
+                break
+        if len(selected_records) >= target_count:
+            break
+
+        primary_remaining = any(len(timeline_queues[segment]) > 0 for segment in primary_segments)
+        if (not primary_remaining) and (len(timeline_queues[fallback_segment]) > 0):
+            selected_records.append(timeline_queues[fallback_segment].popleft())
+            picked_any = True
+
+        if not picked_any:
+            break
+
+    return selected_records
+
+
+def _select_windows_for_patient(
+    candidate_records: Sequence[Dict[str, Any]],
+    *,
+    ratio_threshold: float,
+    min_windows_per_patient: int,
+    max_windows_per_patient: int,
+    valid_window_ratio_target: float,
+    late_segment_boost: int,
+) -> Dict[str, Any]:
+    all_records = list(candidate_records)
+    eligible_total = int(len(all_records))
+    if eligible_total == 0:
+        return {
+            "selected_records": [],
+            "eligible_total": 0,
+            "eligible_valid": 0,
+            "eligible_invalid": 0,
+            "target_total": 0,
+            "target_valid": 0,
+            "target_invalid": 0,
+            "selected_valid": 0,
+            "selected_invalid": 0,
+            "selected_valid_ratio": 0.0,
+            "ratio_gap_to_target": float(valid_window_ratio_target),
+            "meets_min_windows": False,
+        }
+
+    target_total = min(int(max_windows_per_patient), eligible_total)
+    target_total = max(target_total, 0)
+
+    valid_pool = [record for record in all_records if _record_action_ratio(record) >= ratio_threshold]
+    invalid_pool = [record for record in all_records if _record_action_ratio(record) < ratio_threshold]
+
+    target_valid = int(round(float(target_total) * float(valid_window_ratio_target)))
+    target_valid = max(min(target_valid, target_total), 0)
+    target_invalid = int(target_total - target_valid)
+
+    subject_id_for_offset = _safe_int(all_records[0].get("subject_id"), default=0)
+    icu_stay_id_for_offset = _safe_int(all_records[0].get("icu_stay_id"), default=0)
+    segment_offset_base = (subject_id_for_offset * 31 + icu_stay_id_for_offset) % 3
+    ordered_valid = _sample_records_evenly_across_timeline(
+        valid_pool,
+        target_count=len(valid_pool),
+        start_segment_offset=segment_offset_base,
+        late_segment_boost=late_segment_boost,
+    )
+    ordered_invalid = _sample_records_evenly_across_timeline(
+        invalid_pool,
+        target_count=len(invalid_pool),
+        start_segment_offset=(segment_offset_base + 1),
+        late_segment_boost=late_segment_boost,
+    )
+
+    selected_valid = list(ordered_valid[:target_valid])
+    selected_invalid = list(ordered_invalid[:target_invalid])
+    valid_cursor = int(len(selected_valid))
+    invalid_cursor = int(len(selected_invalid))
+
+    while (len(selected_valid) + len(selected_invalid)) < target_total:
+        current_total = len(selected_valid) + len(selected_invalid)
+        can_take_valid = valid_cursor < len(ordered_valid)
+        can_take_invalid = invalid_cursor < len(ordered_invalid)
+        if (not can_take_valid) and (not can_take_invalid):
+            break
+        if can_take_valid and (not can_take_invalid):
+            selected_valid.append(ordered_valid[valid_cursor])
+            valid_cursor += 1
+            continue
+        if can_take_invalid and (not can_take_valid):
+            selected_invalid.append(ordered_invalid[invalid_cursor])
+            invalid_cursor += 1
+            continue
+
+        ratio_if_take_valid = abs(
+            (float(len(selected_valid) + 1) / float(current_total + 1)) - float(valid_window_ratio_target)
+        )
+        ratio_if_take_invalid = abs(
+            (float(len(selected_valid)) / float(current_total + 1)) - float(valid_window_ratio_target)
+        )
+        if ratio_if_take_valid <= ratio_if_take_invalid:
+            selected_valid.append(ordered_valid[valid_cursor])
+            valid_cursor += 1
+        else:
+            selected_invalid.append(ordered_invalid[invalid_cursor])
+            invalid_cursor += 1
+
+    selected_records = list(selected_valid) + list(selected_invalid)
+    selected_records = sorted(
+        selected_records,
+        key=lambda record: _safe_int(record.get("window_position"), default=10**9),
+    )
+    selected_valid_count = sum(1 for record in selected_records if _record_action_ratio(record) >= ratio_threshold)
+    selected_invalid_count = int(len(selected_records) - selected_valid_count)
+    selected_valid_ratio = (float(selected_valid_count) / float(len(selected_records))) if selected_records else 0.0
+    ratio_gap_to_target = abs(float(selected_valid_ratio) - float(valid_window_ratio_target))
+
     return {
-        "survived": max(int(target_counts["survived"]) - int(observed_counts.get("survived", 0)), 0),
-        "died": max(int(target_counts["died"]) - int(observed_counts.get("died", 0)), 0),
+        "selected_records": selected_records,
+        "eligible_total": eligible_total,
+        "eligible_valid": int(len(valid_pool)),
+        "eligible_invalid": int(len(invalid_pool)),
+        "target_total": int(target_total),
+        "target_valid": int(target_valid),
+        "target_invalid": int(target_invalid),
+        "selected_valid": int(selected_valid_count),
+        "selected_invalid": int(selected_invalid_count),
+        "selected_valid_ratio": float(selected_valid_ratio),
+        "ratio_gap_to_target": float(ratio_gap_to_target),
+        "meets_min_windows": bool(len(selected_records) >= int(min_windows_per_patient)),
     }
 
 
-def _balance_targets_met(
-    target_counts: Mapping[str, int],
-    observed_counts: Mapping[str, int],
-) -> bool:
-    deficits = _balance_deficits(target_counts, observed_counts)
-    return deficits["survived"] == 0 and deficits["died"] == 0
-
-
-def _cap_selected_windows_per_patient(
-    records: Sequence[Dict[str, Any]],
-    *,
-    max_windows_per_patient: Optional[int],
-    sampling_seed: int,
-    subject_id: int,
-    icu_stay_id: int,
-) -> List[Dict[str, Any]]:
-    if max_windows_per_patient is None:
-        return list(records)
-    if len(records) <= max_windows_per_patient:
-        return list(records)
-
-    local_seed = (int(sampling_seed) * 1_000_003 + int(subject_id) * 9_176 + int(icu_stay_id)) & 0xFFFFFFFF
-    local_rng = random.Random(local_seed)
-    sampled_records = local_rng.sample(list(records), k=int(max_windows_per_patient))
-    sampled_records = sorted(
-        sampled_records,
-        key=lambda record: _safe_int(record.get("window_position"), default=10**9),
+def _patient_quality_sort_key(patient_entry: Mapping[str, Any]) -> tuple[float, int, int, int, int]:
+    return (
+        _safe_float(patient_entry.get("ratio_gap_to_target"), default=1.0),
+        -_safe_int(patient_entry.get("selected_windows"), default=0),
+        -_safe_int(patient_entry.get("generated_windows"), default=0),
+        _safe_int(patient_entry.get("subject_id"), default=10**9),
+        _safe_int(patient_entry.get("icu_stay_id"), default=10**9),
     )
-    return sampled_records
+
+
+def _select_top_patients_by_quality(
+    patient_entries: Sequence[Dict[str, Any]],
+    *,
+    target_count: int,
+    min_windows_per_patient: int,
+) -> List[Dict[str, Any]]:
+    sorted_entries = sorted(patient_entries, key=_patient_quality_sort_key)
+    enough_windows = [
+        entry
+        for entry in sorted_entries
+        if _safe_int(entry.get("selected_windows"), default=0) >= min_windows_per_patient
+    ]
+    low_window_entries = [
+        entry
+        for entry in sorted_entries
+        if _safe_int(entry.get("selected_windows"), default=0) < min_windows_per_patient
+    ]
+
+    selected_entries = list(enough_windows[:target_count])
+    remaining_slots = int(target_count - len(selected_entries))
+    if remaining_slots > 0:
+        selected_entries.extend(low_window_entries[:remaining_slots])
+    return selected_entries
 
 
 def main() -> None:
     args = _parse_args()
     paths = _resolve_paths(args)
     config = load_config(args.config)
-    target_patient_counts = _parse_target_patient_counts(args)
 
     output_parent = paths["output_jsonl"].parent
     output_parent.mkdir(parents=True, exist_ok=True)
+    if paths["output_full_jsonl"] is not None:
+        paths["output_full_jsonl"].parent.mkdir(parents=True, exist_ok=True)
     paths["patient_stats_csv"].parent.mkdir(parents=True, exist_ok=True)
     paths["summary_json"].parent.mkdir(parents=True, exist_ok=True)
     paths["statistics_dir"].mkdir(parents=True, exist_ok=True)
@@ -623,9 +818,22 @@ def main() -> None:
     ratio_threshold = float(args.ratio_threshold)
     if ratio_threshold < 0:
         raise ValueError(f"--ratio-threshold must be >= 0, got {ratio_threshold}")
-    max_windows_per_patient = args.max_windows_per_patient
-    if max_windows_per_patient is not None and int(max_windows_per_patient) <= 0:
-        raise ValueError("--max-windows-per-patient must be > 0 when provided.")
+    min_windows_per_patient = int(args.min_windows_per_patient)
+    max_windows_per_patient = int(args.max_windows_per_patient)
+    if min_windows_per_patient <= 0:
+        raise ValueError("--min-windows-per-patient must be > 0.")
+    if max_windows_per_patient < min_windows_per_patient:
+        raise ValueError("--max-windows-per-patient must be >= --min-windows-per-patient.")
+    valid_window_ratio_target = float(args.valid_window_ratio_target)
+    if (valid_window_ratio_target < 0.0) or (valid_window_ratio_target > 1.0):
+        raise ValueError("--valid-window-ratio-target must be within [0, 1].")
+    late_segment_boost = int(args.late_segment_boost)
+    if late_segment_boost <= 0:
+        raise ValueError("--late-segment-boost must be > 0.")
+    selected_survived_count = int(args.selected_survived_count)
+    selected_died_count = int(args.selected_died_count)
+    if selected_survived_count < 0 or selected_died_count < 0:
+        raise ValueError("--selected-survived-count and --selected-died-count must be >= 0.")
 
     parser = MIMICDataParser(
         events_path=str(paths["events_path"]),
@@ -638,27 +846,14 @@ def main() -> None:
         raise RuntimeError("Failed to load ICU stays from subset.")
 
     all_stays_df = parser.icu_stay_df.copy()
-    if args.max_patients is not None:
-        if int(args.max_patients) < 0:
-            raise ValueError("--max-patients must be >= 0")
-        max_patients = int(args.max_patients)
-        initial_stays_df = all_stays_df.head(max_patients).copy()
-        remaining_stays_df = all_stays_df.iloc[max_patients:].copy()
-    else:
-        initial_stays_df = all_stays_df.copy()
-        remaining_stays_df = all_stays_df.iloc[0:0].copy()
 
     action_code_set = _build_action_code_set(HIGH_IMPACT_EVENT_CODES)
     selected_records: List[Dict[str, Any]] = []
+    patient_entries: List[Dict[str, Any]] = []
     patient_stats_rows: List[Dict[str, Any]] = []
     total_windows_generated = 0
-    total_windows_selected = 0
     skipped_no_windows = 0
-    next_patient_index = 1
     processed_stay_keys: set[tuple[int, int]] = set()
-    selected_subject_ids: set[int] = set()
-    selected_patient_counts = {"survived": 0, "died": 0}
-    topup_attempted = False
 
     print(
         "Window generation config: "
@@ -674,35 +869,23 @@ def main() -> None:
         "Window filtering config: "
         f"ratio_threshold>={ratio_threshold:.4f}, "
         f"action_codes={sorted(action_code_set)}, "
-        f"max_windows_per_patient={max_windows_per_patient}"
+        f"min_windows_per_patient={min_windows_per_patient}, "
+        f"max_windows_per_patient={max_windows_per_patient}, "
+        f"valid_window_ratio_target={valid_window_ratio_target:.4f}, "
+        f"late_segment_boost={late_segment_boost}"
     )
-    if target_patient_counts is not None:
-        print(
-            "Target patient balance config: "
-            f"survived={target_patient_counts['survived']}, "
-            f"died={target_patient_counts['died']}, "
-            f"sampling_seed={int(args.sampling_seed)}"
-        )
+    print(
+        "Final cohort config: " f"selected_survived={selected_survived_count}, " f"selected_died={selected_died_count}"
+    )
+    print(f"Candidate ICU stays loaded: {len(all_stays_df)}")
 
-    def process_stay(stay: pd.Series) -> None:
-        nonlocal next_patient_index
-        nonlocal total_windows_generated
-        nonlocal total_windows_selected
-        nonlocal skipped_no_windows
-
+    for _, stay in all_stays_df.iterrows():
         subject_id = int(stay["subject_id"])
         icu_stay_id = int(stay["icu_stay_id"])
         stay_key = (subject_id, icu_stay_id)
         if stay_key in processed_stay_keys:
-            return
+            continue
         processed_stay_keys.add(stay_key)
-
-        outcome_key = _outcome_key_from_survived(stay.get("survived"))
-        if target_patient_counts is not None:
-            if selected_patient_counts[outcome_key] >= target_patient_counts[outcome_key]:
-                return
-            if subject_id in selected_subject_ids:
-                return
 
         trajectory = parser.get_patient_trajectory(subject_id, icu_stay_id, icu_stay=stay)
         windows = _create_windows_for_trajectory(
@@ -711,38 +894,46 @@ def main() -> None:
             config,
             silence_parser_logs=bool(args.silence_parser_window_logs),
         )
-
-        if not windows:
+        generated_for_patient = int(len(windows))
+        total_windows_generated += generated_for_patient
+        if generated_for_patient == 0:
             skipped_no_windows += 1
 
-        selected_records_for_patient: List[Dict[str, Any]] = []
+        trajectory_metadata_payload = _trajectory_metadata_for_export(trajectory)
+        candidate_records_for_patient: List[Dict[str, Any]] = []
         for window_position, window in enumerate(windows, start=1):
             current_events = _normalize_event_list(window.get("current_events"))
             ratio_stats = _compute_action_ratio(current_events=current_events, action_code_set=action_code_set)
 
-            # filter1: action-event ratio threshold
             ratio_value = float(ratio_stats["action_event_ratio"])
-            if ratio_value < ratio_threshold:
-                continue
-            # filter2: minimum total events threshold
-            total_events_count = int(ratio_stats["total_event_count"])
-            if total_events_count < 10:
-                continue
+
+            timeline_stats = _icu_timeline_fraction_and_segment(
+                hours_since_admission=window.get("hours_since_admission"),
+                icu_duration_hours=trajectory_metadata_payload.get("icu_duration_hours"),
+            )
+            ratio_bucket = "valid" if ratio_value >= ratio_threshold else "invalid"
 
             record = dict(window)
             record["patient_id"] = f"{subject_id}_{icu_stay_id}"
             record["window_index"] = int(window_position - 1)  # Oracle uses 0-based index internally.
             record["window_position"] = int(window_position)  # Human-friendly 1-based index.
-            record["trajectory_metadata"] = _trajectory_metadata_for_export(trajectory)
+            record["trajectory_metadata"] = trajectory_metadata_payload
             record["selection_metadata"] = {
-                "selection_rule": "action_event_ratio_threshold",
+                "selection_rule": "timeline_first_ratio_target_quality_ranked_patient_selection",
                 "ratio_threshold": ratio_threshold,
                 "threshold_comparator": ">=",
+                "ratio_bucket": ratio_bucket,
+                "valid_window_ratio_target": float(valid_window_ratio_target),
+                "min_windows_per_patient": int(min_windows_per_patient),
+                "max_windows_per_patient": int(max_windows_per_patient),
+                "late_segment_boost": int(late_segment_boost),
                 "action_event_codes_reference": list(HIGH_IMPACT_EVENT_CODES),
                 "action_event_count": int(ratio_stats["action_event_count"]),
                 "total_event_count": int(ratio_stats["total_event_count"]),
                 "action_event_ratio": ratio_value,
                 "action_event_code_counts": ratio_stats["action_event_code_counts"],
+                "icu_timeline_fraction": timeline_stats["icu_timeline_fraction"],
+                "icu_timeline_segment": timeline_stats["icu_timeline_segment"],
                 "selected_at_utc": datetime.utcnow().isoformat() + "Z",
             }
             record["action_events"] = ratio_stats["action_events"]
@@ -760,105 +951,143 @@ def main() -> None:
                 "has_current_discharge_summary": _has_current_discharge_summary(record),
                 "num_history_events": record.get("num_history_events"),
                 "num_current_events": record.get("num_current_events"),
+                "action_event_ratio": ratio_value,
+                "ratio_bucket": ratio_bucket,
+                "icu_timeline_segment": timeline_stats["icu_timeline_segment"],
             }
-            selected_records_for_patient.append(record)
+            candidate_records_for_patient.append(record)
 
-        selected_count_before_cap = int(len(selected_records_for_patient))
-        selected_records_for_patient = _cap_selected_windows_per_patient(
-            selected_records_for_patient,
+        selection_result = _select_windows_for_patient(
+            candidate_records_for_patient,
+            ratio_threshold=ratio_threshold,
+            min_windows_per_patient=min_windows_per_patient,
             max_windows_per_patient=max_windows_per_patient,
-            sampling_seed=int(args.sampling_seed),
-            subject_id=subject_id,
-            icu_stay_id=icu_stay_id,
+            valid_window_ratio_target=valid_window_ratio_target,
+            late_segment_boost=late_segment_boost,
         )
+        selected_records_for_patient = selection_result["selected_records"]
         selected_for_patient = int(len(selected_records_for_patient))
         if selected_for_patient > 0:
             for kept_record in selected_records_for_patient:
                 selection_metadata = kept_record.get("selection_metadata")
                 if isinstance(selection_metadata, dict):
-                    selection_metadata["max_windows_per_patient"] = (
-                        int(max_windows_per_patient) if max_windows_per_patient is not None else None
+                    selection_metadata["min_windows_per_patient"] = int(min_windows_per_patient)
+                    selection_metadata["max_windows_per_patient"] = int(max_windows_per_patient)
+                    selection_metadata["late_segment_boost"] = int(late_segment_boost)
+                    selection_metadata["window_count_eligible_before_patient_selection"] = int(
+                        selection_result["eligible_total"]
                     )
-                    selection_metadata["window_count_before_patient_cap"] = selected_count_before_cap
-                    selection_metadata["window_count_after_patient_cap"] = selected_for_patient
+                    selection_metadata["window_count_after_patient_selection"] = selected_for_patient
+                    selection_metadata["eligible_valid_window_count"] = int(selection_result["eligible_valid"])
+                    selection_metadata["eligible_invalid_window_count"] = int(selection_result["eligible_invalid"])
+                    selection_metadata["target_valid_window_count"] = int(selection_result["target_valid"])
+                    selection_metadata["target_invalid_window_count"] = int(selection_result["target_invalid"])
+                    selection_metadata["selected_valid_window_count"] = int(selection_result["selected_valid"])
+                    selection_metadata["selected_invalid_window_count"] = int(selection_result["selected_invalid"])
+                    selection_metadata["selected_valid_window_ratio"] = float(selection_result["selected_valid_ratio"])
+                    selection_metadata["ratio_gap_to_target"] = float(selection_result["ratio_gap_to_target"])
+                    selection_metadata["meets_min_windows"] = bool(selection_result["meets_min_windows"])
 
-        include_patient = selected_for_patient > 0
-        if target_patient_counts is not None and include_patient:
-            include_patient = (
-                selected_patient_counts[outcome_key] < target_patient_counts[outcome_key]
-                and subject_id not in selected_subject_ids
+        patient_entries.append(
+            {
+                "subject_id": int(subject_id),
+                "icu_stay_id": int(icu_stay_id),
+                "survived": bool(trajectory.get("survived")),
+                "generated_windows": int(generated_for_patient),
+                "selected_windows": int(selected_for_patient),
+                "selected_valid": int(selection_result["selected_valid"]),
+                "selected_invalid": int(selection_result["selected_invalid"]),
+                "selected_valid_ratio": float(selection_result["selected_valid_ratio"]),
+                "ratio_gap_to_target": float(selection_result["ratio_gap_to_target"]),
+                "meets_min_windows": bool(selection_result["meets_min_windows"]),
+                "selected_records": selected_records_for_patient,
+                "all_records": candidate_records_for_patient,
+            }
+        )
+
+    survived_candidates = [
+        entry for entry in patient_entries if bool(entry["survived"]) and int(entry["selected_windows"]) > 0
+    ]
+    died_candidates = [
+        entry for entry in patient_entries if (not bool(entry["survived"])) and int(entry["selected_windows"]) > 0
+    ]
+
+    if len(survived_candidates) < selected_survived_count:
+        raise RuntimeError(
+            "Not enough survived patients with selected windows for final cohort selection. "
+            f"Required={selected_survived_count}, available={len(survived_candidates)}."
+        )
+    if len(died_candidates) < selected_died_count:
+        raise RuntimeError(
+            "Not enough died patients with selected windows for final cohort selection. "
+            f"Required={selected_died_count}, available={len(died_candidates)}."
+        )
+
+    selected_survived_entries = _select_top_patients_by_quality(
+        survived_candidates,
+        target_count=selected_survived_count,
+        min_windows_per_patient=min_windows_per_patient,
+    )
+    selected_died_entries = _select_top_patients_by_quality(
+        died_candidates,
+        target_count=selected_died_count,
+        min_windows_per_patient=min_windows_per_patient,
+    )
+
+    selected_entry_key_set: set[tuple[int, int]] = set()
+    full_records_for_selected_patients: List[Dict[str, Any]] = []
+    for selected_entry in selected_survived_entries + selected_died_entries:
+        selected_entry_key_set.add((int(selected_entry["subject_id"]), int(selected_entry["icu_stay_id"])))
+        selected_records.extend(selected_entry["selected_records"])
+        all_records = selected_entry.get("all_records")
+        if isinstance(all_records, list):
+            sorted_all_records = sorted(
+                all_records,
+                key=lambda record: _safe_int(record.get("window_position"), default=10**9),
             )
-        if include_patient:
-            selected_records.extend(selected_records_for_patient)
-            total_windows_selected += selected_for_patient
-            if target_patient_counts is not None:
-                selected_patient_counts[outcome_key] += 1
-                selected_subject_ids.add(subject_id)
-        else:
-            selected_for_patient = 0
+            full_records_for_selected_patients.extend(sorted_all_records)
 
-        generated_for_patient = int(len(windows))
-        total_windows_generated += generated_for_patient
+    total_windows_selected = int(len(selected_records))
+    selected_patient_counts = {
+        "survived": int(len(selected_survived_entries)),
+        "died": int(len(selected_died_entries)),
+    }
+
+    for patient_index, entry in enumerate(patient_entries, start=1):
+        stay_key = (int(entry["subject_id"]), int(entry["icu_stay_id"]))
+        in_final_cohort = stay_key in selected_entry_key_set
+        selected_count_for_stats = int(entry["selected_windows"]) if in_final_cohort else 0
+        generated_windows = int(entry["generated_windows"])
         patient_stats_rows.append(
             {
-                "patient_index": int(next_patient_index),
-                "subject_id": subject_id,
-                "icu_stay_id": icu_stay_id,
-                "survived": bool(trajectory.get("survived")),
-                "generated_windows": generated_for_patient,
-                "selected_windows": int(selected_for_patient),
+                "patient_index": int(patient_index),
+                "subject_id": int(entry["subject_id"]),
+                "icu_stay_id": int(entry["icu_stay_id"]),
+                "survived": bool(entry["survived"]),
+                "generated_windows": generated_windows,
+                "selected_windows": selected_count_for_stats,
+                "selected_valid_windows": int(entry["selected_valid"]) if in_final_cohort else 0,
+                "selected_invalid_windows": int(entry["selected_invalid"]) if in_final_cohort else 0,
+                "selected_valid_ratio": float(entry["selected_valid_ratio"]) if in_final_cohort else 0.0,
+                "ratio_gap_to_target": float(entry["ratio_gap_to_target"]) if in_final_cohort else 0.0,
+                "meets_min_windows": bool(entry["meets_min_windows"]),
+                "selected_for_final_cohort": bool(in_final_cohort),
                 "selected_ratio": (
-                    (float(selected_for_patient) / float(generated_for_patient)) if generated_for_patient > 0 else 0.0
+                    (float(selected_count_for_stats) / float(generated_windows)) if generated_windows > 0 else 0.0
                 ),
                 "window_generation_current_hours": float(config.oracle_current_window_hours),
                 "window_generation_step_hours": float(config.oracle_window_step_hours),
                 "window_filter_ratio_threshold": ratio_threshold,
             }
         )
-        next_patient_index += 1
-
-    for _, stay in initial_stays_df.iterrows():
-        if target_patient_counts is not None and _balance_targets_met(target_patient_counts, selected_patient_counts):
-            break
-        process_stay(stay)
-
-    if target_patient_counts is not None and not _balance_targets_met(target_patient_counts, selected_patient_counts):
-        deficits = _balance_deficits(target_patient_counts, selected_patient_counts)
-        print(
-            "Initial round ended with deficit: "
-            f"survived={deficits['survived']}, died={deficits['died']}. "
-            "Starting top-up from remaining stays."
-        )
-        topup_attempted = True
-        sampling_seed = int(args.sampling_seed)
-
-        for outcome_key, outcome_value in (("died", False), ("survived", True)):
-            if selected_patient_counts[outcome_key] >= target_patient_counts[outcome_key]:
-                continue
-
-            outcome_candidates = remaining_stays_df[
-                remaining_stays_df["survived"].astype(bool) == outcome_value
-            ].copy()
-            if outcome_candidates.empty:
-                continue
-
-            outcome_candidates = outcome_candidates.sample(frac=1.0, random_state=sampling_seed).reset_index(drop=True)
-            for _, stay in outcome_candidates.iterrows():
-                if selected_patient_counts[outcome_key] >= target_patient_counts[outcome_key]:
-                    break
-                process_stay(stay)
-
-    if target_patient_counts is not None and not _balance_targets_met(target_patient_counts, selected_patient_counts):
-        deficits = _balance_deficits(target_patient_counts, selected_patient_counts)
-        raise RuntimeError(
-            "Unable to satisfy target patient balance after top-up. "
-            f"Missing survived={deficits['survived']}, died={deficits['died']}. "
-            "Please provide a larger candidate ICU-stay dataset."
-        )
 
     with open(paths["output_jsonl"], "w", encoding="utf-8") as file:
         for record in selected_records:
             file.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
+    if paths["output_full_jsonl"] is not None:
+        with open(paths["output_full_jsonl"], "w", encoding="utf-8") as file:
+            for record in full_records_for_selected_patients:
+                file.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
 
     patient_stats_df = pd.DataFrame(patient_stats_rows, columns=PATIENT_STATS_COLUMNS)
     patient_stats_df.to_csv(paths["patient_stats_csv"], index=False)
@@ -878,6 +1107,13 @@ def main() -> None:
             hours_since_admission=record.get("hours_since_admission"),
             icu_duration_hours=icu_duration_hours,
         )
+        selection_metadata = record.get("selection_metadata")
+        if isinstance(selection_metadata, Mapping):
+            action_event_ratio = _safe_float(selection_metadata.get("action_event_ratio"), default=0.0)
+            window_bucket = str(selection_metadata.get("ratio_bucket") or "unknown")
+        else:
+            action_event_ratio = 0.0
+            window_bucket = "unknown"
         selected_window_stats_rows.append(
             {
                 "patient_id": str(record.get("patient_id") or ""),
@@ -886,6 +1122,8 @@ def main() -> None:
                 "num_current_events": int(num_current_events),
                 "num_history_events": int(num_history_events),
                 "num_total_events": int(num_current_events + num_history_events),
+                "action_event_ratio": float(action_event_ratio),
+                "window_bucket": window_bucket,
                 "has_current_discharge_summary": _has_current_discharge_summary(record),
                 "icu_timeline_fraction": timeline_stats["icu_timeline_fraction"],
                 "icu_timeline_segment": timeline_stats["icu_timeline_segment"],
@@ -989,9 +1227,16 @@ def main() -> None:
     total_current_events = int(selected_windows_df["num_current_events"].sum()) if selected_window_count > 0 else 0
     total_history_events = int(selected_windows_df["num_history_events"].sum()) if selected_window_count > 0 else 0
     total_events = int(total_current_events + total_history_events)
+    selected_valid_window_count = (
+        int((selected_windows_df["window_bucket"] == "valid").sum()) if selected_window_count > 0 else 0
+    )
+    selected_invalid_window_count = (
+        int((selected_windows_df["window_bucket"] == "invalid").sum()) if selected_window_count > 0 else 0
+    )
     windows_with_current_discharge_summary = (
         int(selected_windows_df["has_current_discharge_summary"].sum()) if selected_window_count > 0 else 0
     )
+    selected_window_action_ratio_stats = _series_distribution_stats(selected_windows_df["action_event_ratio"])
     selected_window_event_stats = _series_distribution_stats(selected_windows_df["num_total_events"])
     selected_window_current_event_stats = _series_distribution_stats(selected_windows_df["num_current_events"])
     selected_window_history_event_stats = _series_distribution_stats(selected_windows_df["num_history_events"])
@@ -1010,6 +1255,16 @@ def main() -> None:
         "statistics_dir": str(paths["statistics_dir"]),
         "window_level_stats": {
             "selected_window_count": selected_window_count,
+            "selected_valid_window_count": int(selected_valid_window_count),
+            "selected_invalid_window_count": int(selected_invalid_window_count),
+            "selected_valid_window_ratio": (
+                float(selected_valid_window_count) / float(selected_window_count) if selected_window_count > 0 else 0.0
+            ),
+            "selected_invalid_window_ratio": (
+                float(selected_invalid_window_count) / float(selected_window_count)
+                if selected_window_count > 0
+                else 0.0
+            ),
             "total_current_event_count": total_current_events,
             "total_history_event_count": total_history_events,
             "total_event_count": total_events,
@@ -1019,6 +1274,7 @@ def main() -> None:
                 if selected_window_count > 0
                 else 0.0
             ),
+            "action_event_ratio_distribution": selected_window_action_ratio_stats,
             "total_events_per_window_distribution": selected_window_event_stats,
             "current_events_per_window_distribution": selected_window_current_event_stats,
             "history_events_per_window_distribution": selected_window_history_event_stats,
@@ -1061,20 +1317,23 @@ def main() -> None:
 
     selected_patient_count = int((patient_stats_df["selected_windows"] > 0).sum()) if len(patient_stats_df) > 0 else 0
     generated_patient_count = int(len(patient_stats_df))
-    target_balance_payload: Optional[Dict[str, Any]]
-    if target_patient_counts is None:
-        target_balance_payload = None
-    else:
-        target_balance_payload = {
-            "target_survived": int(target_patient_counts["survived"]),
-            "target_died": int(target_patient_counts["died"]),
-            "selected_survived": int(selected_survived_patient_count),
-            "selected_died": int(selected_died_patient_count),
-            "sampling_seed": int(args.sampling_seed),
-            "topup_attempted": bool(topup_attempted),
-            "initial_round_candidate_count": int(len(initial_stays_df)),
-            "topup_candidate_pool_count": int(len(remaining_stays_df)),
-        }
+    selected_survived_meets_min = int(
+        sum(1 for entry in selected_survived_entries if bool(entry.get("meets_min_windows")))
+    )
+    selected_died_meets_min = int(sum(1 for entry in selected_died_entries if bool(entry.get("meets_min_windows"))))
+    quality_selection_payload = {
+        "target_survived_count": int(selected_survived_count),
+        "target_died_count": int(selected_died_count),
+        "available_survived_candidates": int(len(survived_candidates)),
+        "available_died_candidates": int(len(died_candidates)),
+        "selected_survived_count": int(len(selected_survived_entries)),
+        "selected_died_count": int(len(selected_died_entries)),
+        "min_windows_per_patient": int(min_windows_per_patient),
+        "max_windows_per_patient": int(max_windows_per_patient),
+        "late_segment_boost": int(late_segment_boost),
+        "selected_survived_meeting_min_windows": int(selected_survived_meets_min),
+        "selected_died_meeting_min_windows": int(selected_died_meets_min),
+    }
 
     summary_payload = {
         "generated_at_utc": datetime.utcnow().isoformat() + "Z",
@@ -1082,14 +1341,18 @@ def main() -> None:
         "events_path": str(paths["events_path"]),
         "icu_stay_path": str(paths["icu_stay_path"]),
         "output_jsonl": str(paths["output_jsonl"]),
+        "output_full_jsonl": str(paths["output_full_jsonl"]) if paths["output_full_jsonl"] is not None else None,
         "patient_stats_csv": str(paths["patient_stats_csv"]),
         "statistics_dir": str(paths["statistics_dir"]),
         "statistics_summary_json": str(paths["statistics_summary_json"]),
         "ratio_threshold": ratio_threshold,
-        "max_windows_per_patient": int(max_windows_per_patient) if max_windows_per_patient is not None else None,
+        "min_windows_per_patient": int(min_windows_per_patient),
+        "max_windows_per_patient": int(max_windows_per_patient),
+        "valid_window_ratio_target": float(valid_window_ratio_target),
+        "late_segment_boost": int(late_segment_boost),
         "threshold_comparator": ">=",
         "high_impact_event_codes": list(HIGH_IMPACT_EVENT_CODES),
-        "target_patient_balance": target_balance_payload,
+        "quality_based_final_cohort_selection": quality_selection_payload,
         "window_generation_config": {
             "current_window_hours": float(config.oracle_current_window_hours),
             "window_step_hours": float(config.oracle_window_step_hours),
@@ -1110,6 +1373,17 @@ def main() -> None:
             "patients_skipped_no_windows_generated": int(skipped_no_windows),
             "total_windows_generated": int(total_windows_generated),
             "total_windows_selected": int(total_windows_selected),
+            "total_windows_exported_for_selected_patients": int(len(full_records_for_selected_patients)),
+            "selected_valid_window_count": int(selected_valid_window_count),
+            "selected_invalid_window_count": int(selected_invalid_window_count),
+            "selected_valid_window_ratio": (
+                float(selected_valid_window_count) / float(selected_window_count) if selected_window_count > 0 else 0.0
+            ),
+            "selected_invalid_window_ratio": (
+                float(selected_invalid_window_count) / float(selected_window_count)
+                if selected_window_count > 0
+                else 0.0
+            ),
             "overall_selected_ratio": (
                 (float(total_windows_selected) / float(total_windows_generated))
                 if total_windows_generated > 0
@@ -1122,6 +1396,8 @@ def main() -> None:
 
     print("Wrote outputs:")
     print(f"  - Selected windows JSONL: {paths['output_jsonl']}")
+    if paths["output_full_jsonl"] is not None:
+        print(f"  - Full windows JSONL (selected patients): {paths['output_full_jsonl']}")
     print(f"  - Patient stats CSV: {paths['patient_stats_csv']}")
     print(f"  - Summary JSON: {paths['summary_json']}")
     print(f"  - Statistics summary JSON: {paths['statistics_summary_json']}")
@@ -1154,13 +1430,20 @@ def main() -> None:
         f"windows_selected={total_windows_selected} / windows_generated={total_windows_generated}, "
         f"patients_with_selected_windows={selected_patient_count} / {generated_patient_count}"
     )
-    if target_patient_counts is not None:
-        print(
-            "Target balance stats: "
-            f"survived={selected_survived_patient_count}/{target_patient_counts['survived']}, "
-            f"died={selected_died_patient_count}/{target_patient_counts['died']}, "
-            f"topup_attempted={topup_attempted}"
-        )
+    print(
+        "Selection mix stats: "
+        f"valid={selected_valid_window_count}, "
+        f"invalid={selected_invalid_window_count}, "
+        f"valid_ratio={((float(selected_valid_window_count) / float(selected_window_count)) if selected_window_count > 0 else 0.0):.4f}"
+    )
+    print(
+        "Final cohort stats: "
+        f"survived={len(selected_survived_entries)}/{selected_survived_count}, "
+        f"died={len(selected_died_entries)}/{selected_died_count}, "
+        f"min_windows={min_windows_per_patient}, "
+        f"max_windows={max_windows_per_patient}, "
+        f"late_segment_boost={late_segment_boost}"
+    )
 
 
 if __name__ == "__main__":

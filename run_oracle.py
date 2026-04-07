@@ -18,7 +18,9 @@ from utils.patient_selection import DEFAULT_SELECTION_SEED, select_balanced_pati
 
 
 def _safe_status(report_dict: Dict[str, Any]) -> str:
-    status = report_dict.get("patient_status", {}).get("overall_status")
+    assessment = report_dict.get("patient_assessment")
+    overall = assessment.get("overall") if isinstance(assessment, dict) else {}
+    status = overall.get("label") if isinstance(overall, dict) else None
     if isinstance(status, str) and status.strip():
         return status.strip().lower()
     return "unknown"
@@ -279,9 +281,13 @@ def _build_patient_predictions_payload(
         raw_current_events = window.get("current_events")
         if not isinstance(raw_current_events, list):
             raw_current_events = []
+        source_window_index = window.get("source_window_index")
+        source_window_position = window.get("source_window_position")
         window_outputs.append(
             {
                 "window_index": idx,
+                "source_window_index": source_window_index,
+                "source_window_position": source_window_position,
                 "window_metadata": {
                     "subject_id": window.get("subject_id"),
                     "icu_stay_id": window.get("icu_stay_id"),
@@ -295,6 +301,8 @@ def _build_patient_predictions_payload(
                     "current_window_hours": window.get("current_window_hours"),
                     "num_history_events": window.get("num_history_events"),
                     "num_current_events": window.get("num_current_events"),
+                    "source_window_index": source_window_index,
+                    "source_window_position": source_window_position,
                     "pre_icu_history_source": window.get("pre_icu_history_source"),
                     "pre_icu_history_items": window.get("pre_icu_history_items"),
                 },
@@ -577,10 +585,14 @@ def _build_window_contexts_payload(
             if isinstance(context_events_payload, dict)
             else "window_payload_events"
         )
+        source_window_index = window.get("source_window_index")
+        source_window_position = window.get("source_window_position")
 
         window_contexts.append(
             {
                 "window_index": idx,
+                "source_window_index": source_window_index,
+                "source_window_position": source_window_position,
                 "llm_window_index": llm_window_index,
                 "context_events_llm_window_index": context_events_llm_window_index,
                 "window_metadata": {
@@ -594,6 +606,8 @@ def _build_window_contexts_payload(
                     "window_end_time": window.get("current_window_end"),
                     "hours_since_admission": window.get("hours_since_admission"),
                     "current_window_hours": window.get("current_window_hours"),
+                    "source_window_index": source_window_index,
+                    "source_window_position": source_window_position,
                     "num_history_events": len(history_events),
                     "num_current_events": len(current_events),
                     "num_future_events": len(future_events),
@@ -763,7 +777,7 @@ def process_batch_for_oracle(
         "patients_processed": 0,
         "patients_failed": 0,
         "overall_status_distribution": {},
-        "total_doctor_actions": 0,
+        "total_action_evaluations": 0,
     }
     total_seen = 0
 
@@ -815,21 +829,24 @@ def process_batch_for_oracle(
             print(f"  Completed: {len(reports)} evaluations")
 
             patient_status_counts: Dict[str, int] = {}
-            doctor_actions_count = 0
+            action_evaluations_count = 0
             for report in reports:
                 report_dict = report.to_dict()
                 status = _safe_status(report_dict)
                 patient_status_counts[status] = patient_status_counts.get(status, 0) + 1
-                doctor_actions_count += len(report_dict.get("doctor_actions", []))
+                action_review = report_dict.get("action_review")
+                evaluations = action_review.get("evaluations") if isinstance(action_review, dict) else []
+                if isinstance(evaluations, list):
+                    action_evaluations_count += len(evaluations)
 
                 summary_stats["overall_status_distribution"][status] = (
                     summary_stats["overall_status_distribution"].get(status, 0) + 1
                 )
 
-            summary_stats["total_doctor_actions"] += doctor_actions_count
+            summary_stats["total_action_evaluations"] += action_evaluations_count
 
             print(f"  Status distribution: {patient_status_counts}")
-            print(f"  Total doctor actions extracted: {doctor_actions_count}")
+            print(f"  Total action evaluations: {action_evaluations_count}")
 
             patient_dir = patients_dir / f"{subject_id}_{icu_stay_id}"
             patient_dir.mkdir(parents=True, exist_ok=True)
@@ -902,7 +919,7 @@ def process_batch_for_oracle(
     print(f"  Patients processed: {summary_stats['patients_processed']}/{summary_stats['total_patients']}")
     print(f"  Patients failed: {summary_stats['patients_failed']}")
     print(f"  Total windows evaluated: {summary_stats['total_windows_evaluated']}")
-    print(f"  Total doctor actions: {summary_stats['total_doctor_actions']}")
+    print(f"  Total action evaluations: {summary_stats['total_action_evaluations']}")
     print(f"  Status distribution: {summary_stats['overall_status_distribution']}")
     print(f"  Total tokens used: {summary_stats['total_tokens_used']:,}")
     print(f"  Avg tokens per evaluation: {summary_stats['avg_tokens_per_evaluation']:.0f}")

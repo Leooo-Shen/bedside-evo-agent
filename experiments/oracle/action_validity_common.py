@@ -19,15 +19,12 @@ ACTIONABLE_EVENT_CODES: Tuple[str, ...] = (
 
 ACTION_SCORE_MAP: Dict[str, float] = {
     "potentially_harmful": -1.0,
-    "suboptimal": -0.5,
-    "non_adherent": -0.5,
-    "neutral": 0.0,
-    "appropriate": 1.0,
-    "adherent": 1.0,
-    "optimal": 1.0,
+    "insufficient_data": 0.0,
+    "acceptable": 0.5,
+    "best_practice": 1.0,
 }
 
-NEGATIVE_ACTION_LABELS: Set[str] = {"suboptimal", "potentially_harmful"}
+NEGATIVE_ACTION_LABELS: Set[str] = {"potentially_harmful"}
 
 STOPWORDS: Set[str] = {
     "a",
@@ -79,9 +76,10 @@ def normalize_action_label(value: Any) -> str:
         return ""
     text = str(value).strip().lower().replace(" ", "_").replace("-", "_")
     aliases = {
+        "best": "best_practice",
+        "good": "acceptable",
         "harmful": "potentially_harmful",
         "potential_harm": "potentially_harmful",
-        "not_enough_context": "not_enough_context",
         "insufficient": "insufficient_data",
     }
     return aliases.get(text, text)
@@ -91,7 +89,7 @@ def extract_action_label(action_eval: Any) -> str:
     if not isinstance(action_eval, Mapping):
         return ""
 
-    for key in ("overall", "contextual_appropriateness", "guideline_adherence", "quality_rating"):
+    for key in ("label", "overall", "contextual_appropriateness", "guideline_adherence", "quality_rating"):
         candidate = action_eval.get(key)
         if isinstance(candidate, Mapping):
             for field in ("label", "status", "value"):
@@ -381,8 +379,15 @@ def recommendation_to_text(recommendation: Any) -> str:
     if not isinstance(recommendation, Mapping):
         return ""
 
-    action = str(recommendation.get("action") or "").strip()
+    action = str(
+        recommendation.get("action_name")
+        or recommendation.get("action")
+        or recommendation.get("contraindicated_action")
+        or ""
+    ).strip()
     desc = str(recommendation.get("action_description") or "").strip()
+    if not desc:
+        desc = str(recommendation.get("reason") or recommendation.get("rationale") or "").strip()
     if action and desc and action.lower() not in desc.lower():
         return f"{action}. {desc}".strip()
     return (desc or action).strip()

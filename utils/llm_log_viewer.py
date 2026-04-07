@@ -13,19 +13,12 @@ except ImportError:  # pragma: no cover - script execution fallback
 
 ACTION_SCORE_MAP: Dict[str, float] = {
     "potentially_harmful": -1.0,
-    "suboptimal": -0.5,
-    "non_adherent": -0.5,
-    "neutral": 0.0,
-    "appropriate": 1.0,
-    "adherent": 1.0,
-    "optimal": 1.0,
+    "acceptable": 0.5,
+    "best_practice": 1.0,
 }
 
 NON_SCORABLE_ACTION_LABELS = {
     "insufficient_data",
-    "not_enough_context",
-    "not_applicable",
-    "guideline_unclear",
 }
 
 
@@ -239,16 +232,14 @@ def _extract_label(candidate: Any) -> str:
 def _is_oracle_parsed_payload(parsed_response: Any) -> bool:
     if not isinstance(parsed_response, dict):
         return False
-    keys = {"patient_status", "action_evaluations", "domains", "overall", "overall_window_summary"}
+    keys = {"patient_assessment", "action_review", "overall", "evaluations"}
     return any(key in parsed_response for key in keys)
 
 
 def _extract_patient_status_payload(parsed_response: Dict[str, Any]) -> Dict[str, Any]:
-    patient_status = parsed_response.get("patient_status")
-    if isinstance(patient_status, dict):
-        return patient_status
-    if "domains" in parsed_response or "overall" in parsed_response or "overall_status" in parsed_response:
-        return parsed_response
+    patient_assessment = parsed_response.get("patient_assessment")
+    if isinstance(patient_assessment, dict):
+        return patient_assessment
     return {}
 
 
@@ -257,13 +248,13 @@ def _extract_patient_overall_label(patient_status: Dict[str, Any]) -> str:
     label = _extract_label(overall)
     if label:
         return label
-    return _normalize_label(patient_status.get("overall_status"))
+    return ""
 
 
 def _extract_action_label(action_eval: Dict[str, Any]) -> str:
     if not isinstance(action_eval, dict):
         return ""
-    for key in ("overall", "contextual_appropriateness", "guideline_adherence", "quality_rating"):
+    for key in ("label", "overall", "contextual_appropriateness", "guideline_adherence", "quality_rating"):
         label = _extract_label(action_eval.get(key))
         if label:
             return label
@@ -291,7 +282,8 @@ def _build_oracle_trend_rows(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
         action_labels: List[str] = []
         action_scores: List[float] = []
-        action_evaluations = parsed.get("action_evaluations", [])
+        action_review = parsed.get("action_review")
+        action_evaluations = action_review.get("evaluations") if isinstance(action_review, dict) else []
         if isinstance(action_evaluations, list):
             for action_eval in action_evaluations:
                 label = _extract_action_label(action_eval)
@@ -549,7 +541,7 @@ def _save_oracle_trend_figures(
     )
     _save_trend_png(
         points=action_points,
-        y_ticks=[(-1.0, "Harmful"), (-0.5, "Suboptimal"), (0.0, "Neutral"), (1.0, "Appropriate")],
+        y_ticks=[(-1.0, "Potentially harmful"), (0.0, "Insufficient"), (0.5, "Acceptable"), (1.0, "Best practice")],
         line_color="#b45309",
         point_fill="#b45309",
         title="Doctor Action Score Trend",
@@ -607,7 +599,7 @@ def _build_oracle_trend_section(calls: List[Dict[str, Any]], output_dir: Optiona
     )
     action_svg = _build_oracle_trend_chart_svg(
         points=action_points,
-        y_ticks=[(-1.0, "Harmful"), (-0.5, "Suboptimal"), (0.0, "Neutral"), (1.0, "Appropriate")],
+        y_ticks=[(-1.0, "Potentially harmful"), (0.0, "Insufficient"), (0.5, "Acceptable"), (1.0, "Best practice")],
         line_color="#b45309",
         point_fill="#b45309",
         empty_message="No doctor-action trend points",
@@ -630,9 +622,7 @@ def _build_oracle_trend_section(calls: List[Dict[str, Any]], output_dir: Optiona
     non_scorable_count = sum(count for label, count in action_counter.items() if label in NON_SCORABLE_ACTION_LABELS)
 
     status_mapping_text = "deteriorating=-1, fluctuating=-0.5, stable=0.5, improving=1"
-    action_mapping_text = (
-        "potentially_harmful=-1, suboptimal/non_adherent=-0.5, " "neutral=0, appropriate/adherent/optimal=1"
-    )
+    action_mapping_text = "potentially_harmful=-1, insufficient_data=0, acceptable=0.5, best_practice=1"
     saved_figures_html = ""
     if figure_files:
         status_name = figure_files["status"]

@@ -58,3 +58,5 @@ experiment_results/
 drawio/
 oracle_results/
 analysis_outputs/
+service-account.json
+*.zip

@@ -36,8 +36,8 @@
     "num_discharge_summaries": 2
   },
   "llm": {
-    "provider": "openai",
-    "model": "gpt-5.4-mini",
+    "provider": "google",
+    "model": "gemini-3.1-pro-preview",
     "max_tokens": 128000
   },
   "remem": {

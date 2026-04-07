@@ -141,14 +141,14 @@ def _find_latest_complete_run(output_root: Path, condition: str) -> Path:
 def _is_valid_oracle_output(oracle_output: Any) -> bool:
     if not isinstance(oracle_output, dict):
         return False
-    required = ("patient_status", "action_evaluations", "recommendations", "overall_window_summary")
+    required = ("patient_assessment", "action_review")
     for key in required:
         if key not in oracle_output:
             return False
-    patient_status = oracle_output.get("patient_status")
-    if not isinstance(patient_status, dict):
+    patient_assessment = oracle_output.get("patient_assessment")
+    if not isinstance(patient_assessment, dict):
         return False
-    overall = patient_status.get("overall")
+    overall = patient_assessment.get("overall")
     if not isinstance(overall, dict):
         return False
     label = overall.get("label")
@@ -157,11 +157,12 @@ def _is_valid_oracle_output(oracle_output: Any) -> bool:
         return False
     if not isinstance(rationale, str) or not rationale.strip():
         return False
-    if not isinstance(oracle_output.get("action_evaluations"), list):
+    action_review = oracle_output.get("action_review")
+    if not isinstance(action_review, dict):
         return False
-    if not isinstance(oracle_output.get("recommendations"), list):
+    if not isinstance(action_review.get("evaluations"), list):
         return False
-    if not isinstance(oracle_output.get("overall_window_summary"), str):
+    if not isinstance(action_review.get("red_flags"), list):
         return False
     return True
 

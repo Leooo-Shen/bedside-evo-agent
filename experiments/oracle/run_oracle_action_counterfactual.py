@@ -358,21 +358,27 @@ def run_counterfactual_action_experiment(
 
         report = oracle.evaluate_window(injected_window)
         report_dict = report.to_dict() if hasattr(report, "to_dict") else {}
+        report_action_review = report_dict.get("action_review")
+        report_evaluations = report_action_review.get("evaluations") if isinstance(report_action_review, dict) else []
 
         llm_calls = oracle.pop_patient_llm_call_logs(subject_id=subject_id, icu_stay_id=icu_stay_id)
         oracle.pop_patient_trajectory_logs(subject_id=subject_id, icu_stay_id=icu_stay_id)
         llm_calls = _sort_llm_calls(llm_calls)
 
         counter_eval = identify_action_evaluation(
-            report_dict.get("action_evaluations"),
+            report_evaluations,
             expected_action_id=expected_action_id,
             marker_token=marker_token,
         )
         counter_label = extract_action_label(counter_eval)
         counter_score = action_label_to_score(counter_label)
 
+        baseline_action_review = baseline_oracle_output.get("action_review")
+        baseline_evaluations = (
+            baseline_action_review.get("evaluations") if isinstance(baseline_action_review, dict) else []
+        )
         baseline_eval = identify_action_evaluation(
-            baseline_oracle_output.get("action_evaluations"),
+            baseline_evaluations,
             expected_action_id=expected_action_id,
             marker_token=None,
         )

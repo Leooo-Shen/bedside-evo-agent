@@ -124,6 +124,25 @@ export GOOGLE_API_KEY="your-key-here"
 
 **Note:** You only need one API key (Anthropic, OpenAI, or Google) depending on which provider you plan to use. The system automatically loads API keys from the `.env` file if present.
 
+### Use Google Vertex AI (Gemini)
+
+If you want to call Gemini through Vertex AI instead of AI Studio API keys, configure:
+
+```bash
+export GOOGLE_GENAI_USE_VERTEXAI=true
+export GOOGLE_APPLICATION_CREDENTIALS="/absolute/path/to/service-account.json"
+export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
+export GOOGLE_CLOUD_LOCATION="global"
+```
+
+Then run with Google provider:
+
+```bash
+python run_oracle.py --provider google --model gemini-2.5-flash
+```
+
+`GOOGLE_PROJECT_ID` is also accepted as an alternative to `GOOGLE_CLOUD_PROJECT`.
+
 ## Project Structure
 
 ```

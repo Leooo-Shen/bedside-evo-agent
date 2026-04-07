@@ -46,19 +46,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/mimic-demo/anno_subset_140"),
+        default=Path("data/mimic-demo/anno_subset_160"),
         help="Output directory for sampled metadata + subset parquets.",
     )
     parser.add_argument(
         "--n-survived",
         type=int,
-        default=70,
+        default=80,
         help="Number of survived patients to sample.",
     )
     parser.add_argument(
         "--n-died",
         type=int,
-        default=70,
+        default=80,
         help="Number of died patients to sample.",
     )
     parser.add_argument(

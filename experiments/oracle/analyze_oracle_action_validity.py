@@ -248,7 +248,9 @@ def _build_q4_window_dataframe(
             if not isinstance(oracle_output, dict):
                 oracle_output = {}
 
-            recommendation_texts = build_recommendation_texts(oracle_output.get("recommendations"))
+            action_review = oracle_output.get("action_review")
+            evaluations = action_review.get("evaluations") if isinstance(action_review, dict) else []
+            recommendation_texts = build_recommendation_texts(evaluations)
             doctor_action_texts = build_doctor_action_texts_from_events(raw_current_events)
 
             match_result = match_recommendations_to_actions(

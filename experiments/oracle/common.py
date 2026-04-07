@@ -187,30 +187,32 @@ def mask_window_outcome_leakage(window: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def extract_patient_status_payload(oracle_output: Mapping[str, Any]) -> Dict[str, Any]:
-    """Extract normalized patient_status payload from one Oracle output object."""
-    patient_status = oracle_output.get("patient_status")
-    if isinstance(patient_status, dict):
-        return patient_status
-    if any(key in oracle_output for key in ("domains", "overall", "overall_status")):
-        return dict(oracle_output)
+    """Extract normalized patient_assessment payload from one Oracle output object."""
+    patient_assessment = oracle_output.get("patient_assessment")
+    if isinstance(patient_assessment, dict):
+        return patient_assessment
     return {}
 
 
 def extract_overall_label(oracle_output: Mapping[str, Any]) -> str:
     """Extract normalized overall status label from an Oracle output object."""
-    patient_status = extract_patient_status_payload(oracle_output)
-    overall = patient_status.get("overall")
+    patient_assessment = extract_patient_status_payload(oracle_output)
+    overall = patient_assessment.get("overall")
     if isinstance(overall, Mapping):
         label = normalize_status_label(overall.get("label"))
         if label:
             return label
-    return normalize_status_label(patient_status.get("overall_status"))
+    return "insufficient_data"
 
 
 def extract_domain_labels(oracle_output: Mapping[str, Any]) -> Dict[str, str]:
-    """Extract normalized domain-level status labels."""
-    patient_status = extract_patient_status_payload(oracle_output)
-    domains = patient_status.get("domains")
+    """Extract normalized domain-level status labels.
+
+    The current Oracle schema does not emit domain labels; this returns
+    `insufficient_data` unless optional domain labels are present.
+    """
+    patient_assessment = extract_patient_status_payload(oracle_output)
+    domains = patient_assessment.get("domains") if isinstance(patient_assessment, Mapping) else {}
     if not isinstance(domains, Mapping):
         domains = {}
 
