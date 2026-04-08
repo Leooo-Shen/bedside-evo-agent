@@ -50,7 +50,7 @@ IRRELEVANT_VITAL_PATTERNS = [
     r"\bskin temperature\b",
 ]
 
-DEFAULT_RELATIVE_REPORT_CODES = ["NOTE_RADIOLOGYREPORT"]
+DEFAULT_RELATIVE_REPORT_CODES: List[str] = []
 
 
 class PreICUHistoryProcessor:
@@ -82,7 +82,7 @@ class PreICUHistoryProcessor:
 
         Ranking priority:
         1) NOTE_DISCHARGESUMMARY (highest priority)
-        2) Relative report NOTE_* codes (default NOTE_RADIOLOGYREPORT)
+        2) Relative report NOTE_* codes (optional, default none)
         Then by recency (most recent first).
         """
         events_df = self._events_df()
@@ -92,9 +92,7 @@ class PreICUHistoryProcessor:
         subject_id = trajectory["subject_id"]
         current_enter_time = pd.to_datetime(trajectory["enter_time"])
 
-        report_codes = {
-            str(code) for code in (relative_report_codes or DEFAULT_RELATIVE_REPORT_CODES) if str(code).strip()
-        }
+        report_codes = {str(code) for code in (relative_report_codes or DEFAULT_RELATIVE_REPORT_CODES) if str(code).strip()}
         report_codes.add("NOTE_DISCHARGESUMMARY")
 
         patient_events = events_df[events_df["subject_id"] == subject_id].copy()
@@ -171,8 +169,8 @@ class PreICUHistoryProcessor:
         Select prioritized pre-ICU reports while enforcing a per-code cap.
 
         report_candidates must already be sorted by priority/recency. This preserves
-        NOTE_DISCHARGESUMMARY-first ordering while allowing relative NOTE_* codes to
-        be included up to the same per-code cap.
+        NOTE_DISCHARGESUMMARY-first ordering while allowing optional relative NOTE_*
+        codes to be included up to the same per-code cap.
         """
         if per_code_cap <= 0:
             return []
@@ -374,8 +372,8 @@ class MIMICDataParser:
         Initialize the parser with paths to MIMIC-demo data files.
 
         Args:
-            events_path: Path to events parquet file (e.g., data/mimic-demo/events/data_0.parquet)
-            icu_stay_path: Path to ICU stay parquet file (e.g., data/mimic-demo/icu_stay/data_0.parquet)
+            events_path: Path to events parquet dataset directory (e.g., data/mimic-demo/events)
+            icu_stay_path: Path to ICU-stay parquet dataset directory (e.g., data/mimic-demo/icu_stay)
             discharge_summary_max_days_after_leave: Selector window for post-ICU discharge summary matching.
             require_discharge_summary_for_icu_stays: Keep only ICU stays with selector-linked discharge
                 summary available. ICU stays without extractable summary are skipped.
@@ -557,21 +555,41 @@ class MIMICDataParser:
             if int(icu_stay["subject_id"]) != int(subject_id) or int(icu_stay["icu_stay_id"]) != int(icu_stay_id):
                 raise ValueError("Provided ICU stay row does not match subject_id / icu_stay_id.")
 
-        # Get all events for this ICU stay
-        # Use index-range slicing first to avoid full-table boolean scans.
+        # Get all events for this ICU stay using event_idx bounds.
+        # Contract: min_event_idx/max_event_idx in icu_stay_df are event_idx values.
         min_idx = int(icu_stay["min_event_idx"])
         max_idx = int(icu_stay["max_event_idx"])
+        if min_idx > max_idx:
+            raise ValueError(
+                f"Invalid event_idx bounds for subject_id={subject_id}, icu_stay_id={icu_stay_id}: "
+                f"min_event_idx={min_idx} > max_event_idx={max_idx}"
+            )
 
-        if self.events_df.index.is_monotonic_increasing and pd.api.types.is_integer_dtype(self.events_df.index.dtype):
-            patient_events = self.events_df.loc[min_idx:max_idx]
-        else:
-            patient_events = self.events_df[(self.events_df.index >= min_idx) & (self.events_df.index <= max_idx)]
+        expected_n_events: Optional[int] = None
+        raw_n_events = icu_stay.get("n_events")
+        if pd.notna(raw_n_events):
+            try:
+                expected_n_events = int(raw_n_events)
+            except (TypeError, ValueError):
+                expected_n_events = None
 
-        # Keep subject_id filter as a safety check for unexpected index anomalies.
-        if "subject_id" in patient_events.columns:
-            patient_events = patient_events[patient_events["subject_id"] == subject_id]
-        patient_events = patient_events.copy()
-        patient_events = patient_events.sort_index()
+        if "subject_id" not in self.events_df.columns:
+            raise ValueError("events_df is missing required column: subject_id")
+        if "event_idx" not in self.events_df.columns:
+            raise ValueError("events_df is missing required column: event_idx")
+
+        subject_events = self.events_df[self.events_df["subject_id"] == int(subject_id)].copy()
+        event_idx_series = pd.to_numeric(subject_events["event_idx"], errors="coerce")
+        patient_events = subject_events[(event_idx_series >= min_idx) & (event_idx_series <= max_idx)].copy()
+        patient_events = patient_events.sort_values("event_idx", ascending=True, kind="mergesort")
+
+        if expected_n_events is not None and len(patient_events) != expected_n_events:
+            raise ValueError(
+                "Extracted event count does not match n_events for "
+                f"subject_id={subject_id}, icu_stay_id={icu_stay_id}: "
+                f"expected={expected_n_events}, extracted={len(patient_events)}, "
+                f"min_event_idx={min_idx}, max_event_idx={max_idx}"
+            )
 
         # Preserve a raw source index for traceability back to the dataset.
         source_index: Optional[pd.Series] = None
@@ -1166,7 +1184,7 @@ class MIMICDataParser:
         current_window_hours: float = 0.5,
         window_step_hours: float = 0.5,
         include_pre_icu_data: bool = True,
-        use_first_n_hours_after_icu: float = 12,
+        use_first_n_hours_after_icu: Optional[float] = None,
         use_discharge_summary_for_history: bool = False,
         num_discharge_summaries: int = 2,
         relative_report_codes: Optional[List[str]] = None,
@@ -1214,10 +1232,10 @@ class MIMICDataParser:
                                                `current_discharge_summary`.
             num_discharge_summaries: Maximum number of prioritized pre-ICU reports to
                                      include per NOTE_* code (default 2). With
-                                     NOTE_DISCHARGESUMMARY and NOTE_RADIOLOGYREPORT,
-                                     up to 4 reports can be selected in total.
-            relative_report_codes: Additional NOTE_* codes to consider as pre-ICU reports.
-                                   NOTE_DISCHARGESUMMARY is always prioritized first.
+                                     NOTE_DISCHARGESUMMARY only, up to 2 reports can
+                                     be selected in total by default.
+            relative_report_codes: Optional additional NOTE_* codes to consider as pre-ICU
+                                   reports. NOTE_DISCHARGESUMMARY is always prioritized first.
             pre_icu_history_hours: Pre-ICU lookback window in hours (default 72h) used for
                                    pre-ICU history events.
             history_context_hours: Optional history horizon (hours) before current window

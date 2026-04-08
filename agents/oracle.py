@@ -16,6 +16,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from model.llms import LLMClient
 from prompts.oracle_prompt import format_event_lines, format_oracle_prompt, format_pre_icu_compression_prompt
+from utils.json_parse import parse_json_dict_best_effort
 
 try:
     import tiktoken
@@ -1358,36 +1359,5 @@ def _normalize_action_review(value: Any) -> Dict[str, Any]:
 
 
 def _best_effort_parse_json(content: str) -> Dict[str, Any]:
-    text = _safe_text(content)
-    if not text:
-        return {}
-
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        pass
-
-    fenced_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
-    for block in fenced_blocks:
-        block = block.strip()
-        if not block:
-            continue
-        try:
-            parsed = json.loads(block)
-            return parsed if isinstance(parsed, dict) else {}
-        except json.JSONDecodeError:
-            continue
-
-    decoder = json.JSONDecoder()
-    for i, char in enumerate(text):
-        if char != "{":
-            continue
-        try:
-            parsed, _ = decoder.raw_decode(text[i:])
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
-
-    return {}
+    parsed = parse_json_dict_best_effort(content)
+    return parsed or {}

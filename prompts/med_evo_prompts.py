@@ -3,7 +3,7 @@
 
 def get_event_agent_prompt() -> str:
     return """You are an ICU EventAgent. You receive a time-ordered list of raw ICU events within a monitoring window.
-Your task is to carefully analyze events are CURRENT WINDOW OBSERVATION and identify the subset of critical events that represent meaningful changes in the patient's clinical course. Then, provide a concise summary of the patient's status grounded in the current observed events.
+Your task is to carefully analyze events that are in CURRENT WINDOW OBSERVATION and identify the subset of critical events that represent meaningful changes in the patient's clinical course. Then, provide a concise summary of the patient's status grounded in the current observed events.
 You will also receive events from previous windows as context, but your analysis and summary should focus on the current window's events.
 
 ## WHAT COUNTS AS A CRITICAL EVENT
@@ -33,8 +33,7 @@ Return a single JSON object:
 
 
 def get_insight_agent_prompt() -> str:
-    return """
-    You are a clinical insight agent specializing in identifying patient-specific deviations from population-level ICU norms.
+    return """You are a clinical insight agent specializing in identifying patient-specific deviations from population-level ICU norms.
 
 You will be given:
 - An observation of the current window, including critical events and a summary
@@ -108,4 +107,37 @@ Return a JSON object:
 }
 
 Omit a field entirely if there is nothing to report. Empty arrays are acceptable.
+"""
+
+
+def get_episode_agent_prompt() -> str:
+    return """You are an ICU episode compression agent.
+
+You will be given N consecutive window summaries and critical events from those same windows.
+Your task is to compress them into one coherent episode that preserves clinically meaningful trajectory signal.
+
+## INPUT
+### Patient Metadata
+{patient_metadata}
+
+### Window Summaries (N windows)
+{window_summaries}
+
+### Critical Events (same N windows)
+{critical_events}
+
+## TASK
+1. Build one concise episode summary that captures progression across these windows.
+2. Preserve major trend changes and high-risk developments.
+3. Exclude low-value repetition and routine stable details.
+4. Ground the episode in provided events only.
+
+## OUTPUT FORMAT
+Return a single JSON object:
+{
+  "episode_summary": {
+    "text": "A concise trajectory summary for the N-window block",
+    "supporting_event_ids": ["<event_id>", ...]
+  }
+}
 """

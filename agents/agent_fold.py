@@ -11,13 +11,13 @@ Key features:
 """
 
 import json
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from model.llms import LLMClient
+from utils.json_parse import parse_json_dict_or_raise
 
 
 @dataclass
@@ -758,33 +758,7 @@ class FoldAgent:
 
     def _parse_json_response(self, response: str) -> Dict:
         """Parse JSON from LLM response."""
-        response = response.strip()
-
-        # Try direct parse
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            pass
-
-        # Try extracting from markdown code block
-        if "```json" in response:
-            start = response.find("```json") + 7
-            end = response.find("```", start)
-            if end > start:
-                return json.loads(response[start:end].strip())
-
-        if "```" in response:
-            start = response.find("```") + 3
-            end = response.find("```", start)
-            if end > start:
-                return json.loads(response[start:end].strip())
-
-        # Try finding JSON object
-        match = re.search(r"\{[\s\S]*\}", response)
-        if match:
-            return json.loads(match.group())
-
-        raise ValueError(f"Could not parse JSON from response: {response[:200]}...")
+        return parse_json_dict_or_raise(response)
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get agent statistics."""

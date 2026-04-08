@@ -10,13 +10,13 @@ The Predictor runs once at the end on the final WorkingContext.
 """
 
 import json
-import re
 from copy import deepcopy
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from agents.agent_fold import ClinicalConcern, LLMCallLog, MemoryDatabase, TrajectoryEntry, WorkingContext
 from model.llms import LLMClient
+from utils.json_parse import parse_json_dict_or_raise
 
 
 def _normalize_token_count(value: Any) -> int:
@@ -314,7 +314,6 @@ class MultiAgent:
         max_tokens: int = 4096,
         enable_logging: bool = False,
         window_duration_hours: float = 0.5,
-        observation_hours: float = 12.0,
         use_observer_agent: bool = True,
         use_memory_agent: bool = True,
         use_reflection_agent: bool = True,
@@ -327,7 +326,6 @@ class MultiAgent:
             max_tokens=max_tokens,
         )
         self.window_duration_hours = window_duration_hours
-        self.observation_hours = observation_hours
         self.use_observer_agent = use_observer_agent
         self.use_memory_agent = use_memory_agent
         self.use_reflection_agent = use_reflection_agent
@@ -671,9 +669,7 @@ class MultiAgent:
             context_parts.append("")
 
         context_text = "\n".join(context_parts)
-        prompt = get_survival_prediction_prompt(
-            observation_hours=self.observation_hours,
-        ).format(context=context_text)
+        prompt = get_survival_prediction_prompt().format(context=context_text)
 
         response = self.llm_client.chat(prompt=prompt, response_format="text")
         content = response.get("content", "")
@@ -929,9 +925,7 @@ class MultiAgent:
             prediction, pred_raw, pred_usage, pred_formatted = self.predictor.predict(
                 working_context=working_context,
                 hours_since_admission=last_hours,
-                prompt_template=get_predictor_prompt(
-                    observation_hours=self.observation_hours,
-                ),
+                prompt_template=get_predictor_prompt(),
             )
         else:
             # Ablation path: use observer outputs directly
@@ -996,48 +990,4 @@ class MultiAgent:
 
 def _parse_json_response(response: str) -> Dict:
     """Parse JSON from LLM response."""
-
-    def _parse_candidate(candidate: str) -> Optional[Dict]:
-        candidate = candidate.strip()
-        if not candidate:
-            return None
-
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
-
-        fenced_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", candidate, re.IGNORECASE)
-        for block in fenced_blocks:
-            block = block.strip()
-            if not block:
-                continue
-            try:
-                return json.loads(block)
-            except json.JSONDecodeError:
-                continue
-
-        decoder = json.JSONDecoder()
-        for i, char in enumerate(candidate):
-            if char not in "{[":
-                continue
-            try:
-                parsed, _ = decoder.raw_decode(candidate[i:])
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                continue
-
-        return None
-
-    candidates = []
-    raw_response = response.strip()
-    if raw_response:
-        candidates.append(raw_response)
-
-    for candidate in candidates:
-        parsed = _parse_candidate(candidate)
-        if parsed is not None:
-            return parsed
-
-    raise ValueError(f"Could not parse JSON from response: {response[:200]}...")
+    return parse_json_dict_or_raise(response)

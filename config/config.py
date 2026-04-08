@@ -90,9 +90,12 @@ class Config:
     # ========================================================================
 
     @property
-    def agent_observation_hours(self) -> float:
-        """Number of hours to observe for agent before making prediction (default 12)."""
-        return self.get("data_loading.agent_observation_hours", 12.0)
+    def agent_observation_hours(self) -> Optional[float]:
+        """Hours observed after ICU admission for agent windows; None means full ICU stay."""
+        value = self.get("data_loading.agent_observation_hours", 12.0)
+        if value is None:
+            return None
+        return float(value)
 
     @property
     def oracle_observation_hours(self) -> Optional[float]:
@@ -130,11 +133,8 @@ class Config:
 
     @property
     def oracle_relative_report_codes(self) -> List[str]:
-        """Additional pre-ICU NOTE_* report codes to prioritize with discharge summaries."""
-        value = self.get("oracle_time_windows.relative_report_codes", ["NOTE_RADIOLOGYREPORT"])
-        if not isinstance(value, list):
-            return ["NOTE_RADIOLOGYREPORT"]
-        return [str(code) for code in value if str(code).strip()]
+        """Fixed pre-ICU report code set; standardized to discharge summary only."""
+        return ["NOTE_DISCHARGESUMMARY"]
 
     @property
     def oracle_pre_icu_history_hours(self) -> float:
@@ -233,6 +233,18 @@ class Config:
     def agent_num_discharge_summaries(self) -> int:
         """Maximum prioritized pre-ICU reports to include per NOTE_* code for Agent."""
         return self.get("agent_time_windows.num_discharge_summaries", 3)
+
+    @property
+    def agent_pre_icu_history_hours(self) -> float:
+        """Pre-ICU history lookback window (hours) for Agent pre-ICU context construction."""
+        value = self.get("agent_time_windows.pre_icu_history_hours")
+        if value is None:
+            # Backward compatibility: older configs may only define Oracle horizon.
+            return float(self.oracle_pre_icu_history_hours)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(self.oracle_pre_icu_history_hours)
 
     # ========================================================================
     # LLM Configuration
@@ -348,22 +360,22 @@ class Config:
             return 3
 
     @property
-    def med_evo_max_events(self) -> int:
+    def med_evo_max_critical_events(self) -> int:
         """Maximum number of critical events kept in memory."""
-        value = self.get("med_evo.max_events", 100)
+        value = self.get("med_evo.max_critical_events", 100)
         try:
             return max(1, int(value))
         except (TypeError, ValueError):
             return 100
 
     @property
-    def med_evo_max_episodes(self) -> int:
-        """Maximum number of episodes reserved for future trajectory compression."""
-        value = self.get("med_evo.max_episodes", 20)
+    def med_evo_max_window_summaries(self) -> int:
+        """Maximum number of trajectory summaries retained (window summaries + episodes)."""
+        value = self.get("med_evo.max_window_summaries", 100)
         try:
-            return max(0, int(value))
+            return max(1, int(value))
         except (TypeError, ValueError):
-            return 20
+            return 100
 
     @property
     def med_evo_max_insights(self) -> int:
@@ -391,6 +403,15 @@ class Config:
             return max(1, int(value))
         except (TypeError, ValueError):
             return 1
+
+    @property
+    def med_evo_episode_every_n_windows(self) -> int:
+        """Run EpisodeAgent once every N non-empty windows (default 0 = disabled)."""
+        value = self.get("med_evo.episode_every_n_windows", 0)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
 
     # ========================================================================
     # Utility Methods

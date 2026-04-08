@@ -20,8 +20,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from data_parser import MIMICDataParser
 
-INDEX_POINTER_COLUMNS: Tuple[str, ...] = ("enter_event_idx", "death_event_idx", "readm_event_idx")
-
 
 @dataclass(frozen=True)
 class ShardPaths:
@@ -274,24 +272,20 @@ def _extract_stay_events(
     min_event_idx: int,
     max_event_idx: int,
 ) -> pd.DataFrame:
-    if events_df.index.is_monotonic_increasing and pd.api.types.is_integer_dtype(events_df.index.dtype):
-        stay_events = events_df.loc[min_event_idx:max_event_idx]
-    else:
-        stay_events = events_df[(events_df.index >= min_event_idx) & (events_df.index <= max_event_idx)]
+    if min_event_idx > max_event_idx:
+        raise ValueError(
+            f"Invalid event_idx bounds for subject_id={subject_id}: "
+            f"min_event_idx={min_event_idx} > max_event_idx={max_event_idx}"
+        )
+    if "subject_id" not in events_df.columns:
+        raise ValueError("events_df is missing required column: subject_id")
+    if "event_idx" not in events_df.columns:
+        raise ValueError("events_df is missing required column: event_idx")
 
-    if "subject_id" in stay_events.columns:
-        stay_events = stay_events[stay_events["subject_id"] == int(subject_id)]
-    return stay_events.sort_index().copy()
-
-
-def _remap_pointer(value: object, index_map: Dict[int, int]) -> object:
-    if pd.isna(value):
-        return pd.NA
-    try:
-        old_index = int(value)
-    except (TypeError, ValueError):
-        return pd.NA
-    return int(index_map[old_index]) if old_index in index_map else pd.NA
+    subject_events = events_df[events_df["subject_id"] == int(subject_id)].copy()
+    event_idx_series = pd.to_numeric(subject_events["event_idx"], errors="coerce")
+    stay_events = subject_events[(event_idx_series >= int(min_event_idx)) & (event_idx_series <= int(max_event_idx))]
+    return stay_events.sort_values("event_idx", ascending=True, kind="mergesort").copy()
 
 
 def _coerce_icu_dtypes(icu_df: pd.DataFrame) -> pd.DataFrame:
@@ -335,7 +329,6 @@ def _build_subset_data(
     metadata_rows: List[Dict] = []
     events_schema_columns: Optional[List[str]] = None
 
-    next_event_index = 0
     for source_shard, shard_group in selected_df.groupby("source_shard", sort=False):
         events_path = Path(str(shard_group["source_events_path"].iloc[0]))
         shard_events_df = pd.read_parquet(events_path)
@@ -365,23 +358,15 @@ def _build_subset_data(
                     f"subject_id={subject_id}, icu_stay_id={icu_stay_id}, shard={source_shard}"
                 )
 
-            source_indices = [int(idx) for idx in stay_events.index.tolist()]
-            new_indices = list(range(next_event_index, next_event_index + len(stay_events)))
-            index_map = dict(zip(source_indices, new_indices))
-
-            subset_min_event_idx = int(new_indices[0])
-            subset_max_event_idx = int(new_indices[-1])
+            subset_min_event_idx = int(src_min_event_idx)
+            subset_max_event_idx = int(src_max_event_idx)
 
             event_frames.append(stay_events[events_schema_columns].reset_index(drop=True))
-            next_event_index += len(stay_events)
 
             icu_row = {column: row[column] for column in icu_schema_columns}
             icu_row["min_event_idx"] = subset_min_event_idx
             icu_row["max_event_idx"] = subset_max_event_idx
             icu_row["n_events"] = int(len(stay_events))
-            for pointer_col in INDEX_POINTER_COLUMNS:
-                if pointer_col in icu_row:
-                    icu_row[pointer_col] = _remap_pointer(icu_row[pointer_col], index_map=index_map)
             icu_rows.append(icu_row)
 
             metadata_rows.append(

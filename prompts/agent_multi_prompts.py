@@ -113,13 +113,9 @@ Return valid JSON only (no XML tags, no markdown code fences):
 - Keep summaries concise but clinically informative."""
 
 
-def get_predictor_prompt(observation_hours: float = 12.0) -> str:
-    """Prompt for the Predictor Agent: survival prediction.
-
-    Args:
-        observation_hours: Number of hours observed after ICU admission
-    """
-    return get_survival_prediction_prompt(observation_hours=observation_hours)
+def get_predictor_prompt() -> str:
+    """Prompt for the Predictor Agent: survival prediction."""
+    return get_survival_prediction_prompt()
 
 
 def get_reflection_agent_prompt() -> str:

@@ -1,12 +1,5 @@
-def get_survival_prediction_prompt(observation_hours: float = 12.0) -> str:
-    """Get the prediction prompt for in-ICU mortality prediction.
-
-    Args:
-        observation_hours: Number of hours observed after ICU admission
-    """
-    obs_hours = int(observation_hours) if float(observation_hours).is_integer() else observation_hours
-
-    return f"""You are a clinical decision support AI specializing in ICU outcome prediction. Your task is to predict whether the patient will die during their current ICU stay, based on data from the first {obs_hours} hours after ICU admission.
+def get_survival_prediction_prompt() -> str:
+    return """You are a clinical decision support AI specializing in ICU outcome prediction. Your task is to predict whether the patient will die during their current ICU stay, based on the observed ICU timeline provided below.
 
 ## INPUT
 You will receive one of:
@@ -37,7 +30,7 @@ Respond in JSON format only:
   "supporting_evidence": [
     {{
       "source": "raw_event" | "critical_event" | "trajectory" | "insight" | "metadata",
-      "content": "Brief summary of the evidence (do not quote verbatim)",
+      "content": "Brief summary of the evidence",
       "significance": "Why this supports the prediction"
     }}
   ],
@@ -50,8 +43,101 @@ Respond in JSON format only:
 - Do not hallucinate or infer data not present in the input.
 - If data is insufficient for a confident prediction, set confidence to "Low" and explain the uncertainty in rationale.
 
-## CLINICAL CONTEXT (First {obs_hours} Hours After ICU Admission)
-{{context}}
+## CLINICAL CONTEXT
+{context}
 
 Based on the above, predict whether this patient will die during their ICU stay.
+"""
+
+
+def get_survival_prediction_prompt_naive() -> str:
+    return """You are a clinical decision support AI specializing in ICU outcome prediction. Your task is to predict whether the patient will die during their current ICU stay, based on the observed ICU timeline provided below.
+
+## OUTPUT FORMAT
+Respond in JSON format only:
+{{
+  "prediction": "Survive" | "Die",
+  "confidence": "Low" | "Moderate" | "High",
+  "supporting_evidence": [
+    {{
+      "source": "raw_event" | "critical_event" | "trajectory" | "insight" | "metadata",
+      "content": "Brief summary of the evidence",
+      "significance": "Why this supports the prediction"
+    }}
+  ],
+  "rationale": "1–3 sentences of concise clinical reasoning"
+}}
+
+## CLINICAL CONTEXT
+{context}
+
+Based on the above, predict whether this patient will die during their ICU stay.
+"""
+
+
+def get_patient_status_prediction_prompt() -> str:
+    return """You are a clinical decision support AI. Assess the patient's overall clinical status for the current ICU window.
+
+## INPUT
+You will receive one of:
+(A) Raw ICU events in chronological order
+(B) A structured Memory object with the following layers:
+    - patient_metadata
+    - working_memory: raw events from recent windows — current local status
+    - critical_events_memory: key change points in patient trajectory
+    - trajectory_memory: global progression since ICU admission
+    - insight_memory: patient-specific deviations from typical ICU trajectories
+
+## INSTRUCTIONS
+Assess the patient's clinical direction at this window by reasoning across four domains:
+- Hemodynamics: heart rate, MAP, lactate, perfusion, vasopressor requirements
+- Respiratory: SpO2, PaO2/FiO2, respiratory rate, ventilator settings
+- Renal/Metabolic: creatinine, urine output, electrolytes, acid-base status
+- Neurology: GCS, mental status, RASS sedation score
+
+Synthesize your domain reasoning into a single overall status label, weighted by the relative clinical importance of each domain for this specific patient:
+- improving: indicators trending toward stability or recovery relative to the provided context
+- stable: no meaningful change in either direction
+- deteriorating: indicators trending toward worsening or decompensation relative to the provided context
+- insufficient_data: available information is not sufficient to make a reliable judgment (e.g., sparse events, conflicting signals)
+
+## OUTPUT FORMAT
+Respond in JSON only:
+{{
+  "patient_assessment": {{
+    "overall": {{
+      "label": "improving" | "stable" | "deteriorating" | "insufficient_data",
+      "rationale": "<1-2 sentences>"
+    }}
+  }}
+}}
+
+## CLINICAL CONTEXT
+{context}
+"""
+
+
+def get_recommendataion_action_prompt() -> str:
+    return """You are a clinical decision support AI. Based on the patient's current clinical status and trajectory, recommend the single most impactful clinical action that could be taken in the next ICU window to improve the patient's outcome. 
+
+## INPUT
+You will receive one of:
+(A) Raw ICU events in chronological order
+(B) A structured Memory object with the following layers:
+    - patient_metadata
+    - working_memory: raw events from recent windows — current local status
+    - critical_events_memory: key change points in patient trajectory
+    - trajectory_memory: global progression since ICU admission
+    - insight_memory: patient-specific deviations from typical ICU trajectories
+
+
+## INSTRUCTIONS
+TODO
+
+## OUTPUT FORMAT
+Respond in JSON only:
+TODO
+
+## CLINICAL CONTEXT
+{context}
 """

@@ -23,6 +23,7 @@ from prompts.remem_prompts import (
     format_state_update_prompt,
     format_survival_prediction_prompt,
 )
+from utils.json_parse import parse_json_dict_or_raise
 
 
 class ActionType(Enum):
@@ -763,31 +764,7 @@ class RememAgent:
 
     def _parse_json_response(self, response: str) -> Dict:
         """Parse JSON from LLM response."""
-        # Try direct parse
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            pass
-
-        # Try extracting from markdown code block
-        if "```json" in response:
-            start = response.find("```json") + 7
-            end = response.find("```", start)
-            if end > start:
-                return json.loads(response[start:end].strip())
-
-        if "```" in response:
-            start = response.find("```") + 3
-            end = response.find("```", start)
-            if end > start:
-                return json.loads(response[start:end].strip())
-
-        # Try finding JSON object
-        match = re.search(r"\{[\s\S]*\}", response)
-        if match:
-            return json.loads(match.group())
-
-        raise ValueError(f"Could not parse JSON from response: {response[:200]}...")
+        return parse_json_dict_or_raise(response)
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get agent statistics."""

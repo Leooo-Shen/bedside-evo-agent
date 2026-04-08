@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import ast
 import json
 import math
-import re
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -13,11 +11,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from model.llms import LLMClient
-from prompts.med_evo_prompts import get_event_agent_prompt, get_insight_agent_prompt
+from prompts.med_evo_prompts import get_episode_agent_prompt, get_event_agent_prompt, get_insight_agent_prompt
 from prompts.oracle_prompt import format_pre_icu_compression_prompt
 from prompts.predictor_prompts import get_survival_prediction_prompt
 from utils.event_format import format_event_line as format_shared_event_line
 from utils.event_format import format_event_lines as format_shared_event_lines
+from utils.json_parse import parse_json_dict_or_raise
 
 PRE_ICU_COMPRESSION_STEP_TYPE = "med_evo_pre_icu_history_compressor"
 
@@ -53,82 +52,7 @@ def _normalize_token_count(value: Any) -> int:
 
 def _parse_json_response(response: Any) -> Dict[str, Any]:
     """Parse JSON payloads from raw LLM output."""
-
-    if isinstance(response, dict):
-        return response
-
-    if isinstance(response, str):
-        raw = response.strip()
-    elif response is None:
-        raw = ""
-    else:
-        raw = str(response).strip()
-
-    def _coerce_dict(parsed: Any) -> Optional[Dict[str, Any]]:
-        if isinstance(parsed, dict):
-            return parsed
-        return None
-
-    def _try_parse(candidate: str) -> Optional[Dict[str, Any]]:
-        candidate = candidate.strip()
-        if not candidate:
-            return None
-
-        try:
-            return _coerce_dict(json.loads(candidate))
-        except json.JSONDecodeError:
-            pass
-
-        try:
-            return _coerce_dict(ast.literal_eval(candidate))
-        except (SyntaxError, ValueError):
-            pass
-
-        fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)```", candidate, re.IGNORECASE)
-        for block in fenced:
-            block = block.strip()
-            if not block:
-                continue
-            try:
-                parsed = json.loads(block)
-            except json.JSONDecodeError:
-                try:
-                    parsed = ast.literal_eval(block)
-                except (SyntaxError, ValueError):
-                    continue
-            maybe_dict = _coerce_dict(parsed)
-            if maybe_dict is not None:
-                return maybe_dict
-
-        decoder = json.JSONDecoder()
-        for i, ch in enumerate(candidate):
-            if ch not in "[{":
-                continue
-            try:
-                parsed, _ = decoder.raw_decode(candidate[i:])
-            except json.JSONDecodeError:
-                continue
-            maybe_dict = _coerce_dict(parsed)
-            if maybe_dict is not None:
-                return maybe_dict
-
-        return None
-
-    candidates: List[str] = []
-    if raw:
-        candidates.append(raw)
-
-    tagged = re.findall(r"<response>([\s\S]*?)</response>", raw, re.IGNORECASE)
-    for tag_content in tagged:
-        if tag_content.strip():
-            candidates.append(tag_content.strip())
-
-    for candidate in candidates:
-        parsed = _try_parse(candidate)
-        if parsed is not None:
-            return parsed
-
-    raise ValueError(f"Could not parse JSON from response: {raw[:200]}...")
+    return parse_json_dict_or_raise(response)
 
 
 def _normalize_int_list(value: Any) -> List[int]:
@@ -199,25 +123,6 @@ def _to_optional_float(value: Any) -> Optional[float]:
 def _fill_prompt_placeholder(template: str, key: str, value: str) -> str:
     """Replace both {key} and {{key}} styles used across prompt templates."""
     return template.replace(f"{{{{{key}}}}}", value).replace(f"{{{key}}}", value)
-
-
-def _strip_hypothesis_evidence_suffix(hypothesis: str) -> str:
-    text = _safe_text(hypothesis)
-    if not text:
-        return ""
-    # Remove deterministic evidence-id suffix if present.
-    return re.sub(r"\s*\[evidence_ids \+:\[[^\]]*\] -:\[[^\]]*\]\]\s*$", "", text).strip()
-
-
-def _append_hypothesis_evidence_suffix(hypothesis: str, supporting_ids: List[int], counter_ids: List[int]) -> str:
-    base = _strip_hypothesis_evidence_suffix(hypothesis)
-    if not base:
-        base = "Clinical hypothesis"
-    if not supporting_ids and not counter_ids:
-        return base
-    support_text = ", ".join(str(event_id) for event_id in supporting_ids)
-    counter_text = ", ".join(str(event_id) for event_id in counter_ids)
-    return f"{base} [evidence_ids +:[{support_text}] -:[{counter_text}]]"
 
 
 def _format_patient_metadata_lines(
@@ -337,21 +242,27 @@ class WindowSummary:
 
 @dataclass
 class Episode:
-    """Compressed trajectory block (schema scaffold for future versions)."""
+    """Compressed trajectory block spanning multiple windows."""
 
     episode_id: int
     start_window: int
     end_window: int
+    start_hour: float
+    end_hour: float
     episode_summary: str
     supporting_event_ids: List[int]
+    supporting_events: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "episode_id": self.episode_id,
             "start_window": self.start_window,
             "end_window": self.end_window,
+            "start_hour": self.start_hour,
+            "end_hour": self.end_hour,
             "episode_summary": self.episode_summary,
             "supporting_event_ids": self.supporting_event_ids,
+            "supporting_events": self.supporting_events,
         }
 
 
@@ -420,32 +331,28 @@ class MedEvoMemory:
                 continue
             parts.append(f"{key}: {value}")
 
-        parts.append("")
-        parts.append("## Recent Working Memory")
-        if self.working_memory:
-            for window in self.working_memory:
-                parts.append(f"Window {window.window_id} (Hour {window.start_hour:.1f}-{window.end_hour:.1f})")
-                parts.extend(_format_event_lines(window.events, empty_text="- (No events)"))
-        else:
-            parts.append("(No windows)")
+        # parts.append("")
+        # parts.append("## Events from Previous Windows")
+        # if self.working_memory:
+        #     for window in self.working_memory[:-1]:
+        #         parts.append(f"Window {window.window_id} (Hour {window.start_hour:.1f}-{window.end_hour:.1f})")
+        #         parts.extend(_format_event_lines(window.events, empty_text="- (No events)"))
+        # else:
+        #     parts.append("(No windows)")
 
         parts.append("")
-        parts.append("## Critical Events")
-        if self.critical_events:
-            for critical in self.critical_events[-10:]:
-                evidence_suffix = f" evidence={critical.evidence}" if critical.evidence else ""
-                parts.append(f"{critical.event_id} CRITICAL_EVENT {critical.name_str}{evidence_suffix}")
-        else:
-            parts.append("- None")
-
-        parts.append("")
-        parts.append("## Trajectory Memory")
+        parts.append("## Trajectory of the ICU Stay")
         if self.trajectory_memory:
-            for item in self.trajectory_memory[-10:]:
+            for item in self.trajectory_memory:
                 if item.get("type") == "window_summary":
                     parts.append(
-                        f"- Window {item.get('window_id')}: {item.get('text')} "
-                        f"[support={item.get('supporting_event_ids', [])}]"
+                        f"- Window {item.get('window_id')} (hour {item.get('start_hour', 0.0):.1f}-{item.get('end_hour', 0.0):.1f}): {item.get('text')} "
+                    )
+                elif item.get("type") == "episode":
+                    parts.append(
+                        f"- Window {item.get('start_window')}-{item.get('end_window')} "
+                        f"(hour {item.get('start_hour', 0.0):.1f}-{item.get('end_hour', 0.0):.1f}): "
+                        f"{item.get('episode_summary', item.get('text', ''))}"
                     )
                 else:
                     parts.append(f"- {item}")
@@ -453,13 +360,29 @@ class MedEvoMemory:
             parts.append("- None")
 
         parts.append("")
-        parts.append("## Insights")
+        parts.append("## Critical Events of the ICU Stay")
+        if self.critical_events:
+            for critical in self.critical_events:
+                parts.append(f"{critical.name_str}")
+        else:
+            parts.append("- None")
+
+        parts.append("")
+        parts.append("## Patient Specific Insights")
         if self.insights:
             for insight in self.insights:
-                parts.append(
-                    f"- I{insight.insight_id} score={insight.score:.3f}: {insight.hypothesis} "
-                    f"support={insight.supporting_event_ids} counter={insight.counter_event_ids}"
-                )
+                parts.append(f"- I{insight.insight_id} score={insight.score:.3f}: {insight.hypothesis} ")
+        else:
+            parts.append("- None")
+
+        parts.append("")
+        parts.append("## Current Window Observation")
+        if self.working_memory:
+            current_window = self.working_memory[-1]
+            parts.append(
+                f"Window {current_window.window_id} (Hour {current_window.start_hour:.1f}-{current_window.end_hour:.1f})"
+            )
+            parts.extend(_format_event_lines(current_window.events, empty_text="- (No events)"))
         else:
             parts.append("- None")
 
@@ -590,10 +513,7 @@ class InsightAgent:
 
         if current_insights:
             insights_text = "\n".join(
-                [
-                    (f"[{insight.insight_id}] {_strip_hypothesis_evidence_suffix(insight.hypothesis)}")
-                    for insight in current_insights
-                ]
+                [(f"[{insight.insight_id}] {_safe_text(insight.hypothesis)}") for insight in current_insights]
             )
         else:
             insights_text = "- None"
@@ -646,6 +566,73 @@ class InsightAgent:
         return parsed, raw, usage, prompt, parse_error
 
 
+class EpisodeAgent:
+    """LLM wrapper for compressing a block of window summaries into one episode."""
+
+    def __init__(self, llm_client: LLMClient):
+        self.llm_client = llm_client
+
+    def analyze(
+        self,
+        recent_window_summaries: List[WindowSummary],
+        recent_critical_events: List[CriticalEvent],
+        patient_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], str, Dict[str, Any], str, Optional[str]]:
+        prompt_template = get_episode_agent_prompt()
+
+        if recent_window_summaries:
+            summary_lines = ["### Window Summaries:"]
+            for summary in recent_window_summaries:
+                text = _safe_text(summary.text)
+                if not text:
+                    text = f"Window {summary.window_id} processed with event-grounded update."
+                summary_lines.append(
+                    f"Window {summary.window_id} (hour {summary.start_hour:.1f}-{summary.end_hour:.1f}): {text}"
+                )
+            summaries_text = "\n".join(summary_lines)
+        else:
+            summaries_text = "### Window Summaries:\n- None"
+
+        if recent_critical_events:
+            critical_lines = ["### Critical Events:"]
+            for critical in recent_critical_events:
+                event_name = _safe_text(critical.name_str)
+                if not event_name:
+                    continue
+                evidence = _safe_text(critical.evidence)
+                if evidence:
+                    critical_lines.append(f"- [{critical.event_id}] {event_name} | {evidence}")
+                else:
+                    critical_lines.append(f"- [{critical.event_id}] {event_name}")
+            critical_text = "\n".join(critical_lines)
+        else:
+            critical_text = "### Critical Events:\n- None"
+
+        patient_metadata_text = "\n".join(_format_patient_metadata_lines(patient_metadata))
+
+        prompt = _fill_prompt_placeholder(prompt_template, "patient_metadata", patient_metadata_text)
+        prompt = _fill_prompt_placeholder(prompt, "window_summaries", summaries_text)
+        prompt = _fill_prompt_placeholder(prompt, "critical_events", critical_text)
+
+        response = self.llm_client.chat(prompt=prompt, response_format="text")
+        raw = response.get("content", "")
+        usage = response.get("usage", {})
+
+        parse_error: Optional[str] = None
+        parsed: Dict[str, Any] = {}
+        for candidate in (response.get("parsed"), raw):
+            if candidate is None:
+                continue
+            try:
+                parsed = _parse_json_response(candidate)
+                parse_error = None
+                break
+            except Exception as exc:
+                parse_error = str(exc)
+
+        return parsed, raw, usage, prompt, parse_error
+
+
 class PredictorAgent:
     """Final ICU outcome predictor."""
 
@@ -656,13 +643,13 @@ class PredictorAgent:
         self,
         memory: MedEvoMemory,
         last_window_events: List[Dict[str, Any]],
-        observation_hours: float,
     ) -> Tuple[Dict[str, Any], str, Dict[str, Any], str, Optional[str]]:
-        prompt_template = get_survival_prediction_prompt(observation_hours=observation_hours)
+        prompt_template = get_survival_prediction_prompt()
 
-        last_events_text = "\n".join(_format_event_lines(last_window_events, empty_text="- (No events)"))
+        # last_events_text = "\n".join(_format_event_lines(last_window_events, empty_text="- (No events)"))
+        # context = "\n\n".join([memory.to_text(), "## Current Window Events", last_events_text])
 
-        context = "\n\n".join([memory.to_text(), "## Last Window Events", last_events_text])
+        context = "\n\n".join([memory.to_text()])
         prompt = _fill_prompt_placeholder(prompt_template, "context", context)
 
         response = self.llm_client.chat(prompt=prompt, response_format="text")
@@ -703,14 +690,14 @@ class MedEvoAgent:
         temperature: Optional[float] = None,
         max_tokens: int = 4096,
         enable_logging: bool = False,
-        observation_hours: float = 12.0,
         window_duration_hours: float = 0.5,
         max_working_windows: int = 3,
-        max_events: int = 100,
-        max_episodes: int = 20,
+        max_critical_events: int = 100,
+        max_window_summaries: int = 100,
         max_insights: int = 5,
         insight_recency_tau: float = 4.0,
         insight_every_n_windows: int = 1,
+        episode_every_n_windows: int = 0,
     ):
         self.llm_client = LLMClient(
             provider=provider,
@@ -720,18 +707,21 @@ class MedEvoAgent:
             max_tokens=max_tokens,
         )
 
-        self.observation_hours = observation_hours
         self.window_duration_hours = window_duration_hours
 
         self.max_working_windows = max_working_windows
-        self.max_events = max_events
-        self.max_episodes = max_episodes
+        self.max_critical_events = max_critical_events
+        self.max_window_summaries = max_window_summaries
         self.max_insights = max_insights
         self.insight_recency_tau = max(float(insight_recency_tau), 0.1)
         try:
             self.insight_every_n_windows = max(1, int(insight_every_n_windows))
         except (TypeError, ValueError):
             self.insight_every_n_windows = 1
+        try:
+            self.episode_every_n_windows = max(0, int(episode_every_n_windows))
+        except (TypeError, ValueError):
+            self.episode_every_n_windows = 0
 
         self.enable_logging = enable_logging
         self.call_logs: List[LLMCallLog] = []
@@ -742,12 +732,14 @@ class MedEvoAgent:
         )
         self.event_agent = EventAgent(self.llm_client)
         self.insight_agent = InsightAgent(self.llm_client)
+        self.episode_agent = EpisodeAgent(self.llm_client)
         self.predictor_agent = PredictorAgent(self.llm_client)
 
         self.total_patients = 0
         self.total_tokens_used = 0
         self.total_event_calls = 0
         self.total_insight_calls = 0
+        self.total_episode_calls = 0
         self.total_predictor_calls = 0
         self.total_pre_icu_compression_calls = 0
         self.total_pre_icu_compression_tokens = 0
@@ -761,6 +753,7 @@ class MedEvoAgent:
         self._event_id_to_raw_event: Dict[int, Dict[str, Any]] = {}
         self._event_id_to_name_str: Dict[int, str] = {}
         self._next_insight_id = 1
+        self._next_episode_id = 1
 
     def clear_logs(self) -> None:
         self.call_logs = []
@@ -783,6 +776,7 @@ class MedEvoAgent:
             "total_tokens_used": self.total_tokens_used,
             "total_event_calls": self.total_event_calls,
             "total_insight_calls": self.total_insight_calls,
+            "total_episode_calls": self.total_episode_calls,
             "total_predictor_calls": self.total_predictor_calls,
             "total_pre_icu_compression_calls": self.total_pre_icu_compression_calls,
             "total_pre_icu_compression_tokens": self.total_pre_icu_compression_tokens,
@@ -790,6 +784,7 @@ class MedEvoAgent:
             "total_event_name_mismatches": self.total_event_name_mismatches,
             "total_insights_pruned": self.total_insights_pruned,
             "insight_every_n_windows": self.insight_every_n_windows,
+            "episode_every_n_windows": self.episode_every_n_windows,
             "total_llm_calls": len(self.call_logs) if self.enable_logging else 0,
         }
 
@@ -837,7 +832,9 @@ class MedEvoAgent:
         )
 
     @staticmethod
-    def _first_window_pre_icu_history(windows: List[Dict[str, Any]]) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    def _first_window_pre_icu_history(
+        windows: List[Dict[str, Any]],
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
         if not windows:
             return None
         first_window = windows[0]
@@ -1256,7 +1253,7 @@ class MedEvoAgent:
             if insight_id is not None:
                 insight = insights_by_id[insight_id]
                 if hypothesis:
-                    insight.hypothesis = _strip_hypothesis_evidence_suffix(hypothesis)
+                    insight.hypothesis = hypothesis
                 insight.supporting_event_ids = self._validate_event_ids(
                     _normalize_int_list(insight.supporting_event_ids + supporting)
                 )
@@ -1275,7 +1272,7 @@ class MedEvoAgent:
             self._next_insight_id += 1
             new_insight = Insight(
                 insight_id=insight_id,
-                hypothesis=_strip_hypothesis_evidence_suffix(hypothesis),
+                hypothesis=hypothesis,
                 supporting_event_ids=supporting,
                 counter_event_ids=counter,
                 created_at=now_ts,
@@ -1288,11 +1285,6 @@ class MedEvoAgent:
         updated_insights = list(insights_by_id.values())
         for insight in updated_insights:
             self._refresh_insight_evidence_objects(insight)
-            insight.hypothesis = _append_hypothesis_evidence_suffix(
-                hypothesis=insight.hypothesis,
-                supporting_ids=insight.supporting_event_ids,
-                counter_ids=insight.counter_event_ids,
-            )
         self._recompute_insight_scores(updated_insights, current_window)
 
         if len(updated_insights) > self.max_insights:
@@ -1322,12 +1314,143 @@ class MedEvoAgent:
             ],
         }
 
-    def run_patient_trajectory(
+    def _build_default_episode_payload(
+        self,
+        recent_window_summaries: List[WindowSummary],
+        recent_critical_events: List[CriticalEvent],
+    ) -> Dict[str, Any]:
+        text_segments: List[str] = []
+        supporting_event_ids: List[int] = []
+
+        for summary in recent_window_summaries:
+            summary_text = _safe_text(summary.text)
+            if summary_text:
+                text_segments.append(
+                    f"Window {summary.window_id} (hour {summary.start_hour:.1f}-{summary.end_hour:.1f}): {summary_text}"
+                )
+            supporting_event_ids.extend(summary.supporting_event_ids)
+
+        if not text_segments:
+            text_segments.append("No clinically meaningful progression identified in this episode block.")
+
+        for critical in recent_critical_events:
+            supporting_event_ids.append(int(critical.event_id))
+
+        supporting_event_ids = _normalize_int_list(supporting_event_ids)[:8]
+
+        return {
+            "episode_summary": {
+                "text": " ".join(text_segments),
+                "supporting_event_ids": supporting_event_ids,
+            }
+        }
+
+    def _ground_episode(
+        self,
+        payload: Dict[str, Any],
+        start_window: int,
+        end_window: int,
+        start_hour: float,
+        end_hour: float,
+        recent_window_summaries: List[WindowSummary],
+        recent_critical_events: List[CriticalEvent],
+    ) -> Episode:
+        source_payload = payload if isinstance(payload, dict) else {}
+        summary_payload = source_payload.get("episode_summary", source_payload.get("episode", {}))
+        if not isinstance(summary_payload, dict):
+            summary_payload = {}
+
+        episode_text = _safe_text(summary_payload.get("text"))
+        if not episode_text:
+            episode_text = _safe_text(summary_payload.get("episode_summary"))
+        if not episode_text:
+            episode_text = _safe_text(source_payload.get("text"))
+
+        default_payload = self._build_default_episode_payload(recent_window_summaries, recent_critical_events)
+        if not episode_text:
+            episode_text = _safe_text(default_payload.get("episode_summary", {}).get("text"))
+
+        supporting_event_ids = _normalize_int_list(
+            summary_payload.get(
+                "supporting_event_ids",
+                summary_payload.get("supporting_evidence", source_payload.get("supporting_event_ids", [])),
+            )
+        )
+        supporting_event_ids = self._validate_event_ids(supporting_event_ids)
+
+        if not supporting_event_ids:
+            supporting_event_ids = self._validate_event_ids(
+                _normalize_int_list(default_payload.get("episode_summary", {}).get("supporting_event_ids", []))
+            )
+
+        if not supporting_event_ids:
+            supporting_event_ids = self._validate_event_ids([int(item.event_id) for item in recent_critical_events])
+
+        supporting_events = self._resolve_supporting_events(supporting_event_ids)
+        supporting_event_ids = [
+            int(item.get("event_id")) for item in supporting_events if item.get("event_id") is not None
+        ]
+
+        episode = Episode(
+            episode_id=self._next_episode_id,
+            start_window=int(start_window),
+            end_window=int(end_window),
+            start_hour=float(start_hour),
+            end_hour=float(end_hour),
+            episode_summary=episode_text,
+            supporting_event_ids=supporting_event_ids,
+            supporting_events=supporting_events,
+        )
+        self._next_episode_id += 1
+        return episode
+
+    def _replace_window_summaries_with_episode(
+        self,
+        memory: MedEvoMemory,
+        covered_summaries: List[WindowSummary],
+        episode: Episode,
+    ) -> None:
+        covered_window_ids = {int(item.window_id) for item in covered_summaries}
+
+        filtered: List[Dict[str, Any]] = []
+        for item in memory.trajectory_memory:
+            if item.get("type") != "window_summary":
+                filtered.append(item)
+                continue
+
+            try:
+                window_id = int(item.get("window_id"))
+            except (TypeError, ValueError):
+                filtered.append(item)
+                continue
+
+            if window_id in covered_window_ids:
+                continue
+            filtered.append(item)
+
+        filtered.append({"type": "episode", **episode.to_dict(), "text": episode.episode_summary})
+        memory.trajectory_memory = self._truncate_trajectory_memory(filtered)
+
+    @staticmethod
+    def _trajectory_item_index(item: Dict[str, Any]) -> int:
+        raw_idx = item.get("window_id", item.get("start_window"))
+        try:
+            return int(raw_idx)
+        except (TypeError, ValueError):
+            return 10**9
+
+    def _truncate_trajectory_memory(self, trajectory_memory: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        ordered = sorted(trajectory_memory, key=self._trajectory_item_index)
+        if len(ordered) > self.max_window_summaries:
+            return ordered[-self.max_window_summaries :]
+        return ordered
+
+    def create_memory_snapshots(
         self,
         windows: List[Dict[str, Any]],
         patient_metadata: Dict[str, Any],
         verbose: bool = True,
-    ) -> Tuple[Dict[str, Any], MedEvoMemory, MedEvoMemoryDatabase]:
+    ) -> Tuple[MedEvoMemory, MedEvoMemoryDatabase]:
         self.total_patients += 1
         self._current_patient_id = (
             f"{patient_metadata.get('subject_id', 'unknown')}_{patient_metadata.get('icu_stay_id', 'unknown')}"
@@ -1337,6 +1460,7 @@ class MedEvoAgent:
         self._event_id_to_raw_event = {}
         self._event_id_to_name_str = {}
         self._next_insight_id = 1
+        self._next_episode_id = 1
 
         patient_metadata_with_pre_icu = self._build_patient_metadata_with_pre_icu_summary(
             windows=windows,
@@ -1355,6 +1479,9 @@ class MedEvoAgent:
         pending_summaries_for_insight: List[WindowSummary] = []
         pending_critical_for_insight: List[CriticalEvent] = []
         pending_critical_ids = set()
+        pending_summaries_for_episode: List[WindowSummary] = []
+        pending_critical_for_episode: List[CriticalEvent] = []
+        pending_critical_ids_for_episode = set()
         for idx, window in enumerate(windows):
             current_events = window.get("current_events", [])
             if not current_events:
@@ -1408,8 +1535,8 @@ class MedEvoAgent:
             )
 
             memory.critical_events.extend(critical_events)
-            if len(memory.critical_events) > self.max_events:
-                memory.critical_events = memory.critical_events[-self.max_events :]
+            if len(memory.critical_events) > self.max_critical_events:
+                memory.critical_events = memory.critical_events[-self.max_critical_events :]
 
             memory.trajectory_memory.append(
                 {
@@ -1417,6 +1544,7 @@ class MedEvoAgent:
                     **summary.to_dict(),
                 }
             )
+            memory.trajectory_memory = self._truncate_trajectory_memory(memory.trajectory_memory)
 
             pending_summaries_for_insight.append(deepcopy(summary))
             for critical in critical_events:
@@ -1424,6 +1552,71 @@ class MedEvoAgent:
                     continue
                 pending_critical_ids.add(critical.event_id)
                 pending_critical_for_insight.append(deepcopy(critical))
+
+            pending_summaries_for_episode.append(deepcopy(summary))
+            for critical in critical_events:
+                if critical.event_id in pending_critical_ids_for_episode:
+                    continue
+                pending_critical_ids_for_episode.add(critical.event_id)
+                pending_critical_for_episode.append(deepcopy(critical))
+
+            run_episode_agent = self.episode_every_n_windows > 0 and (
+                len(pending_summaries_for_episode) >= self.episode_every_n_windows
+            )
+            if run_episode_agent:
+                episode_start = pending_summaries_for_episode[0]
+                episode_end = pending_summaries_for_episode[-1]
+
+                episode_parsed, episode_raw, episode_usage, episode_prompt, episode_parse_error = (
+                    self.episode_agent.analyze(
+                        recent_window_summaries=pending_summaries_for_episode,
+                        recent_critical_events=pending_critical_for_episode,
+                        patient_metadata=memory.patient_metadata,
+                    )
+                )
+                self.total_episode_calls += 1
+
+                if episode_parse_error is not None:
+                    episode_parsed = self._build_default_episode_payload(
+                        pending_summaries_for_episode,
+                        pending_critical_for_episode,
+                    )
+
+                grounded_episode = self._ground_episode(
+                    payload=episode_parsed,
+                    start_window=episode_start.window_id,
+                    end_window=episode_end.window_id,
+                    start_hour=episode_start.start_hour,
+                    end_hour=episode_end.end_hour,
+                    recent_window_summaries=pending_summaries_for_episode,
+                    recent_critical_events=pending_critical_for_episode,
+                )
+                self._replace_window_summaries_with_episode(
+                    memory=memory,
+                    covered_summaries=pending_summaries_for_episode,
+                    episode=grounded_episode,
+                )
+
+                self._log_call(
+                    step_type="episode_agent",
+                    window_index=idx,
+                    hours_since_admission=hours,
+                    prompt=episode_prompt,
+                    response=episode_raw,
+                    usage=episode_usage,
+                    parsed_response=episode_parsed,
+                    metadata={
+                        "episode_parse_error": episode_parse_error,
+                        "episode_id": grounded_episode.episode_id,
+                        "episode_start_window": grounded_episode.start_window,
+                        "episode_end_window": grounded_episode.end_window,
+                        "episode_support_count": len(grounded_episode.supporting_event_ids),
+                    },
+                )
+
+                pending_summaries_for_episode = []
+                pending_critical_for_episode = []
+                pending_critical_ids_for_episode = set()
 
             run_insight_agent = (processed_window_count % self.insight_every_n_windows) == 0
             processed_window_count += 1
@@ -1474,27 +1667,67 @@ class MedEvoAgent:
 
             if verbose:
                 maybe_skipped = " insight_skipped=True" if not run_insight_agent else ""
-                print(f"insights={len(memory.insights)} critical_events={len(memory.critical_events)}{maybe_skipped}")
+                episode_count = sum(1 for item in memory.trajectory_memory if item.get("type") == "episode")
+                print(
+                    f"insights={len(memory.insights)} critical_events={len(memory.critical_events)} "
+                    f"episodes={episode_count}{maybe_skipped}"
+                )
 
-        last_window_events = windows[-1].get("current_events", []) if windows else []
-        last_hours = float(windows[-1].get("hours_since_admission", 0.0)) if windows else 0.0
+        return memory, memory_db
+
+    def predict_from_memory(
+        self,
+        memory: MedEvoMemory,
+        *,
+        last_window_events: Optional[List[Dict[str, Any]]] = None,
+        hours_since_admission: float = 0.0,
+        window_index: int = -1,
+    ) -> Dict[str, Any]:
+        if last_window_events is None:
+            last_window_events = []
 
         prediction, pred_raw, pred_usage, pred_prompt, pred_parse_error = self.predictor_agent.predict(
             memory=memory,
             last_window_events=last_window_events,
-            observation_hours=self.observation_hours,
         )
         self.total_predictor_calls += 1
 
         self._log_call(
             step_type="med_evo_predictor",
-            window_index=-1,
-            hours_since_admission=last_hours,
+            window_index=int(window_index),
+            hours_since_admission=float(hours_since_admission),
             prompt=pred_prompt,
             response=pred_raw,
             usage=pred_usage,
             parsed_response=prediction,
             metadata={"predictor_parse_error": pred_parse_error},
+        )
+
+        return prediction
+
+    def run_patient_trajectory(
+        self,
+        windows: List[Dict[str, Any]],
+        patient_metadata: Dict[str, Any],
+        verbose: bool = True,
+    ) -> Tuple[Dict[str, Any], MedEvoMemory, MedEvoMemoryDatabase]:
+        memory, memory_db = self.create_memory_snapshots(
+            windows=windows,
+            patient_metadata=patient_metadata,
+            verbose=verbose,
+        )
+
+        last_window = windows[-1] if windows else {}
+        last_window_events = last_window.get("current_events", []) if isinstance(last_window, dict) else []
+        if not isinstance(last_window_events, list):
+            last_window_events = []
+        last_hours = float(last_window.get("hours_since_admission", 0.0)) if isinstance(last_window, dict) else 0.0
+
+        prediction = self.predict_from_memory(
+            memory=memory,
+            last_window_events=last_window_events,
+            hours_since_admission=last_hours,
+            window_index=-1,
         )
 
         return prediction, memory, memory_db

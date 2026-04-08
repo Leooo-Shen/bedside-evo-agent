@@ -30,9 +30,49 @@ import pandas as pd
 from config.config import get_config
 from data_parser import MIMICDataParser
 from model.llms import LLMClient
-from prompts.predictor_prompts import get_survival_prediction_prompt
+from prompts.predictor_prompts import get_survival_prediction_prompt, get_survival_prediction_prompt_naive
+from utils.json_parse import parse_json_dict_best_effort
 from utils.outcome_utils import evaluate_outcome_match, extract_survival_prediction_fields
 from utils.patient_selection import select_balanced_patients
+
+
+def _load_patient_stay_ids_csv(patient_stay_ids_path: str) -> pd.DataFrame:
+    """Load and validate a CSV with columns: subject_id, icu_stay_id."""
+    path = Path(patient_stay_ids_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Patient-stay IDs CSV not found: {path}")
+
+    ids_df = pd.read_csv(path)
+    required_columns = {"subject_id", "icu_stay_id"}
+    missing = required_columns - set(ids_df.columns)
+    if missing:
+        raise ValueError(f"Invalid patient-stay IDs CSV (missing columns): {sorted(missing)}")
+
+    ids_df = ids_df[["subject_id", "icu_stay_id"]].copy()
+    ids_df["subject_id"] = pd.to_numeric(ids_df["subject_id"], errors="coerce").astype("Int64")
+    ids_df["icu_stay_id"] = pd.to_numeric(ids_df["icu_stay_id"], errors="coerce").astype("Int64")
+    ids_df = ids_df.dropna(subset=["subject_id", "icu_stay_id"]).copy()
+    ids_df["subject_id"] = ids_df["subject_id"].astype("int64")
+    ids_df["icu_stay_id"] = ids_df["icu_stay_id"].astype("int64")
+    ids_df = ids_df.drop_duplicates(subset=["subject_id", "icu_stay_id"]).reset_index(drop=True)
+
+    if len(ids_df) == 0:
+        raise ValueError(f"No valid subject_id/icu_stay_id rows found in: {path}")
+
+    return ids_df
+
+
+def _select_patients_by_stay_ids(icu_stay_df: pd.DataFrame, patient_stay_ids_df: pd.DataFrame) -> pd.DataFrame:
+    """Select ICU stays by exact (subject_id, icu_stay_id) keys."""
+    parsed = icu_stay_df.copy()
+    parsed["subject_id"] = pd.to_numeric(parsed["subject_id"], errors="coerce").astype("Int64")
+    parsed["icu_stay_id"] = pd.to_numeric(parsed["icu_stay_id"], errors="coerce").astype("Int64")
+    parsed = parsed.dropna(subset=["subject_id", "icu_stay_id"]).copy()
+    parsed["subject_id"] = parsed["subject_id"].astype("int64")
+    parsed["icu_stay_id"] = parsed["icu_stay_id"].astype("int64")
+
+    selected = parsed.merge(patient_stay_ids_df, on=["subject_id", "icu_stay_id"], how="inner")
+    return selected
 
 
 def format_events_for_baseline(events: List[Dict], max_events: Optional[int] = None) -> str:
@@ -81,7 +121,11 @@ def format_events_for_baseline(events: List[Dict], max_events: Optional[int] = N
 
 
 def create_baseline_prompt(
-    trajectory: Dict, all_events: List[Dict], task: str = "survival", max_events: Optional[int] = None
+    trajectory: Dict,
+    all_events: List[Dict],
+    task: str = "survival",
+    max_events: Optional[int] = None,
+    observation_hours: Optional[float] = None,
 ) -> str:
     """
     Create prompt for baseline prediction.
@@ -91,6 +135,7 @@ def create_baseline_prompt(
         all_events: All events before the final window
         task: Prediction task ("survival", "mortality", etc.)
         max_events: Maximum events to include in prompt (None = all)
+        observation_hours: Observation horizon in hours. None means full ICU stay.
 
     Returns:
         Formatted prompt string
@@ -106,9 +151,17 @@ def create_baseline_prompt(
     events_str = format_events_for_baseline(all_events, max_events=max_events)
 
     if task == "survival":
+        if observation_hours is None:
+            event_scope_title = "Observed ICU Timeline"
+        else:
+            event_scope_title = f"First {observation_hours:g} Hours After ICU Admission"
+
         # Build context string with patient info and events
-        context = f"## Patient Information\n- Age: {age_str} years\n\n## Clinical Events (First 12 Hours After ICU Admission)\n{events_str}"
+        context = (
+            f"## Patient Information\n- Age: {age_str} years\n\n## Clinical Events ({event_scope_title})\n{events_str}"
+        )
         prompt = get_survival_prediction_prompt().format(context=context)
+        # prompt = get_survival_prediction_prompt_naive().format(context=context)
 
     return prompt
 
@@ -119,6 +172,7 @@ def make_baseline_prediction(
     all_events: List[Dict],
     task: str = "survival",
     log_dir: Optional[Path] = None,
+    observation_hours: Optional[float] = None,
 ) -> Dict:
     """
     Make a baseline prediction using all available data.
@@ -129,12 +183,13 @@ def make_baseline_prediction(
         all_events: All events before final window
         task: Prediction task
         log_dir: Optional directory to save prompt/response logs
+        observation_hours: Observation horizon in hours. None means full ICU stay.
 
     Returns:
         Prediction dictionary
     """
     # Create prompt
-    prompt = create_baseline_prompt(trajectory, all_events, task=task)
+    prompt = create_baseline_prompt(trajectory, all_events, task=task, observation_hours=observation_hours)
 
     # Get prediction from LLM
     llm_call_error = None
@@ -178,8 +233,11 @@ def make_baseline_prediction(
         }
     else:
         try:
-            prediction = json.loads(response["content"])
-        except (json.JSONDecodeError, KeyError, TypeError):
+            parsed_prediction = parse_json_dict_best_effort(response.get("content", ""))
+            if parsed_prediction is None:
+                raise ValueError("Failed to parse dict-shaped JSON payload from model response")
+            prediction = parsed_prediction
+        except (KeyError, TypeError, ValueError):
             # Fallback if JSON parsing fails
             prediction = {
                 "prediction": "unknown",
@@ -280,10 +338,12 @@ def process_single_patient_baseline(
             for event in current_events:
                 all_events.append(event)
 
-        print(
-            f"   Events after filtering: {len(all_trajectory_events)} → {len(all_events)} "
-            f"(First {observation_hours:.1f} hour ICU events)"
-        )
+        if observation_hours is None:
+            observation_scope = "full ICU stay (still outcome-truncated)"
+        else:
+            observation_scope = f"first {observation_hours:g} hours after ICU admission"
+
+        print(f"   Events after filtering: {len(all_trajectory_events)} → {len(all_events)} " f"({observation_scope})")
 
         if len(all_events) == 0:
             print(f"   WARNING: No events after filtering, skipping...")
@@ -293,7 +353,14 @@ def process_single_patient_baseline(
         log_dir = results_dir / "logs"
 
         # Make baseline prediction
-        prediction = make_baseline_prediction(llm_client, trajectory, all_events, task=task, log_dir=log_dir)
+        prediction = make_baseline_prediction(
+            llm_client,
+            trajectory,
+            all_events,
+            task=task,
+            log_dir=log_dir,
+            observation_hours=observation_hours,
+        )
 
         # Extract predicted outcome
         predicted_outcome, confidence = extract_survival_prediction_fields(prediction)
@@ -366,6 +433,7 @@ def main(
     task: str = "survival",
     n_survived: int = 10,
     n_died: int = 10,
+    patient_stay_ids_path: Optional[str] = None,
 ):
     """
     Run baseline prediction experiment on multiple balanced patients.
@@ -375,6 +443,8 @@ def main(
         task: Prediction task (default "survival")
         n_survived: Number of survived patients for balanced selection
         n_died: Number of died patients for balanced selection
+        patient_stay_ids_path: Optional CSV path with columns subject_id, icu_stay_id.
+            If provided, run this exact ICU-stay cohort.
     """
     # Load configuration
     config = get_config()
@@ -399,13 +469,40 @@ def main(
     parser.load_data()
     print(f"   Loaded {len(parser.icu_stay_df)} ICU stays")
 
-    # Select balanced patient cohort
+    # Select patient cohort
     print("\n2. Selecting patient cohort...")
-    selected_patients = select_balanced_patients(
-        parser.icu_stay_df,
-        n_survived=n_survived,
-        n_died=n_died,
-    )
+    if patient_stay_ids_path:
+        requested_ids_df = _load_patient_stay_ids_csv(patient_stay_ids_path)
+        selected_patients = _select_patients_by_stay_ids(parser.icu_stay_df, requested_ids_df)
+        selected_patients = selected_patients.sort_values(["subject_id", "icu_stay_id"]).reset_index(drop=True)
+
+        selected_key_set = {
+            (int(row.subject_id), int(row.icu_stay_id))
+            for row in selected_patients[["subject_id", "icu_stay_id"]].itertuples(index=False)
+        }
+        requested_key_set = {
+            (int(row.subject_id), int(row.icu_stay_id))
+            for row in requested_ids_df[["subject_id", "icu_stay_id"]].itertuples(index=False)
+        }
+        missing_keys = sorted(requested_key_set - selected_key_set)
+
+        print(f"   Patient-stay IDs file: {patient_stay_ids_path}")
+        print(f"   Requested ICU stays: {len(requested_key_set)}")
+        print(f"   Matched ICU stays: {len(selected_patients)}")
+
+        if missing_keys:
+            preview = ", ".join(f"{sid}_{stay}" for sid, stay in missing_keys[:5])
+            raise RuntimeError(
+                "Some requested patient-stay IDs are missing from current parser cohort. "
+                f"Missing={len(missing_keys)}; first 5: {preview}"
+            )
+    else:
+        selected_patients = select_balanced_patients(
+            parser.icu_stay_df,
+            n_survived=n_survived,
+            n_died=n_died,
+        )
+
     print(f"   Total patients selected: {len(selected_patients)}")
 
     # Run experiments in parallel
@@ -535,6 +632,12 @@ if __name__ == "__main__":
     parser.add_argument("--task", type=str, default="survival", help="Prediction task (default: survival)")
     parser.add_argument("--n-survived", type=int, default=10, help="Number of survived patients")
     parser.add_argument("--n-died", type=int, default=10, help="Number of died patients")
+    parser.add_argument(
+        "--patient-stay-ids",
+        type=str,
+        default=None,
+        help="Optional CSV path with columns subject_id, icu_stay_id for fixed cohort selection",
+    )
 
     args = parser.parse_args()
 
@@ -543,4 +646,5 @@ if __name__ == "__main__":
         task=args.task,
         n_survived=args.n_survived,
         n_died=args.n_died,
+        patient_stay_ids_path=args.patient_stay_ids,
     )

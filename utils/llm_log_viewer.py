@@ -52,10 +52,12 @@ def build_pipeline_agents(agent: Any, agent_type: str) -> List[Dict[str, Any]]:
         return [{"name": "remem_agent", "used": True}]
 
     if agent_type == "med_evo":
+        episode_every_n = int(getattr(agent, "episode_every_n_windows", 0) or 0)
         return [
             {"name": "perception_agent", "used": True},
             {"name": "event_agent", "used": True},
             {"name": "insight_agent", "used": True},
+            {"name": "episode_agent", "used": episode_every_n > 0},
             {"name": "predictor", "used": True},
         ]
 

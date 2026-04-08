@@ -130,8 +130,6 @@ Requirements:
   4) Working diagnoses if evident
 
 - Prefer interpreted clinical states over raw numbers (e.g. 'worsening hypoxia despite O2').
-- Pre-ICU event lines may carry history IDs like `[H0]`, `[H1]`, ... where `H` means pre-ICU history.
-- If citing specific pre-ICU events in the compressed text, keep those `[H#]` references.
 - Mention uncertainty if source text is sparse or conflicting.
 - Do not invent events or outcomes not present in input.
 - Keep the summary reusable across all subsequent ICU windows.
