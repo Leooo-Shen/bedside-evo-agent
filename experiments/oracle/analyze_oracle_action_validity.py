@@ -232,7 +232,7 @@ def _build_q4_window_dataframe(
         if not isinstance(window_outputs, list):
             continue
 
-        for idx, window_output in enumerate(window_outputs, start=1):
+        for idx, window_output in enumerate(window_outputs):
             if not isinstance(window_output, dict):
                 continue
             window_index = _safe_int(window_output.get("window_index"), default=idx)

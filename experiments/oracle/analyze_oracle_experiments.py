@@ -74,7 +74,7 @@ def _build_window_level_dataframe(run_dir: Path, num_time_bins: int) -> pd.DataF
         window_outputs = payload.get("window_outputs", [])
         total_windows = len(window_outputs)
 
-        for index, window_output in enumerate(window_outputs, start=1):
+        for index, window_output in enumerate(window_outputs):
             window_meta = window_output.get("window_metadata", {})
             oracle_output = window_output.get("oracle_output", {})
             if not isinstance(oracle_output, dict):
@@ -86,7 +86,11 @@ def _build_window_level_dataframe(run_dir: Path, num_time_bins: int) -> pd.DataF
             domain_consistency = compute_domain_consistency(oracle_output)
 
             hours_since_admission = float(window_meta.get("hours_since_admission") or 0.0)
-            window_index = int(window_output.get("window_index") or index)
+            window_index_raw = window_output.get("window_index")
+            try:
+                window_index = int(window_index_raw)
+            except (TypeError, ValueError):
+                window_index = int(index)
 
             row = {
                 "condition": condition,
@@ -98,7 +102,7 @@ def _build_window_level_dataframe(run_dir: Path, num_time_bins: int) -> pd.DataF
                 "true_outcome": "survived" if true_survived else "died",
                 "prompt_outcome": "survived" if prompt_survived else "died",
                 "window_index": window_index,
-                "window_index_0": max(0, window_index - 1),
+                "window_index_0": max(0, window_index),
                 "num_windows": total_windows,
                 "hours_since_admission": hours_since_admission,
                 "overall_label": overall_label,

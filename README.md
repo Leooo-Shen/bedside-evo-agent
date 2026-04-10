@@ -209,6 +209,35 @@ python run_oracle.py \
   --max-patients 10
 ```
 
+### MedEvo Memory Workflow
+
+Build MedEvo memory snapshots first, then run downstream prediction tasks from that memory run.
+
+```bash
+# 1) Create a MedEvo memory run
+python experiments/create_memory.py --n-survived 5 --n-died 5
+
+# 2) Survival prediction from precomputed memory
+# Uses only the final memory snapshot per patient (med-evo mode only)
+python experiments/survival_experiment.py \
+  --memory-run experiment_results/memory_snapshot_med_evo_YYYYMMDD_HHMMSS
+
+# Optional: run a fixed patient-stay list for survival
+python experiments/survival_experiment.py \
+  --memory-run experiment_results/memory_snapshot_med_evo_YYYYMMDD_HHMMSS \
+  --patient-stay-ids path/to/patient_stay_ids.csv
+
+# 3) Patient status prediction from memory snapshots
+python experiments/patient_status_experiment.py \
+  --memory-run experiment_results/memory_snapshot_med_evo_YYYYMMDD_HHMMSS \
+  --snapshot-stride 1
+
+# 4) Recommendation prediction from leakage-safe memory context
+python experiments/recommendation_experiment.py \
+  --memory-run experiment_results/memory_snapshot_med_evo_YYYYMMDD_HHMMSS \
+  --snapshot-stride 1
+```
+
 ### Parameters
 
 - `--events`: Path to events parquet file

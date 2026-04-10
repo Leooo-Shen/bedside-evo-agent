@@ -121,7 +121,7 @@ def _select_first_action_rich_window(
     if not isinstance(window_outputs, list):
         return None
 
-    for idx, window_output in enumerate(window_outputs, start=1):
+    for idx, window_output in enumerate(window_outputs):
         if not isinstance(window_output, dict):
             continue
         raw_current_events = window_output.get("raw_current_events")
@@ -333,7 +333,7 @@ def run_counterfactual_action_experiment(
             future_context_hours=config.oracle_context_future_hours,
         )
 
-        if selected_window_index < 1 or selected_window_index > len(windows):
+        if selected_window_index < 0 or selected_window_index >= len(windows):
             raise ValueError(
                 f"Patient {patient_id} selected window {selected_window_index} not found in rebuilt windows "
                 f"(available={len(windows)})"
@@ -344,7 +344,7 @@ def run_counterfactual_action_experiment(
         if not isinstance(baseline_oracle_output, dict):
             baseline_oracle_output = {}
 
-        base_window = copy.deepcopy(windows[selected_window_index - 1])
+        base_window = copy.deepcopy(windows[selected_window_index])
         base_window["window_index"] = selected_window_index
 
         template = select_wrong_action_template(base_window.get("current_events") or [])

@@ -60,3 +60,5 @@ oracle_results/
 analysis_outputs/
 service-account.json
 *.zip
+evaluation_results/
+tests/

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -277,6 +278,60 @@ def extract_snapshot_window_features(snapshot: Dict[str, Any]) -> Tuple[int, flo
     return window_index, hours_since_admission, num_current_events
 
 
+def extract_snapshot_hour_bounds(snapshot: Dict[str, Any]) -> Tuple[float, float]:
+    """Return (start_hour, end_hour) for a snapshot's current window."""
+    working_memory = snapshot.get("working_memory")
+    if not isinstance(working_memory, list) or not working_memory:
+        return 0.0, 0.0
+
+    current_window = working_memory[-1]
+    if not isinstance(current_window, dict):
+        return 0.0, 0.0
+
+    start_hour = _safe_float(current_window.get("start_hour"), default=0.0)
+    end_hour = _safe_float(current_window.get("end_hour"), default=start_hour)
+    if end_hour < start_hour:
+        end_hour = start_hour
+    return start_hour, end_hour
+
+
+def select_snapshot_by_observation_hour(
+    windowed_snapshots: List[Tuple[int, Dict[str, Any]]],
+    observation_hour: float,
+) -> Tuple[int, Dict[str, Any]]:
+    """Select the latest snapshot whose current-window end_hour is <= observation_hour."""
+    if not windowed_snapshots:
+        raise ValueError("Cannot select snapshot by observation hour from empty snapshot list.")
+
+    try:
+        normalized_hour = float(observation_hour)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid observation_hour value: {observation_hour}") from exc
+    if not math.isfinite(normalized_hour) or normalized_hour < 0:
+        raise ValueError(f"observation_hour must be a finite number >= 0, got {observation_hour}")
+
+    selected_item: Optional[Tuple[int, Dict[str, Any]]] = None
+    containing_item: Optional[Tuple[int, Dict[str, Any]]] = None
+    first_start_hour, first_end_hour = extract_snapshot_hour_bounds(windowed_snapshots[0][1])
+
+    for window_index, snapshot in windowed_snapshots:
+        start_hour, end_hour = extract_snapshot_hour_bounds(snapshot)
+        if end_hour <= normalized_hour:
+            selected_item = (int(window_index), snapshot)
+        if containing_item is None and start_hour <= normalized_hour <= end_hour:
+            containing_item = (int(window_index), snapshot)
+
+    if selected_item is not None:
+        return selected_item
+    if containing_item is not None:
+        return containing_item
+
+    raise ValueError(
+        "No snapshot is available for the requested observation hour "
+        f"{normalized_hour:g}. Earliest snapshot covers hour range [{first_start_hour:g}, {first_end_hour:g}]."
+    )
+
+
 def resolve_memory_run_dir(memory_run: str) -> Path:
     path = Path(str(memory_run).strip())
     if path.exists() and path.is_dir():
@@ -412,6 +467,33 @@ def _save_run_config(results_dir: Path, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, indent=2)
 
 
+def _is_complete_patient_result(patient_dir: Path) -> bool:
+    return (
+        (patient_dir / PATIENT_INFO_FILENAME).exists()
+        and (patient_dir / "memory_database.json").exists()
+        and (patient_dir / "final_memory.json").exists()
+    )
+
+
+def _collect_completed_patient_keys(results_dir: Path) -> Set[Tuple[int, int]]:
+    patients_dir = results_dir / "patients"
+    if not patients_dir.exists():
+        return set()
+
+    completed: Set[Tuple[int, int]] = set()
+    for patient_dir in patients_dir.iterdir():
+        if not patient_dir.is_dir():
+            continue
+        if not _is_complete_patient_result(patient_dir):
+            continue
+        try:
+            subject_id_text, icu_stay_id_text = patient_dir.name.split("_", 1)
+            completed.add((int(subject_id_text), int(icu_stay_id_text)))
+        except (TypeError, ValueError):
+            continue
+    return completed
+
+
 def _process_single_patient_memory(
     *,
     patient_row: pd.Series,
@@ -545,7 +627,16 @@ def run_experiment(
     verbose: bool = True,
     enable_logging: bool = True,
     patient_stay_ids_path: Optional[str] = None,
+    num_workers: int = 1,
+    resume_run: Optional[str] = None,
 ) -> Dict[str, Any]:
+    try:
+        num_workers = int(num_workers)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid num_workers value: {num_workers}") from exc
+    if num_workers < 1:
+        raise ValueError(f"num_workers must be >= 1, got {num_workers}")
+
     config = get_config()
     events_path = str(config.events_path)
     icu_stay_path = str(config.icu_stay_path)
@@ -561,11 +652,17 @@ def run_experiment(
         print(f"Observation Window: First {observation_hours:g} hours")
     print(f"Events Path: {events_path}")
     print(f"ICU Stay Path: {icu_stay_path}")
+    print(f"Num Workers: {num_workers}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = Path("experiment_results") / f"memory_snapshot_med_evo_{timestamp}"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Results: {results_dir}")
+    if resume_run:
+        results_dir = resolve_memory_run_dir(resume_run)
+        results_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Resuming Existing Results: {results_dir}")
+    else:
+        results_dir = Path("experiment_results") / f"memory_snapshot_med_evo_{timestamp}"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Results: {results_dir}")
 
     run_config_payload = {
         "generated_at": datetime.now().isoformat(),
@@ -576,6 +673,10 @@ def run_experiment(
         },
         "logging": {
             "enable_logging": bool(enable_logging),
+        },
+        "execution": {
+            "num_workers": num_workers,
+            "resume_run": str(resume_run) if resume_run else None,
         },
         "data_source": {
             "events_path": events_path,
@@ -606,7 +707,8 @@ def run_experiment(
             "episode_every_n_windows": config.med_evo_episode_every_n_windows,
         },
     }
-    _save_run_config(results_dir, run_config_payload)
+    if not resume_run or not (results_dir / RUN_CONFIG_FILENAME).exists():
+        _save_run_config(results_dir, run_config_payload)
 
     print("\n1. Loading MIMIC-demo data...")
     parser = MIMICDataParser(
@@ -649,10 +751,27 @@ def run_experiment(
             n_died=n_died,
         )
 
+    completed_keys = _collect_completed_patient_keys(results_dir) if resume_run else set()
+    if completed_keys:
+        total_selected = len(selected_patients)
+        pending_mask = selected_patients.apply(
+            lambda row: (int(row["subject_id"]), int(row["icu_stay_id"])) not in completed_keys,
+            axis=1,
+        )
+        selected_patients = selected_patients[pending_mask].reset_index(drop=True)
+        skipped = total_selected - len(selected_patients)
+        print(f"   Resume mode: skipped {skipped} already-completed patients")
+
     print("\n3. Creating memory snapshots...")
     print("=" * 80)
 
     all_results: List[Dict[str, Any]] = []
+    failed_patients: List[Dict[str, Any]] = []
+    if resume_run:
+        existing_records = load_memory_patient_records(results_dir)
+        all_results.extend(existing_records)
+        if existing_records:
+            print(f"   Loaded {len(existing_records)} existing patient results from resume run")
     patient_data = [(idx, row) for idx, (_, row) in enumerate(selected_patients.iterrows(), 1)]
 
     def process_patient_wrapper(args):
@@ -669,11 +788,28 @@ def run_experiment(
         )
 
     if patient_data:
-        max_workers = min(1, len(patient_data))
+        max_workers = min(num_workers, len(patient_data))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process_patient_wrapper, data) for data in patient_data]
-            for future in as_completed(futures):
-                result = future.result()
+            future_to_patient = {executor.submit(process_patient_wrapper, data): data for data in patient_data}
+            for future in as_completed(future_to_patient):
+                idx, patient_row = future_to_patient[future]
+                subject_id = int(patient_row["subject_id"])
+                icu_stay_id = int(patient_row["icu_stay_id"])
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    print(
+                        f"   ERROR: Failed patient {subject_id}_{icu_stay_id} "
+                        f"({idx}/{len(selected_patients)}): {exc}"
+                    )
+                    failed_patients.append(
+                        {
+                            "subject_id": subject_id,
+                            "icu_stay_id": icu_stay_id,
+                            "error": str(exc),
+                        }
+                    )
+                    continue
                 if result:
                     all_results.append(result)
 
@@ -693,6 +829,8 @@ def run_experiment(
     print(f"\nTotal Patients: {total_patients}")
     print(f"Total Windows: {total_windows}")
     print(f"Total Memory Snapshots: {total_snapshots}")
+    if failed_patients:
+        print(f"Failed Patients: {len(failed_patients)}")
     print("\nMedEvo Pipeline Totals:")
     print(f"  EventAgent Calls: {int(agent_stat_totals.get('total_event_calls', 0))}")
     print(f"  InsightAgent Calls: {int(agent_stat_totals.get('total_insight_calls', 0))}")
@@ -705,9 +843,11 @@ def run_experiment(
         "timestamp": timestamp,
         "experiment": "create_memory_med_evo",
         "results_dir": str(results_dir),
+        "num_workers": num_workers,
         "total_patients": total_patients,
         "total_windows": total_windows,
         "total_memory_snapshots": total_snapshots,
+        "failed_patients": failed_patients,
         "med_evo_agent_stats": {k: int(v) for k, v in agent_stat_totals.items()},
         "individual_results": sorted(all_results, key=lambda item: (item["subject_id"], item["icu_stay_id"])),
     }
@@ -724,6 +864,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Create MedEvo memory snapshots")
     parser.add_argument("--n-survived", type=int, default=1, help="Number of survived patients")
     parser.add_argument("--n-died", type=int, default=0, help="Number of died patients")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Maximum number of parallel workers for patient processing (default: 4).",
+    )
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
     parser.add_argument("--no-logging", action="store_true", help="Disable detailed LLM call logging")
     parser.add_argument(
@@ -733,6 +879,15 @@ def main() -> None:
         help=(
             "Optional CSV with columns subject_id,icu_stay_id. "
             "If provided, run this exact ICU-stay list instead of random sampling."
+        ),
+    )
+    parser.add_argument(
+        "--resume-run",
+        type=str,
+        default=None,
+        help=(
+            "Optional existing memory run directory to resume in-place. "
+            "Completed patient folders are skipped automatically."
         ),
     )
 
@@ -748,6 +903,8 @@ def main() -> None:
         verbose=not args.quiet,
         enable_logging=not args.no_logging,
         patient_stay_ids_path=args.patient_stay_ids,
+        num_workers=args.num_workers,
+        resume_run=args.resume_run,
     )
 
     print("\n" + "=" * 80)

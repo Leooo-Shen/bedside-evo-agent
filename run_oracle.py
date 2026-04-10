@@ -277,7 +277,7 @@ def _build_patient_predictions_payload(
         parsed_outputs_by_window_index[window_index] = parsed_response
 
     window_outputs = []
-    for idx, window in enumerate(windows, start=1):
+    for idx, window in enumerate(windows):
         raw_current_events = window.get("current_events")
         if not isinstance(raw_current_events, list):
             raw_current_events = []
@@ -307,10 +307,7 @@ def _build_patient_predictions_payload(
                     "pre_icu_history_items": window.get("pre_icu_history_items"),
                 },
                 "raw_current_events": raw_current_events,
-                "oracle_output": parsed_outputs_by_window_index.get(
-                    idx - 1,
-                    parsed_outputs_by_window_index.get(idx, {}),
-                ),
+                "oracle_output": parsed_outputs_by_window_index.get(idx, {}),
             }
         )
 
@@ -455,9 +452,8 @@ def _resolve_context_events_for_window(
 ) -> tuple[Optional[Dict[str, Any]], Optional[int]]:
     if not context_by_window_index:
         return None, None
-    for candidate in (window_index - 1, window_index):
-        if candidate in context_by_window_index:
-            return context_by_window_index[candidate], candidate
+    if window_index in context_by_window_index:
+        return context_by_window_index[window_index], window_index
     return None, None
 
 
@@ -488,14 +484,12 @@ def _resolve_prompt_sections_for_window(
     if not sections_by_window_index:
         return empty, None
 
-    # LLM call window_index may be 0-based while predictions are 1-based.
-    for candidate in (window_index - 1, window_index):
-        if candidate in sections_by_window_index:
-            sections = sections_by_window_index[candidate]
-            return (
-                {key: str(sections.get(key) or "") for key in PROMPT_SECTION_HEADINGS},
-                candidate,
-            )
+    if window_index in sections_by_window_index:
+        sections = sections_by_window_index[window_index]
+        return (
+            {key: str(sections.get(key) or "") for key in PROMPT_SECTION_HEADINGS},
+            window_index,
+        )
     return empty, None
 
 
@@ -516,7 +510,7 @@ def _build_window_contexts_payload(
     resolved_history_hours: Optional[float] = history_hours
     resolved_future_hours: Optional[float] = future_hours
 
-    for idx, raw_window in enumerate(windows, start=1):
+    for idx, raw_window in enumerate(windows):
         window = raw_window if isinstance(raw_window, dict) else {}
         source_current_events = window.get("current_events")
         if not isinstance(source_current_events, list):

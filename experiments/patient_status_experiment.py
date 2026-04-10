@@ -1,11 +1,11 @@
-"""Patient status prediction from precomputed MedEvo memory runs."""
+"""Patient status prediction from precomputed MedEvo memory runs and event baselines."""
 
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 # Add project root to Python path
 project_root = Path(__file__).parent.parent
@@ -26,12 +26,21 @@ from experiments.create_memory import (
     select_snapshots_with_stride,
 )
 from prompts.predictor_prompts import get_patient_status_prediction_prompt
+from utils.event_format import format_event_lines
 from utils.json_parse import parse_json_dict_best_effort
 from utils.llm_log_viewer import save_llm_calls_html
 from utils.status_scoring import normalize_status_label
 
 RUN_CONFIG_FILENAME = "run_config.json"
 AGGREGATE_FILENAME = "aggregate_results.json"
+CONTEXT_MODE_MED_EVO_MEMORY = "med_evo_memory"
+CONTEXT_MODE_FULL_HISTORY_EVENTS = "full_history_events"
+CONTEXT_MODE_LOCAL_EVENTS_ONLY = "local_events_only"
+SUPPORTED_CONTEXT_MODES = (
+    CONTEXT_MODE_MED_EVO_MEMORY,
+    CONTEXT_MODE_FULL_HISTORY_EVENTS,
+    CONTEXT_MODE_LOCAL_EVENTS_ONLY,
+)
 
 
 def _normalize_token_count(value: Any) -> int:
@@ -93,10 +102,90 @@ def _sum_numeric_stats(items: List[Dict[str, Any]]) -> Dict[str, float]:
     return totals
 
 
+def _extract_current_window(snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
+    working_memory = snapshot.get("working_memory")
+    if not isinstance(working_memory, list) or not working_memory:
+        raise ValueError("Snapshot missing non-empty working_memory")
+    current_window = working_memory[-1]
+    if not isinstance(current_window, Mapping):
+        raise ValueError("Snapshot current working_memory entry must be a mapping")
+    return current_window
+
+
+def _window_events(window: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    events = window.get("events")
+    if not isinstance(events, list):
+        return []
+    return [dict(event) for event in events if isinstance(event, Mapping)]
+
+
+def _render_flat_raw_events(events: Sequence[Mapping[str, Any]]) -> str:
+    event_rows = [dict(event) for event in events if isinstance(event, Mapping)]
+    return "\n".join(format_event_lines(event_rows, empty_text="(No events)"))
+
+
+def _build_full_history_event_context(
+    *,
+    selected_window_index: int,
+    selected_snapshot: Mapping[str, Any],
+    snapshot_by_window: Mapping[int, Mapping[str, Any]],
+) -> str:
+    candidate_windows = {int(index) for index in snapshot_by_window.keys() if int(index) <= int(selected_window_index)}
+    candidate_windows.add(int(selected_window_index))
+    merged_events: List[Dict[str, Any]] = []
+    for window_index in sorted(candidate_windows):
+        if int(window_index) == int(selected_window_index):
+            snapshot = selected_snapshot
+        else:
+            snapshot = snapshot_by_window.get(int(window_index))
+            if not isinstance(snapshot, Mapping):
+                continue
+        merged_events.extend(_window_events(_extract_current_window(snapshot)))
+    return _render_flat_raw_events(merged_events)
+
+
+def _build_local_events_only_context(selected_snapshot: Mapping[str, Any]) -> str:
+    current_window = _extract_current_window(selected_snapshot)
+    return _render_flat_raw_events(_window_events(current_window))
+
+
+def _build_status_context(
+    *,
+    context_mode: str,
+    selected_window_index: int,
+    selected_snapshot: Mapping[str, Any],
+    snapshot_by_window: Mapping[int, Mapping[str, Any]],
+) -> Tuple[str, str]:
+    if context_mode == CONTEXT_MODE_MED_EVO_MEMORY:
+        return render_snapshot_to_text(dict(selected_snapshot)), "precomputed_med_evo_memory"
+    if context_mode == CONTEXT_MODE_FULL_HISTORY_EVENTS:
+        return (
+            _build_full_history_event_context(
+                selected_window_index=int(selected_window_index),
+                selected_snapshot=selected_snapshot,
+                snapshot_by_window=snapshot_by_window,
+            ),
+            CONTEXT_MODE_FULL_HISTORY_EVENTS,
+        )
+    if context_mode == CONTEXT_MODE_LOCAL_EVENTS_ONLY:
+        return _build_local_events_only_context(selected_snapshot), CONTEXT_MODE_LOCAL_EVENTS_ONLY
+    raise ValueError(
+        f"Unsupported context_mode={context_mode}. "
+        f"Supported modes: {', '.join(SUPPORTED_CONTEXT_MODES)}"
+    )
+
+
+def _results_dir_name_for_context_mode(context_mode: str) -> str:
+    if context_mode == CONTEXT_MODE_MED_EVO_MEMORY:
+        return "patient_status_experiment"
+    return f"patient_status_experiment_{context_mode}"
+
+
 def process_single_patient(
     patient_record: Dict[str, Any],
     agent: MedEvoAgent,
     snapshot_stride: int,
+    context_mode: str,
     memory_run_dir: Path,
     results_dir: Path,
     patient_idx: int,
@@ -112,6 +201,7 @@ def process_single_patient(
     if verbose:
         print(f"\n[Patient {patient_idx}/{total_patients}] Subject: {subject_id}, ICU Stay: {icu_stay_id}")
         print(f"   Source memory: {source_patient_dir}")
+        print(f"   Context mode: {context_mode}")
 
     try:
         payload = load_patient_memory_payload(source_patient_dir)
@@ -135,83 +225,94 @@ def process_single_patient(
             windowed_snapshots=windowed_snapshots,
             stride=snapshot_stride,
         )
+        snapshot_by_window = {int(window_idx): snapshot for window_idx, snapshot in windowed_snapshots}
+        if not selected_snapshots:
+            print("   WARNING: No selected snapshots found, skipping...")
+            return None
 
         if verbose:
             print(
                 f"   Memory snapshots: total={len(windowed_snapshots)}, "
                 f"selected={len(selected_snapshots)}, stride={snapshot_stride}"
             )
+            print("   Status inference uses the last selected snapshot only.")
 
-        status_predictions: List[Dict[str, Any]] = []
         status_call_logs: List[Dict[str, Any]] = []
         total_status_input_tokens = 0
         total_status_output_tokens = 0
 
-        for sequence_idx, (selected_window_index, snapshot_for_status) in enumerate(selected_snapshots, start=1):
-            inferred_window_index, hours, num_current_events = extract_snapshot_window_features(snapshot_for_status)
-            if inferred_window_index >= 0:
-                window_index = inferred_window_index
-            else:
-                window_index = int(selected_window_index)
+        selected_window_index, snapshot_for_status = selected_snapshots[-1]
+        sequence_idx = int(len(selected_snapshots))
+        inferred_window_index, hours, num_current_events = extract_snapshot_window_features(snapshot_for_status)
+        if inferred_window_index >= 0:
+            window_index = inferred_window_index
+        else:
+            window_index = int(selected_window_index)
 
-            context = render_snapshot_to_text(snapshot_for_status)
-            prompt = get_patient_status_prediction_prompt().format(context=context)
-            response = agent.llm_client.chat(prompt=prompt, response_format="text")
+        context, snapshot_source = _build_status_context(
+            context_mode=str(context_mode),
+            selected_window_index=int(selected_window_index),
+            selected_snapshot=snapshot_for_status,
+            snapshot_by_window=snapshot_by_window,
+        )
+        prompt = get_patient_status_prediction_prompt().format(context=context)
+        response = agent.llm_client.chat(prompt=prompt, response_format="text")
 
-            raw_response = response.get("content", "")
-            usage = response.get("usage", {})
-            if not isinstance(usage, dict):
-                usage = {}
+        raw_response = response.get("content", "")
+        usage = response.get("usage", {})
+        if not isinstance(usage, dict):
+            usage = {}
 
-            input_tokens = _normalize_token_count(usage.get("input_tokens"))
-            output_tokens = _normalize_token_count(usage.get("output_tokens"))
-            total_status_input_tokens += input_tokens
-            total_status_output_tokens += output_tokens
+        input_tokens = _normalize_token_count(usage.get("input_tokens"))
+        output_tokens = _normalize_token_count(usage.get("output_tokens"))
+        total_status_input_tokens += input_tokens
+        total_status_output_tokens += output_tokens
 
-            parsed_prediction = parse_json_dict_best_effort(raw_response)
-            if parsed_prediction is None:
-                parsed_prediction = {}
+        parsed_prediction = parse_json_dict_best_effort(raw_response)
+        if parsed_prediction is None:
+            parsed_prediction = {}
 
-            status_label, status_rationale, active_risks = _extract_status_fields(parsed_prediction)
+        status_label, status_rationale, active_risks = _extract_status_fields(parsed_prediction)
+        status_predictions = [
+            {
+                "window_index": int(window_index),
+                "snapshot_sequence": int(sequence_idx),
+                "hours_since_admission": float(hours),
+                "num_current_events": int(num_current_events),
+                "snapshot_source": str(snapshot_source),
+                "context_mode": str(context_mode),
+                "status_label": status_label,
+                "status_rationale": status_rationale,
+                "active_risks": active_risks,
+                "parsed_prediction": parsed_prediction,
+            }
+        ]
 
-            status_predictions.append(
-                {
-                    "window_index": int(window_index),
+        status_call_logs.append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "patient_id": f"{subject_id}_{icu_stay_id}",
+                "window_index": int(window_index),
+                "hours_since_admission": float(hours),
+                "prompt": prompt,
+                "response": raw_response,
+                "parsed_response": parsed_prediction,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "metadata": {
+                    "step_type": "patient_status_predictor",
+                    "llm_provider": agent.llm_client.provider,
+                    "llm_model": agent.llm_client.model,
+                    "snapshot_source": str(snapshot_source),
+                    "context_mode": str(context_mode),
                     "snapshot_sequence": int(sequence_idx),
-                    "hours_since_admission": float(hours),
-                    "num_current_events": int(num_current_events),
-                    "snapshot_source": "precomputed_med_evo_memory",
-                    "status_label": status_label,
-                    "status_rationale": status_rationale,
-                    "active_risks": active_risks,
-                    "parsed_prediction": parsed_prediction,
-                }
-            )
+                    "memory_run": str(memory_run_dir),
+                },
+            }
+        )
 
-            status_call_logs.append(
-                {
-                    "timestamp": datetime.now().isoformat(),
-                    "patient_id": f"{subject_id}_{icu_stay_id}",
-                    "window_index": int(window_index),
-                    "hours_since_admission": float(hours),
-                    "prompt": prompt,
-                    "response": raw_response,
-                    "parsed_response": parsed_prediction,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "metadata": {
-                        "step_type": "patient_status_predictor",
-                        "llm_provider": agent.llm_client.provider,
-                        "llm_model": agent.llm_client.model,
-                        "snapshot_source": "precomputed_med_evo_memory",
-                        "snapshot_sequence": int(sequence_idx),
-                        "memory_run": str(memory_run_dir),
-                    },
-                }
-            )
-
-            if verbose:
-                print(f"   Status Window {window_index}: {status_label}")
+        if verbose:
+            print(f"   Status Window {window_index}: {status_label}")
 
         status_distribution: Dict[str, int] = {}
         for item in status_predictions:
@@ -227,6 +328,7 @@ def process_single_patient(
             "actual_outcome": actual_outcome,
             "memory_run": str(memory_run_dir),
             "source_patient_dir": str(source_patient_dir),
+            "context_mode": str(context_mode),
             "num_memory_snapshots": len(windowed_snapshots),
             "snapshot_stride": snapshot_stride,
             "status_distribution": status_distribution,
@@ -246,6 +348,7 @@ def process_single_patient(
             "icu_stay_id": icu_stay_id,
             "actual_outcome": actual_outcome,
             "memory_run": str(memory_run_dir),
+            "context_mode": str(context_mode),
             "num_memory_snapshots": len(windowed_snapshots),
             "snapshot_stride": snapshot_stride,
             "final_status_label": (
@@ -259,9 +362,10 @@ def process_single_patient(
         if enable_logging:
             patient_logs = {
                 "patient_id": f"{subject_id}_{icu_stay_id}",
-                "agent_type": "med_evo_patient_status_from_memory",
+                "agent_type": f"patient_status_{context_mode}",
                 "llm_provider": getattr(agent.llm_client, "provider", None),
                 "llm_model": getattr(agent.llm_client, "model", None),
+                "context_mode": str(context_mode),
                 "pipeline_agents": [{"name": "patient_status_predictor", "used": True}],
                 "total_calls": len(status_call_logs),
                 "calls": status_call_logs,
@@ -276,6 +380,7 @@ def process_single_patient(
             "subject_id": subject_id,
             "icu_stay_id": icu_stay_id,
             "actual_outcome": actual_outcome,
+            "context_mode": str(context_mode),
             "num_memory_snapshots": len(windowed_snapshots),
             "snapshot_stride": snapshot_stride,
             "num_status_predictions": len(status_predictions),
@@ -306,26 +411,42 @@ def _save_run_config(results_dir: Path, payload: Dict[str, Any]) -> None:
 def run_experiment(
     memory_run: str,
     snapshot_stride: int = 1,
+    context_mode: str = "",
     verbose: bool = True,
     enable_logging: bool = True,
     patient_stay_ids_path: Optional[str] = None,
+    num_workers: int = 4,
 ) -> Dict[str, Any]:
     try:
         snapshot_stride = max(1, int(snapshot_stride))
     except (TypeError, ValueError):
         snapshot_stride = 1
+    try:
+        num_workers = int(num_workers)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid num_workers value: {num_workers}") from exc
+    if num_workers < 1:
+        raise ValueError(f"num_workers must be >= 1, got {num_workers}")
+    normalized_context_mode = str(context_mode).strip()
+    if normalized_context_mode not in SUPPORTED_CONTEXT_MODES:
+        raise ValueError(
+            f"Unsupported context_mode={context_mode}. "
+            f"Supported modes: {', '.join(SUPPORTED_CONTEXT_MODES)}"
+        )
 
     config = get_config()
     memory_run_dir = resolve_memory_run_dir(memory_run)
     source_run_config = load_memory_run_config(memory_run_dir)
 
     print("=" * 80)
-    print("PATIENT STATUS EXPERIMENT - FROM MED_EVO MEMORY")
+    print("PATIENT STATUS EXPERIMENT")
     print("=" * 80)
     print(f"Memory Run: {memory_run_dir}")
     print(f"Snapshot Stride (k): {snapshot_stride}")
+    print(f"Context Mode: {normalized_context_mode}")
+    print(f"Num Workers: {num_workers}")
 
-    results_dir = memory_run_dir / "patient_status_experiment"
+    results_dir = memory_run_dir / _results_dir_name_for_context_mode(normalized_context_mode)
     results_dir.mkdir(parents=True, exist_ok=True)
     print(f"Results: {results_dir}")
 
@@ -351,8 +472,16 @@ def run_experiment(
         "logging": {
             "enable_logging": bool(enable_logging),
         },
+        "execution": {
+            "num_workers": num_workers,
+        },
         "status_prediction": {
             "snapshot_stride": snapshot_stride,
+            "context_mode": str(normalized_context_mode),
+            "inference_scope": "last_selected_snapshot_only",
+            "local_events_only_scope": "working_memory_last_window_only"
+            if normalized_context_mode == CONTEXT_MODE_LOCAL_EVENTS_ONLY
+            else None,
         },
         "llm": {
             "provider": config.llm_provider,
@@ -389,6 +518,7 @@ def run_experiment(
             patient_record=patient_record,
             agent=patient_agent,
             snapshot_stride=snapshot_stride,
+            context_mode=normalized_context_mode,
             memory_run_dir=memory_run_dir,
             results_dir=results_dir,
             patient_idx=idx,
@@ -397,7 +527,7 @@ def run_experiment(
             verbose=verbose,
         )
 
-    max_workers = min(1, len(patient_data))
+    max_workers = min(num_workers, len(patient_data))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_patient_wrapper, item) for item in patient_data]
         for future in as_completed(futures):
@@ -439,7 +569,12 @@ def run_experiment(
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "experiment": "patient_status_experiment",
         "memory_run": str(memory_run_dir),
+        "context_mode": str(normalized_context_mode),
         "snapshot_stride": snapshot_stride,
+        "num_workers": num_workers,
+        "local_events_only_scope": "working_memory_last_window_only"
+        if normalized_context_mode == CONTEXT_MODE_LOCAL_EVENTS_ONLY
+        else None,
         "total_patients": total_patients,
         "total_window_predictions": total_window_predictions,
         "status_distribution": status_distribution,
@@ -460,7 +595,9 @@ def run_experiment(
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Patient status prediction from precomputed MedEvo memory")
+    parser = argparse.ArgumentParser(
+        description="Patient status prediction from precomputed MedEvo memory and event baselines"
+    )
     parser.add_argument(
         "--memory-run",
         type=str,
@@ -472,6 +609,22 @@ def main() -> None:
         type=int,
         default=1,
         help="Use every k-th memory snapshot for status prediction (default: 1).",
+    )
+    parser.add_argument(
+        "--context-mode",
+        type=str,
+        required=True,
+        choices=list(SUPPORTED_CONTEXT_MODES),
+        help=(
+            "Context construction mode: "
+            "med_evo_memory | full_history_events | local_events_only."
+        ),
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Maximum number of parallel workers for patient processing (default: 4).",
     )
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
     parser.add_argument("--no-logging", action="store_true", help="Disable detailed LLM call logging")
@@ -485,15 +638,17 @@ def main() -> None:
     args = parser.parse_args()
 
     print(f"\n{'='*80}")
-    print("RUNNING: PATIENT STATUS FROM MEMORY")
+    print("RUNNING: PATIENT STATUS EXPERIMENT")
     print(f"{'='*80}\n")
 
     run_experiment(
         memory_run=args.memory_run,
         snapshot_stride=args.snapshot_stride,
+        context_mode=args.context_mode,
         verbose=not args.quiet,
         enable_logging=not args.no_logging,
         patient_stay_ids_path=args.patient_stay_ids,
+        num_workers=args.num_workers,
     )
 
     print("\n" + "=" * 80)

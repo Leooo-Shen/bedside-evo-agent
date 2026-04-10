@@ -89,6 +89,7 @@ You will receive one of:
     - insight_memory: patient-specific deviations from typical ICU trajectories
 
 ## INSTRUCTIONS
+### Task1. Overall Status Assessment
 Assess the patient's clinical direction at this window by reasoning across four domains:
 - Hemodynamics: heart rate, MAP, lactate, perfusion, vasopressor requirements
 - Respiratory: SpO2, PaO2/FiO2, respiratory rate, ventilator settings
@@ -101,6 +102,12 @@ Synthesize your domain reasoning into a single overall status label, weighted by
 - deteriorating: indicators trending toward worsening or decompensation relative to the provided context
 - insufficient_data: available information is not sufficient to make a reliable judgment (e.g., sparse events, conflicting signals)
 
+### Task2. Active Problem Identification
+Identify active clinical problems or emerging risks this patient faces going forward from this window.
+- Only include risks that are real and imminent or already developing — not distant or hypothetical
+- Each risk must be tied to specific trajectory evidence
+- An empty list is expected and acceptable when no urgent risks are present
+
 ## OUTPUT FORMAT
 Respond in JSON only:
 {{
@@ -108,7 +115,13 @@ Respond in JSON only:
     "overall": {{
       "label": "improving" | "stable" | "deteriorating" | "insufficient_data",
       "rationale": "<1-2 sentences>"
-    }}
+    }},
+    "active_risks": [
+      {{
+        "risk_name": "<concise name, e.g. 'AKI progression', 'ventilator-associated pneumonia'>",
+        "key_evidence": ["<Brief summary of the evidence>", ...],
+      }}
+    ] // Or []
   }}
 }}
 
@@ -117,11 +130,16 @@ Respond in JSON only:
 """
 
 
-def get_recommendataion_action_prompt() -> str:
-    return """You are a clinical decision support AI. Based on the patient's current clinical status and trajectory, recommend the single most impactful clinical action that could be taken in the next ICU window to improve the patient's outcome. 
+def get_recommendation_action_prompt(top_k_actions: int, prediction_horizon_hours: float) -> str:
+    if int(top_k_actions) < 1:
+        raise ValueError(f"top_k_actions must be >= 1, got {top_k_actions}")
+    if float(prediction_horizon_hours) <= 0:
+        raise ValueError(f"prediction_horizon_hours must be > 0, got {prediction_horizon_hours}")
+
+    return f"""You are a clinical decision support AI. Based on the patient's current ICU status, recommend the most appropriate clinical actions for the next {float(prediction_horizon_hours):g}-hour horizon.
 
 ## INPUT
-You will receive one of:
+You will receive either one of:
 (A) Raw ICU events in chronological order
 (B) A structured Memory object with the following layers:
     - patient_metadata
@@ -130,14 +148,43 @@ You will receive one of:
     - trajectory_memory: global progression since ICU admission
     - insight_memory: patient-specific deviations from typical ICU trajectories
 
-
 ## INSTRUCTIONS
-TODO
+### Task1. Action Recommendation
+1. Recommend up to {int(top_k_actions)} distinct actions that are clinically actionable in the next {float(prediction_horizon_hours):g}-hour horizon.
+2. Only recommend actions that are clearly justified by the available data. 
+3. It is totally acceptable to return fewer than {int(top_k_actions)}. If data is insufficient to justify a recommendation with at least low confidence, omit it.
+4. Order actions from highest to lowest clinical priority (rank 1 = most urgent).
+5. Prioritize interventions with the highest expected impact on short-term stability and outcome.
+6. Ground every recommendation strictly in the provided context. Do not infer or invent missing data.
+
+### Task2. Red Flag Actions
+Using the full trajectory and current window, identify any actions that should be strictly avoided for this specific patient going forward.
+- Only flag actions that a reasonable clinician might consider but would be harmful for this specific patient — do not list generic contraindications unless directly applicable here
+- Each flag must be justified by patient-level evidence (comorbidities, trajectory events, organ function, known sensitivities)
+- An empty list is expected and acceptable when no red flags are present
 
 ## OUTPUT FORMAT
-Respond in JSON only:
-TODO
+Keep language concise and clinically precise. Respond in JSON only,
+{{
+  "recommended_actions": [
+    {{
+      "rank": <integer, 1 = highest priority>,
+      "action_name": "<Short action label>",
+      "action_description": "<Concrete, specific action recommendation>",
+      "rationale": "<1 sentence grounded in patient data>",
+      "key_evidence": ["<Brief summary of the evidence>", ...],
+      "confidence": "Low" | "Moderate" | "High"
+    }}
+  ],
+  "red_flags": [
+      {{
+        "contraindicated_action": "<name of the action to avoid>",
+        "reason": "<specific reason this action is dangerous for this patient>",
+        "key_evidence": ["<Brief summary of the evidence>", ...],
+      }}
+    ] // Or []
+}}
 
 ## CLINICAL CONTEXT
-{context}
+{{context}}
 """
