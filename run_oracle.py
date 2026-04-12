@@ -667,6 +667,7 @@ def process_batch_for_oracle(
     n_died: Optional[int] = None,
     selection_seed: Optional[int] = DEFAULT_SELECTION_SEED,
     window_workers: int = 4,
+    apply_icu_duration_filter: bool = True,
 ) -> None:
     """Process a batch of patient trajectories through Oracle."""
     if max_patients is not None and max_patients < 0:
@@ -696,7 +697,12 @@ def process_batch_for_oracle(
     print(f"Output Run Directory: {run_dir}")
 
     print("\nInitializing data parser...")
-    parser = MIMICDataParser(events_path, icu_stay_path)
+    print(f"  Apply ICU duration filter (4h < duration <= 96h): {bool(apply_icu_duration_filter)}")
+    parser = MIMICDataParser(
+        events_path=events_path,
+        icu_stay_path=icu_stay_path,
+        apply_icu_duration_filter=bool(apply_icu_duration_filter),
+    )
     parser.load_data()
 
     print("\nInitializing Meta Oracle...")
@@ -1054,6 +1060,11 @@ def main() -> None:
         default=DEFAULT_SELECTION_SEED,
         help=f"Random seed for balanced patient sampling (default: {DEFAULT_SELECTION_SEED}).",
     )
+    parser.add_argument(
+        "--disable-icu-duration-filter",
+        action="store_true",
+        help="Disable default ICU duration filter (4h < duration <= 96h).",
+    )
 
     parser.add_argument(
         "--config",
@@ -1086,6 +1097,7 @@ def main() -> None:
         n_died=args.n_died,
         selection_seed=args.selection_seed,
         window_workers=args.window_workers,
+        apply_icu_duration_filter=not bool(args.disable_icu_duration_filter),
     )
 
 
