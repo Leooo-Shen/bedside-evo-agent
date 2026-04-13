@@ -72,6 +72,12 @@ def _parse_args() -> argparse.Namespace:
         help="Discharge summary selector window used by MIMICDataParser.",
     )
     parser.add_argument(
+        "--min-icu-duration-hours",
+        type=float,
+        default=4.0,
+        help="Strict lower bound for ICU duration filter (sampled stay must be > this value).",
+    )
+    parser.add_argument(
         "--metadata-name",
         type=str,
         default="sampled_patient_metadata.csv",
@@ -131,6 +137,7 @@ def _discover_shards(input_root: Path) -> List[ShardPaths]:
 def _collect_candidates(
     shards: Sequence[ShardPaths],
     max_days_after_leave: float,
+    min_icu_duration_hours: float,
 ) -> Tuple[pd.DataFrame, List[str]]:
     records: List[Dict] = []
     icu_schema_columns: Optional[List[str]] = None
@@ -141,6 +148,7 @@ def _collect_candidates(
             icu_stay_path=str(shard.icu_stay_path),
             discharge_summary_max_days_after_leave=max_days_after_leave,
             require_discharge_summary_for_icu_stays=True,
+            apply_icu_duration_filter=False,
         )
         parser.load_data()
 
@@ -150,6 +158,21 @@ def _collect_candidates(
             raise RuntimeError(f"Parser returned empty events dataframe for shard {shard.shard_id}")
 
         shard_icu_df = parser.icu_stay_df.copy()
+        if "icu_duration_hours" not in shard_icu_df.columns:
+            raise ValueError(
+                f"ICU shard {shard.shard_id} is missing required column: icu_duration_hours"
+            )
+        shard_icu_df["icu_duration_hours"] = pd.to_numeric(
+            shard_icu_df["icu_duration_hours"], errors="coerce"
+        )
+        shard_icu_df = shard_icu_df[
+            shard_icu_df["icu_duration_hours"].notna()
+            & (shard_icu_df["icu_duration_hours"] > float(min_icu_duration_hours))
+        ].copy()
+        if len(shard_icu_df) == 0:
+            del parser
+            gc.collect()
+            continue
         if icu_schema_columns is None:
             icu_schema_columns = list(shard_icu_df.columns)
         elif list(shard_icu_df.columns) != icu_schema_columns:
@@ -434,6 +457,7 @@ def _validate_output(
     expected_total: int,
     expected_survived: int,
     expected_died: int,
+    min_icu_duration_hours: float,
     max_days_after_leave: float,
 ) -> Dict[str, int]:
     parser = MIMICDataParser(
@@ -441,6 +465,7 @@ def _validate_output(
         icu_stay_path=str(icu_stay_path),
         discharge_summary_max_days_after_leave=max_days_after_leave,
         require_discharge_summary_for_icu_stays=True,
+        apply_icu_duration_filter=False,
     )
     parser.load_data()
     if parser.icu_stay_df is None:
@@ -465,6 +490,10 @@ def _validate_output(
         raise RuntimeError(
             "Validation failed: one-subject-one-stay constraint broken in output subset "
             f"(expected {expected_total} unique subjects, observed {observed_unique_subjects})."
+        )
+    if (parser.icu_stay_df["icu_duration_hours"] <= float(min_icu_duration_hours)).any():
+        raise RuntimeError(
+            "Validation failed: subset contains ICU stays at or below the minimum duration threshold."
         )
 
     return {
@@ -491,8 +520,83 @@ def _compute_subject_eligibility_counts(candidates_df: pd.DataFrame) -> pd.DataF
     return pd.DataFrame(rows)
 
 
+def _write_icu_duration_distribution(
+    *,
+    icu_subset_df: pd.DataFrame,
+    statistics_dir: Path,
+) -> Dict[str, object]:
+    if "icu_duration_hours" not in icu_subset_df.columns:
+        raise ValueError("icu_subset_df is missing required column: icu_duration_hours")
+    if "survived" not in icu_subset_df.columns:
+        raise ValueError("icu_subset_df is missing required column: survived")
+
+    duration_df = icu_subset_df[["icu_duration_hours", "survived"]].copy()
+    duration_df["icu_duration_hours"] = pd.to_numeric(duration_df["icu_duration_hours"], errors="coerce")
+    duration_df = duration_df[duration_df["icu_duration_hours"].notna()].copy()
+    if len(duration_df) == 0:
+        raise RuntimeError("No finite icu_duration_hours values found in sampled cohort.")
+
+    summary_df = duration_df["icu_duration_hours"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9]).to_frame(
+        name="icu_duration_hours"
+    )
+    duration_summary_path = statistics_dir / "icu_duration_summary.csv"
+    summary_df.to_csv(duration_summary_path, index=True)
+
+    bucket_edges = [4.0, 12.0, 24.0, 48.0, 96.0, 168.0, 336.0, 672.0, float("inf")]
+    bucket_labels = [
+        "(4,12]",
+        "(12,24]",
+        "(24,48]",
+        "(48,96]",
+        "(96,168]",
+        "(168,336]",
+        "(336,672]",
+        "(672,inf]",
+    ]
+    duration_df["duration_bucket"] = pd.cut(
+        duration_df["icu_duration_hours"],
+        bins=bucket_edges,
+        labels=bucket_labels,
+        right=True,
+        include_lowest=False,
+    )
+    duration_distribution_df = (
+        duration_df.groupby("duration_bucket", observed=False)
+        .agg(
+            stay_count=("duration_bucket", "size"),
+            survived_count=("survived", "sum"),
+        )
+        .reindex(bucket_labels, fill_value=0)
+        .reset_index()
+        .rename(columns={"duration_bucket": "icu_duration_bucket_hours"})
+    )
+    duration_distribution_df["stay_count"] = duration_distribution_df["stay_count"].astype(int)
+    duration_distribution_df["survived_count"] = duration_distribution_df["survived_count"].astype(int)
+    duration_distribution_df["died_count"] = (
+        duration_distribution_df["stay_count"] - duration_distribution_df["survived_count"]
+    ).astype(int)
+    duration_distribution_df["stay_ratio"] = duration_distribution_df["stay_count"] / float(len(duration_df))
+
+    duration_distribution_path = statistics_dir / "icu_duration_distribution.csv"
+    duration_distribution_df.to_csv(duration_distribution_path, index=False)
+
+    print("Sampled ICU duration summary (hours):")
+    print(summary_df.to_string())
+    print("Sampled ICU duration bucket distribution:")
+    print(duration_distribution_df.to_string(index=False))
+
+    return {
+        "icu_duration_summary_csv": str(duration_summary_path),
+        "icu_duration_distribution_csv": str(duration_distribution_path),
+        "icu_duration_distribution": duration_distribution_df.to_dict(orient="records"),
+    }
+
+
 def main() -> None:
     args = _parse_args()
+    min_icu_duration_hours = float(args.min_icu_duration_hours)
+    if min_icu_duration_hours < 0:
+        raise ValueError("--min-icu-duration-hours must be >= 0.")
 
     shards = _discover_shards(args.input_root)
     print(f"Discovered {len(shards)} shard(s) under {args.input_root}")
@@ -500,6 +604,7 @@ def main() -> None:
     candidates_df, icu_schema_columns = _collect_candidates(
         shards=shards,
         max_days_after_leave=float(args.max_days_after_leave),
+        min_icu_duration_hours=min_icu_duration_hours,
     )
 
     subject_eligibility_df = _compute_subject_eligibility_counts(candidates_df)
@@ -538,6 +643,8 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    statistics_dir = output_dir / "statistics"
+    statistics_dir.mkdir(parents=True, exist_ok=True)
 
     events_output_path = output_dir / args.events_name
     icu_output_path = output_dir / args.icu_stay_name
@@ -561,8 +668,14 @@ def main() -> None:
             expected_total=selected_total,
             expected_survived=selected_survived,
             expected_died=selected_died,
+            min_icu_duration_hours=min_icu_duration_hours,
             max_days_after_leave=float(args.max_days_after_leave),
         )
+
+    duration_stats = _write_icu_duration_distribution(
+        icu_subset_df=icu_subset_df,
+        statistics_dir=statistics_dir,
+    )
 
     shard_outcome_distribution = (
         selected_df.groupby(["source_shard", "survived"]).size().reset_index(name="count").to_dict("records")
@@ -578,12 +691,15 @@ def main() -> None:
         "selection_seed": int(args.seed),
         "requested_n_survived": int(args.n_survived),
         "requested_n_died": int(args.n_died),
+        "min_icu_duration_hours_strict_gt": float(min_icu_duration_hours),
         "selected_total": selected_total,
         "selected_survived": selected_survived,
         "selected_died": selected_died,
         "selected_unique_subjects": selected_unique_subjects,
         "selected_total_events": int(len(events_subset_df)),
         "selected_total_icu_rows": int(len(icu_subset_df)),
+        "statistics_dir": str(statistics_dir),
+        "duration_stats": duration_stats,
         "source_shards": [shard.shard_id for shard in shards],
         "shard_outcome_distribution": shard_outcome_distribution,
         "output_validation": validation_stats,
@@ -596,6 +712,8 @@ def main() -> None:
     print(f"  - Events Parquet: {events_output_path}")
     print(f"  - ICU Stay Parquet: {icu_output_path}")
     print(f"  - Summary JSON: {summary_output_path}")
+    print(f"  - ICU Duration Summary CSV: {duration_stats['icu_duration_summary_csv']}")
+    print(f"  - ICU Duration Distribution CSV: {duration_stats['icu_duration_distribution_csv']}")
 
 
 if __name__ == "__main__":

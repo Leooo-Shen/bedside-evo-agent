@@ -16,6 +16,20 @@ from data_parser import MIMICDataParser
 from utils.llm_log_viewer import save_llm_calls_html
 from utils.patient_selection import DEFAULT_SELECTION_SEED, select_balanced_patients
 
+TMP_PROGRESS_FILENAME = "tmp_progress.json"
+REQUIRED_PATIENT_OUTPUT_FILES = (
+    "oracle_predictions.json",
+    "llm_calls.json",
+    "window_contexts.json",
+)
+ORACLE_COUNTER_KEYS = (
+    "total_evaluations",
+    "total_llm_calls",
+    "total_tokens_used",
+    "total_pre_icu_compression_calls",
+    "total_pre_icu_compression_tokens",
+)
+
 
 def _safe_status(report_dict: Dict[str, Any]) -> str:
     assessment = report_dict.get("patient_assessment")
@@ -131,6 +145,47 @@ def _safe_float(value: Any, default: float = float("inf")) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _json_dump_atomic(payload: Dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f"{path.suffix}.tmp")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=_json_default)
+    temp_path.replace(path)
+
+
+def _json_load_dict(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _normalize_optional_path(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return str(Path(text).expanduser().resolve())
+
+
+def _collect_completed_patient_ids(patients_dir: Path) -> List[str]:
+    if not patients_dir.exists():
+        return []
+    completed: List[str] = []
+    for patient_dir in sorted(patients_dir.iterdir(), key=lambda path: path.name):
+        if not patient_dir.is_dir():
+            continue
+        missing_files = [name for name in REQUIRED_PATIENT_OUTPUT_FILES if not (patient_dir / name).exists()]
+        if len(missing_files) == 0:
+            completed.append(patient_dir.name)
+    return completed
 
 
 def _coerce_optional_float(value: Any) -> Optional[float]:
@@ -668,6 +723,7 @@ def process_batch_for_oracle(
     selection_seed: Optional[int] = DEFAULT_SELECTION_SEED,
     window_workers: int = 4,
     apply_icu_duration_filter: bool = True,
+    resume_run_dir: Optional[str] = None,
 ) -> None:
     """Process a batch of patient trajectories through Oracle."""
     if max_patients is not None and max_patients < 0:
@@ -682,19 +738,40 @@ def process_batch_for_oracle(
     )
     prompt_mode_suffix = "with_outcome" if selected_include_icu_outcome_in_prompt else "without_outcome"
 
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"oracle_{run_timestamp}_{prompt_mode_suffix}"
-    run_dir = output_root / run_id
+    resolved_events_path = _normalize_optional_path(events_path)
+    resolved_icu_stay_path = _normalize_optional_path(icu_stay_path)
+
+    resume_summary = None
+    resume_progress = None
+    if resume_run_dir is None:
+        output_root = Path(output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = f"oracle_{run_timestamp}_{prompt_mode_suffix}"
+        run_dir = output_root / run_id
+    else:
+        run_dir = Path(str(resume_run_dir).strip()).expanduser().resolve()
+        if not run_dir.exists() or not run_dir.is_dir():
+            raise ValueError(f"Resume run directory does not exist or is not a directory: {run_dir}")
+        resume_summary = _json_load_dict(run_dir / "processing_summary.json")
+        resume_progress = _json_load_dict(run_dir / TMP_PROGRESS_FILENAME)
+        resume_run_id = resume_summary.get("run_id") if isinstance(resume_summary, dict) else None
+        if not isinstance(resume_run_id, str) or not resume_run_id.strip():
+            resume_run_id = run_dir.name
+        run_id = str(resume_run_id).strip()
+
     patients_dir = run_dir / "patients"
     patients_dir.mkdir(parents=True, exist_ok=True)
+    summary_file = run_dir / "processing_summary.json"
+    tmp_progress_file = run_dir / TMP_PROGRESS_FILENAME
 
     print("=" * 80)
     print("MIMIC-DEMO ORACLE PROCESSING PIPELINE")
     print("=" * 80)
     print(f"Run ID: {run_id}")
     print(f"Output Run Directory: {run_dir}")
+    if resume_run_dir is not None:
+        print(f"Resume run directory: {run_dir}")
 
     print("\nInitializing data parser...")
     print(f"  Apply ICU duration filter (4h < duration <= 96h): {bool(apply_icu_duration_filter)}")
@@ -767,18 +844,191 @@ def process_batch_for_oracle(
 
     json_default = getattr(parser, "_json_default", _json_default)
 
+    completed_patient_ids = _collect_completed_patient_ids(patients_dir)
+    completed_patient_id_set = set(completed_patient_ids)
+    if isinstance(resume_progress, dict):
+        expected_resume_state = {
+            "run_id": run_id,
+            "events_path": resolved_events_path,
+            "icu_stay_path": resolved_icu_stay_path,
+            "provider": provider,
+            "model": model,
+            "current_window_hours": current_window_hours,
+            "window_step_hours": window_step_hours,
+            "include_pre_icu_data": include_pre_icu_data,
+            "use_discharge_summary": selected_use_discharge_summary,
+            "compress_pre_icu_history": selected_compress_pre_icu_history,
+            "include_icu_outcome_in_prompt": selected_include_icu_outcome_in_prompt,
+            "max_patients": max_patients,
+            "n_survived": n_survived,
+            "n_died": n_died,
+            "selection_seed": selection_seed,
+            "window_workers": window_workers,
+            "apply_icu_duration_filter": bool(apply_icu_duration_filter),
+            "planned_total_patients": planned_total,
+        }
+        mismatched_keys = [
+            key for key, value in expected_resume_state.items() if key in resume_progress and resume_progress.get(key) != value
+        ]
+        if mismatched_keys:
+            mismatch_details = ", ".join(
+                f"{key}: expected={expected_resume_state[key]!r} got={resume_progress.get(key)!r}"
+                for key in mismatched_keys
+            )
+            raise ValueError(
+                "Resume progress is incompatible with current run settings. "
+                f"Mismatched fields: {mismatch_details}"
+            )
+        raw_completed_patient_ids = resume_progress.get("completed_patient_ids")
+        if isinstance(raw_completed_patient_ids, list):
+            for raw_patient_id in raw_completed_patient_ids:
+                patient_id = str(raw_patient_id)
+                if patient_id in completed_patient_id_set:
+                    continue
+                patient_dir = patients_dir / patient_id
+                missing_files = [name for name in REQUIRED_PATIENT_OUTPUT_FILES if not (patient_dir / name).exists()]
+                if missing_files:
+                    raise ValueError(
+                        f"Resume progress marks patient {patient_id} complete but files are missing: {missing_files}"
+                    )
+                completed_patient_id_set.add(patient_id)
+                completed_patient_ids.append(patient_id)
+
+    print(f"  Already completed stays found in run directory: {len(completed_patient_ids)}")
+
     print(f"\n{'=' * 80}")
     print("PROCESSING TRAJECTORIES")
     print("=" * 80)
 
     summary_stats: Dict[str, Any] = {
+        "run_id": run_id,
+        "run_directory": str(run_dir),
+        "events_path": events_path,
+        "icu_stay_path": icu_stay_path,
+        "provider": provider,
+        "model": model,
+        "current_window_hours": current_window_hours,
+        "window_step_hours": window_step_hours,
+        "include_pre_icu_data": include_pre_icu_data,
+        "use_discharge_summary": selected_use_discharge_summary,
+        "compress_pre_icu_history": selected_compress_pre_icu_history,
+        "include_icu_outcome_in_prompt": selected_include_icu_outcome_in_prompt,
+        "history_context_hours": float(config.oracle_context_history_hours),
+        "future_context_hours": float(config.oracle_context_future_hours),
+        "top_k_recommendations": int(config.oracle_context_top_k_recommendations),
+        "max_patients": max_patients,
+        "n_survived": n_survived,
+        "n_died": n_died,
+        "selection_seed": selection_seed,
+        "window_workers": window_workers,
+        "apply_icu_duration_filter": bool(apply_icu_duration_filter),
         "total_patients": planned_total if planned_total is not None else 0,
         "total_windows_evaluated": 0,
         "patients_processed": 0,
+        "patients_resumed": len(completed_patient_ids),
         "patients_failed": 0,
         "overall_status_distribution": {},
         "total_action_evaluations": 0,
+        "total_evaluations": 0,
+        "total_llm_calls": 0,
+        "total_tokens_used": 0,
+        "total_pre_icu_compression_calls": 0,
+        "total_pre_icu_compression_tokens": 0,
+        "avg_tokens_per_evaluation": 0.0,
     }
+    if isinstance(resume_summary, dict):
+        summary_stats.update(resume_summary)
+    if isinstance(resume_progress, dict):
+        resumed_summary_stats = resume_progress.get("summary_stats")
+        if isinstance(resumed_summary_stats, dict):
+            summary_stats.update(resumed_summary_stats)
+
+    summary_stats["run_id"] = run_id
+    summary_stats["run_directory"] = str(run_dir)
+    summary_stats["events_path"] = events_path
+    summary_stats["icu_stay_path"] = icu_stay_path
+    summary_stats["provider"] = provider
+    summary_stats["model"] = model
+    summary_stats["current_window_hours"] = current_window_hours
+    summary_stats["window_step_hours"] = window_step_hours
+    summary_stats["include_pre_icu_data"] = include_pre_icu_data
+    summary_stats["use_discharge_summary"] = selected_use_discharge_summary
+    summary_stats["compress_pre_icu_history"] = selected_compress_pre_icu_history
+    summary_stats["include_icu_outcome_in_prompt"] = selected_include_icu_outcome_in_prompt
+    summary_stats["history_context_hours"] = float(config.oracle_context_history_hours)
+    summary_stats["future_context_hours"] = float(config.oracle_context_future_hours)
+    summary_stats["top_k_recommendations"] = int(config.oracle_context_top_k_recommendations)
+    summary_stats["max_patients"] = max_patients
+    summary_stats["n_survived"] = n_survived
+    summary_stats["n_died"] = n_died
+    summary_stats["selection_seed"] = selection_seed
+    summary_stats["window_workers"] = window_workers
+    summary_stats["apply_icu_duration_filter"] = bool(apply_icu_duration_filter)
+    summary_stats["total_patients"] = planned_total if planned_total is not None else summary_stats.get("total_patients", 0)
+    summary_stats["patients_resumed"] = len(completed_patient_ids)
+    if not isinstance(summary_stats.get("overall_status_distribution"), dict):
+        summary_stats["overall_status_distribution"] = {}
+    if _safe_int(summary_stats.get("patients_processed"), default=0) < len(completed_patient_ids):
+        summary_stats["patients_processed"] = len(completed_patient_ids)
+
+    baseline_oracle_totals = {key: _safe_int(summary_stats.get(key), default=0) for key in ORACLE_COUNTER_KEYS}
+
+    def _build_summary_snapshot() -> Dict[str, Any]:
+        snapshot = dict(summary_stats)
+        oracle_stats = oracle.get_statistics()
+        for key in ORACLE_COUNTER_KEYS:
+            snapshot[key] = baseline_oracle_totals[key] + _safe_int(oracle_stats.get(key), default=0)
+        total_evaluations = _safe_int(snapshot.get("total_evaluations"), default=0)
+        total_tokens = _safe_int(snapshot.get("total_tokens_used"), default=0)
+        snapshot["avg_tokens_per_evaluation"] = (
+            float(total_tokens) / float(total_evaluations) if total_evaluations > 0 else 0.0
+        )
+        for key in (
+            "use_discharge_summary",
+            "include_icu_outcome_in_prompt",
+            "history_context_hours",
+            "future_context_hours",
+            "top_k_recommendations",
+            "compress_pre_icu_history",
+        ):
+            snapshot[key] = oracle_stats.get(key, snapshot.get(key))
+        snapshot["run_id"] = run_id
+        snapshot["run_directory"] = str(run_dir)
+        snapshot["total_patients"] = planned_total if planned_total is not None else snapshot.get("total_patients", 0)
+        return snapshot
+
+    def _persist_progress(is_completed: bool) -> Dict[str, Any]:
+        snapshot = _build_summary_snapshot()
+        _json_dump_atomic(snapshot, summary_file)
+        payload = {
+            "run_id": run_id,
+            "run_directory": str(run_dir),
+            "updated_at": datetime.now().isoformat(),
+            "is_completed": bool(is_completed),
+            "events_path": resolved_events_path,
+            "icu_stay_path": resolved_icu_stay_path,
+            "provider": provider,
+            "model": model,
+            "current_window_hours": current_window_hours,
+            "window_step_hours": window_step_hours,
+            "include_pre_icu_data": include_pre_icu_data,
+            "use_discharge_summary": selected_use_discharge_summary,
+            "compress_pre_icu_history": selected_compress_pre_icu_history,
+            "include_icu_outcome_in_prompt": selected_include_icu_outcome_in_prompt,
+            "max_patients": max_patients,
+            "n_survived": n_survived,
+            "n_died": n_died,
+            "selection_seed": selection_seed,
+            "window_workers": window_workers,
+            "apply_icu_duration_filter": bool(apply_icu_duration_filter),
+            "planned_total_patients": planned_total,
+            "completed_patient_ids": list(completed_patient_ids),
+            "summary_stats": snapshot,
+        }
+        _json_dump_atomic(payload, tmp_progress_file)
+        return snapshot
+
+    summary_stats = _persist_progress(is_completed=False)
     total_seen = 0
 
     for i, trajectory in enumerate(
@@ -789,11 +1039,15 @@ def process_batch_for_oracle(
 
         subject_id = trajectory["subject_id"]
         icu_stay_id = trajectory["icu_stay_id"]
+        patient_id = f"{subject_id}_{icu_stay_id}"
         progress = f"{i}/{planned_total}" if planned_total is not None else str(i)
 
         print(f"\n[{progress}] Processing Patient {subject_id}, ICU Stay {icu_stay_id}")
         print(f"  Duration: {trajectory['icu_duration_hours']:.1f} hours")
         print(f"  Outcome: {'Survived' if trajectory['survived'] else 'Died'}")
+        if patient_id in completed_patient_id_set:
+            print("  Skipping (already completed in resume run directory)")
+            continue
 
         try:
             windows = parser.create_time_windows(
@@ -891,12 +1145,16 @@ def process_batch_for_oracle(
 
             summary_stats["total_windows_evaluated"] += len(reports)
             summary_stats["patients_processed"] += 1
+            completed_patient_id_set.add(patient_id)
+            completed_patient_ids.append(patient_id)
+            summary_stats = _persist_progress(is_completed=False)
 
         except Exception as e:
             print(f"  ERROR: Failed to process patient: {e}")
             summary_stats["patients_failed"] += 1
             oracle.pop_patient_trajectory_logs(subject_id=subject_id, icu_stay_id=icu_stay_id)
             oracle.pop_patient_llm_call_logs(subject_id=subject_id, icu_stay_id=icu_stay_id)
+            summary_stats = _persist_progress(is_completed=False)
             continue
 
     if planned_total is None:
@@ -905,18 +1163,11 @@ def process_batch_for_oracle(
     print(f"\n{'=' * 80}")
     print("SAVING RESULTS")
     print("=" * 80)
-
-    oracle_stats = oracle.get_statistics()
-    summary_stats.update(oracle_stats)
-    summary_stats["run_id"] = run_id
-    summary_stats["run_directory"] = str(run_dir)
-
-    summary_file = run_dir / "processing_summary.json"
-    with open(summary_file, "w", encoding="utf-8") as f:
-        json.dump(summary_stats, f, indent=2, ensure_ascii=False)
+    summary_stats = _persist_progress(is_completed=True)
 
     print("\nSummary:")
     print(f"  Patients processed: {summary_stats['patients_processed']}/{summary_stats['total_patients']}")
+    print(f"  Patients resumed: {summary_stats.get('patients_resumed', 0)}")
     print(f"  Patients failed: {summary_stats['patients_failed']}")
     print(f"  Total windows evaluated: {summary_stats['total_windows_evaluated']}")
     print(f"  Total action evaluations: {summary_stats['total_action_evaluations']}")
@@ -926,6 +1177,7 @@ def process_batch_for_oracle(
 
     print(f"\nOutputs saved to: {run_dir}")
     print(f"  - Summary: {summary_file.name}")
+    print(f"  - Tmp progress: {tmp_progress_file.name}")
     print("  - Per-patient predictions: patients/<subject_id>_<icu_stay_id>/oracle_predictions.json")
     print("  - Per-patient window context: patients/<subject_id>_<icu_stay_id>/window_contexts.json")
 
@@ -959,6 +1211,15 @@ def main() -> None:
         type=str,
         default=config.output_dir,
         help=f"Output root directory for timestamped Oracle runs (default: {config.output_dir})",
+    )
+    parser.add_argument(
+        "--resume-run-dir",
+        type=str,
+        default=None,
+        help=(
+            "Resume from an existing Oracle run directory containing partial per-patient outputs. "
+            "When set, --output is ignored for run directory selection."
+        ),
     )
 
     parser.add_argument(
@@ -1098,6 +1359,7 @@ def main() -> None:
         selection_seed=args.selection_seed,
         window_workers=args.window_workers,
         apply_icu_duration_filter=not bool(args.disable_icu_duration_filter),
+        resume_run_dir=args.resume_run_dir,
     )
 
 
