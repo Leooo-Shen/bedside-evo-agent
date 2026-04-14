@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import math
+import re
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -61,9 +61,30 @@ def _normalize_int_list(value: Any) -> List[int]:
     output: List[int] = []
     seen = set()
     for item in value:
-        try:
-            parsed = int(item)
-        except (TypeError, ValueError):
+        parsed: Optional[int] = None
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            parsed = item
+        elif isinstance(item, float):
+            if item.is_integer():
+                parsed = int(item)
+        elif isinstance(item, str):
+            text = item.strip()
+            if not text:
+                continue
+            try:
+                parsed = int(text)
+            except ValueError:
+                try:
+                    parsed_float = float(text)
+                    if parsed_float.is_integer():
+                        parsed = int(parsed_float)
+                except ValueError:
+                    matches = re.findall(r"-?\d+", text)
+                    if len(matches) == 1:
+                        parsed = int(matches[0])
+        if parsed is None:
             continue
         if parsed in seen:
             continue
@@ -80,6 +101,45 @@ def _format_single_event_line(event: Dict[str, Any]) -> str:
     if not isinstance(event, dict):
         return ""
     return _safe_text(format_shared_event_line(event))
+
+
+def _format_trajectory_observation_line(item: Dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+
+    item_type = _safe_text(item.get("type"))
+    if item_type == "episode":
+        try:
+            start_window = int(item.get("start_window"))
+            end_window = int(item.get("end_window"))
+        except (TypeError, ValueError):
+            return ""
+
+        start_hour = _to_optional_float(item.get("start_hour"))
+        end_hour = _to_optional_float(item.get("end_hour"))
+        text = _safe_text(item.get("episode_summary") or item.get("text"))
+        if not text:
+            text = f"Episode {start_window}-{end_window} compressed trajectory summary."
+        if start_hour is None or end_hour is None:
+            return f"episode {start_window}-{end_window}: {text}"
+        return f"episode {start_window}-{end_window} (hour {start_hour:.1f}-{end_hour:.1f}): {text}"
+
+    if item_type == "window_summary":
+        try:
+            window_id = int(item.get("window_id"))
+        except (TypeError, ValueError):
+            return ""
+
+        start_hour = _to_optional_float(item.get("start_hour"))
+        end_hour = _to_optional_float(item.get("end_hour"))
+        text = _safe_text(item.get("text"))
+        if not text:
+            text = f"Window {window_id} processed with event-grounded update."
+        if start_hour is None or end_hour is None:
+            return f"window {window_id}: {text}"
+        return f"window {window_id} (hour {start_hour:.1f}-{end_hour:.1f}): {text}"
+
+    return ""
 
 
 def _extract_event_reference_id(event: Dict[str, Any]) -> Optional[int]:
@@ -123,6 +183,36 @@ def _to_optional_float(value: Any) -> Optional[float]:
 def _fill_prompt_placeholder(template: str, key: str, value: str) -> str:
     """Replace both {key} and {{key}} styles used across prompt templates."""
     return template.replace(f"{{{{{key}}}}}", value).replace(f"{{{key}}}", value)
+
+
+_PROMPT_PLACEHOLDER_PATTERN = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}|\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+
+def _extract_prompt_placeholders(template: str) -> List[str]:
+    placeholders = set()
+    for match in _PROMPT_PLACEHOLDER_PATTERN.finditer(template):
+        key = match.group(1) or match.group(2)
+        if key:
+            placeholders.add(key)
+    return sorted(placeholders)
+
+
+def _render_prompt(template: str, values: Dict[str, str]) -> str:
+    required_keys = _extract_prompt_placeholders(template)
+    missing_keys = sorted(key for key in required_keys if key not in values)
+    if missing_keys:
+        raise ValueError(f"Missing prompt placeholder values: {', '.join(missing_keys)}")
+
+    prompt = template
+    for key, value in values.items():
+        prompt = _fill_prompt_placeholder(prompt, key, value)
+
+    unresolved_keys = sorted(
+        key for key in required_keys if f"{{{key}}}" in prompt or f"{{{{{key}}}}}" in prompt
+    )
+    if unresolved_keys:
+        raise ValueError(f"Unresolved prompt placeholders: {', '.join(unresolved_keys)}")
+    return prompt
 
 
 def _format_patient_metadata_lines(
@@ -475,7 +565,10 @@ class EventAgent:
         else:
             window_lines.append("- None")
 
-        prompt = _fill_prompt_placeholder(prompt_template, "working_windows_text", "\n".join(window_lines).strip())
+        prompt = _render_prompt(
+            prompt_template,
+            {"working_windows_text": "\n".join(window_lines).strip()},
+        )
 
         response = self.llm_client.chat(prompt=prompt, response_format="text")
         raw = response.get("content", "")
@@ -505,7 +598,7 @@ class InsightAgent:
     def analyze(
         self,
         current_insights: List[Insight],
-        recent_window_summaries: List[WindowSummary],
+        trajectory_memory: List[Dict[str, Any]],
         recent_critical_events: List[CriticalEvent],
         patient_metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], str, Dict[str, Any], str, Optional[str]]:
@@ -518,15 +611,14 @@ class InsightAgent:
         else:
             insights_text = "- None"
 
-        if recent_window_summaries:
+        if trajectory_memory:
             summary_lines = ["### Window Summary:"]
-            for summary in recent_window_summaries:
-                text = _safe_text(summary.text)
-                if not text:
-                    text = f"Window {summary.window_id} processed with event-grounded update."
-                summary_lines.append(
-                    f"window {summary.window_id} (hour {summary.start_hour:.1f}-{summary.end_hour:.1f}): {text}"
-                )
+            for item in trajectory_memory:
+                line = _format_trajectory_observation_line(item)
+                if line:
+                    summary_lines.append(line)
+            if len(summary_lines) == 1:
+                summary_lines.append("- None")
             summary_text = "\n".join(summary_lines)
         else:
             summary_text = "### Window Summary:\n- None"
@@ -542,10 +634,15 @@ class InsightAgent:
 
         patient_metadata_text = "\n".join(_format_patient_metadata_lines(patient_metadata))
 
-        prompt = _fill_prompt_placeholder(prompt_template, "hypothesis_bank", insights_text)
-        prompt = _fill_prompt_placeholder(prompt, "patient_metadata", patient_metadata_text)
-        prompt = _fill_prompt_placeholder(prompt, "window_summary", summary_text)
-        prompt = _fill_prompt_placeholder(prompt, "critical_events", critical_text)
+        prompt = _render_prompt(
+            prompt_template,
+            {
+                "hypothesis_bank": insights_text,
+                "patient_metadata": patient_metadata_text,
+                "window_summary": summary_text,
+                "critical_events": critical_text,
+            },
+        )
 
         response = self.llm_client.chat(prompt=prompt, response_format="text")
         raw = response.get("content", "")
@@ -581,38 +678,64 @@ class EpisodeAgent:
         prompt_template = get_episode_agent_prompt()
 
         if recent_window_summaries:
-            summary_lines = ["### Window Summaries:"]
+            summary_lines: List[str] = []
             for summary in recent_window_summaries:
                 text = _safe_text(summary.text)
                 if not text:
                     text = f"Window {summary.window_id} processed with event-grounded update."
                 summary_lines.append(
-                    f"Window {summary.window_id} (hour {summary.start_hour:.1f}-{summary.end_hour:.1f}): {text}"
+                    f"- Window {summary.window_id} (hour {summary.start_hour:.1f}-{summary.end_hour:.1f}): {text}"
                 )
             summaries_text = "\n".join(summary_lines)
         else:
-            summaries_text = "### Window Summaries:\n- None"
+            summaries_text = "- None"
 
         if recent_critical_events:
-            critical_lines = ["### Critical Events:"]
+            critical_lines: List[str] = []
             for critical in recent_critical_events:
                 event_name = _safe_text(critical.name_str)
                 if not event_name:
                     continue
+                event_id_prefix = f"[{critical.event_id}]"
+                normalized_event_name = event_name.lstrip()
+                if normalized_event_name.startswith(event_id_prefix):
+                    event_label = normalized_event_name
+                else:
+                    event_label = f"{event_id_prefix} {event_name}"
                 evidence = _safe_text(critical.evidence)
                 if evidence:
-                    critical_lines.append(f"- [{critical.event_id}] {event_name} | {evidence}")
+                    critical_lines.append(f"- {event_label} | {evidence}")
                 else:
-                    critical_lines.append(f"- [{critical.event_id}] {event_name}")
-            critical_text = "\n".join(critical_lines)
+                    critical_lines.append(f"- {event_label}")
+            critical_text = "\n".join(critical_lines) if critical_lines else "- None"
         else:
-            critical_text = "### Critical Events:\n- None"
+            critical_text = "- None"
 
         patient_metadata_text = "\n".join(_format_patient_metadata_lines(patient_metadata))
+        episode_window_count = len(recent_window_summaries)
+        if recent_window_summaries:
+            first_summary = recent_window_summaries[0]
+            last_summary = recent_window_summaries[-1]
+            episode_start_time = f"hour {first_summary.start_hour:.1f}"
+            episode_end_time = f"hour {last_summary.end_hour:.1f}"
+            episode_duration = max(last_summary.end_hour - first_summary.start_hour, 0.0)
+        else:
+            episode_start_time = "N/A"
+            episode_end_time = "N/A"
+            episode_duration = 0.0
 
-        prompt = _fill_prompt_placeholder(prompt_template, "patient_metadata", patient_metadata_text)
-        prompt = _fill_prompt_placeholder(prompt, "window_summaries", summaries_text)
-        prompt = _fill_prompt_placeholder(prompt, "critical_events", critical_text)
+        prompt = _render_prompt(
+            prompt_template,
+            {
+                "k": str(episode_window_count),
+                "duration": f"{episode_duration:.1f}",
+                "episode_start_time": episode_start_time,
+                "episode_end_time": episode_end_time,
+                "patient_metadata": patient_metadata_text,
+                "window_summaries": summaries_text,
+                "critical_events": critical_text,
+            },
+        )
 
         response = self.llm_client.chat(prompt=prompt, response_format="text")
         raw = response.get("content", "")
@@ -650,7 +773,7 @@ class PredictorAgent:
         # context = "\n\n".join([memory.to_text(), "## Current Window Events", last_events_text])
 
         context = "\n\n".join([memory.to_text()])
-        prompt = _fill_prompt_placeholder(prompt_template, "context", context)
+        prompt = _render_prompt(prompt_template, {"context": context})
 
         response = self.llm_client.chat(prompt=prompt, response_format="text")
         raw = response.get("content", "")
@@ -695,7 +818,6 @@ class MedEvoAgent:
         max_critical_events: int = 100,
         max_window_summaries: int = 100,
         max_insights: int = 5,
-        insight_recency_tau: float = 4.0,
         insight_every_n_windows: int = 1,
         episode_every_n_windows: int = 0,
     ):
@@ -713,7 +835,6 @@ class MedEvoAgent:
         self.max_critical_events = max_critical_events
         self.max_window_summaries = max_window_summaries
         self.max_insights = max_insights
-        self.insight_recency_tau = max(float(insight_recency_tau), 0.1)
         try:
             self.insight_every_n_windows = max(1, int(insight_every_n_windows))
         except (TypeError, ValueError):
@@ -1162,32 +1283,11 @@ class MedEvoAgent:
             supporting_events=supporting_events,
         )
 
-    def _recency_weight(self, current_window: int, event_window: int) -> float:
-        delta = max(current_window - event_window, 0)
-        return math.exp(-float(delta) / self.insight_recency_tau)
-
-    def _recompute_insight_scores(self, insights: List[Insight], current_window: int) -> None:
+    def _recompute_insight_scores(self, insights: List[Insight]) -> None:
         for insight in insights:
-            support_sum = 0.0
-            for event_id in insight.supporting_event_ids:
-                if event_id not in self._event_id_to_window:
-                    continue
-                support_sum += self._recency_weight(
-                    current_window,
-                    self._event_id_to_window[event_id],
-                )
-
-            counter_sum = 0.0
-            for event_id in insight.counter_event_ids:
-                if event_id not in self._event_id_to_window:
-                    continue
-                counter_sum += self._recency_weight(
-                    current_window,
-                    self._event_id_to_window[event_id],
-                )
-
-            score = support_sum - counter_sum
-            insight.score = max(-10.0, min(10.0, score))
+            support_count = len(insight.supporting_event_ids)
+            counter_count = len(insight.counter_event_ids)
+            insight.score = float(support_count - counter_count)
 
     def _build_evidence_events(self, event_ids: List[int]) -> List[EvidenceEvent]:
         evidence_events: List[EvidenceEvent] = []
@@ -1212,7 +1312,6 @@ class MedEvoAgent:
         self,
         existing_insights: List[Insight],
         parsed_payload: Dict[str, Any],
-        current_window: int,
     ) -> List[Insight]:
         now_ts = time.time()
         insights_by_id = {insight.insight_id: deepcopy(insight) for insight in existing_insights}
@@ -1285,7 +1384,7 @@ class MedEvoAgent:
         updated_insights = list(insights_by_id.values())
         for insight in updated_insights:
             self._refresh_insight_evidence_objects(insight)
-        self._recompute_insight_scores(updated_insights, current_window)
+        self._recompute_insight_scores(updated_insights)
 
         if len(updated_insights) > self.max_insights:
             updated_insights.sort(key=lambda insight: (insight.score, insight.updated_at))
@@ -1445,6 +1544,39 @@ class MedEvoAgent:
             return ordered[-self.max_window_summaries :]
         return ordered
 
+    def _build_insight_context(self, memory: MedEvoMemory) -> Tuple[List[Dict[str, Any]], List[CriticalEvent]]:
+        trajectory_items = [deepcopy(item) for item in memory.trajectory_memory if isinstance(item, dict)]
+
+        critical_by_id: Dict[int, CriticalEvent] = {}
+        for critical in memory.critical_events:
+            critical_by_id[int(critical.event_id)] = critical
+
+        selected_critical_events: List[CriticalEvent] = []
+        selected_ids = set()
+        for item in trajectory_items:
+            supporting_event_ids = _normalize_int_list(item.get("supporting_event_ids", []))
+            for event_id in supporting_event_ids:
+                if event_id in selected_ids:
+                    continue
+                critical = critical_by_id.get(event_id)
+                if critical is None:
+                    continue
+                selected_ids.add(event_id)
+                selected_critical_events.append(deepcopy(critical))
+
+        if selected_critical_events:
+            return trajectory_items, selected_critical_events
+
+        deduped_critical_events: List[CriticalEvent] = []
+        seen = set()
+        for critical in memory.critical_events:
+            event_id = int(critical.event_id)
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            deduped_critical_events.append(deepcopy(critical))
+        return trajectory_items, deduped_critical_events
+
     def create_memory_snapshots(
         self,
         windows: List[Dict[str, Any]],
@@ -1476,9 +1608,6 @@ class MedEvoAgent:
                 print(f"  Pre-ICU summary prepared ({len(pre_icu_summary)} chars)")
 
         processed_window_count = 0
-        pending_summaries_for_insight: List[WindowSummary] = []
-        pending_critical_for_insight: List[CriticalEvent] = []
-        pending_critical_ids = set()
         pending_summaries_for_episode: List[WindowSummary] = []
         pending_critical_for_episode: List[CriticalEvent] = []
         pending_critical_ids_for_episode = set()
@@ -1545,13 +1674,6 @@ class MedEvoAgent:
                 }
             )
             memory.trajectory_memory = self._truncate_trajectory_memory(memory.trajectory_memory)
-
-            pending_summaries_for_insight.append(deepcopy(summary))
-            for critical in critical_events:
-                if critical.event_id in pending_critical_ids:
-                    continue
-                pending_critical_ids.add(critical.event_id)
-                pending_critical_for_insight.append(deepcopy(critical))
 
             pending_summaries_for_episode.append(deepcopy(summary))
             for critical in critical_events:
@@ -1624,11 +1746,12 @@ class MedEvoAgent:
             insight_parsed: Dict[str, Any] = {"insight_updates": [], "new_insights": []}
             insight_parse_error: Optional[str] = None
             if run_insight_agent:
+                trajectory_context, critical_context = self._build_insight_context(memory)
                 insight_parsed, insight_raw, insight_usage, insight_prompt, insight_parse_error = (
                     self.insight_agent.analyze(
                         current_insights=memory.insights,
-                        recent_window_summaries=pending_summaries_for_insight,
-                        recent_critical_events=pending_critical_for_insight,
+                        trajectory_memory=trajectory_context,
+                        recent_critical_events=critical_context,
                         patient_metadata=memory.patient_metadata,
                     )
                 )
@@ -1640,7 +1763,6 @@ class MedEvoAgent:
                 memory.insights = self._apply_insight_updates(
                     existing_insights=memory.insights,
                     parsed_payload=insight_parsed,
-                    current_window=idx,
                 )
 
                 self._log_call(
@@ -1656,12 +1778,8 @@ class MedEvoAgent:
                         "num_insights": len(memory.insights),
                     },
                 )
-                pending_summaries_for_insight = []
-                pending_critical_for_insight = []
-                pending_critical_ids = set()
             else:
-                # Keep insight recency-aware scores up to date even when skipping LLM updates.
-                self._recompute_insight_scores(memory.insights, idx)
+                self._recompute_insight_scores(memory.insights)
 
             memory_db.add_snapshot(memory)
 

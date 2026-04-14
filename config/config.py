@@ -387,15 +387,6 @@ class Config:
             return 5
 
     @property
-    def med_evo_insight_recency_tau(self) -> float:
-        """Recency decay tau used by deterministic insight scoring."""
-        value = self.get("med_evo.insight_recency_tau", 4.0)
-        try:
-            return max(0.1, float(value))
-        except (TypeError, ValueError):
-            return 4.0
-
-    @property
     def med_evo_insight_every_n_windows(self) -> int:
         """Run InsightAgent once every N non-empty windows (default 1 = every window)."""
         value = self.get("med_evo.insight_every_n_windows", 1)

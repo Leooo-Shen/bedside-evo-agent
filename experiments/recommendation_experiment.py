@@ -771,7 +771,6 @@ def run_experiment(
             max_critical_events=config.med_evo_max_critical_events,
             max_window_summaries=config.med_evo_max_window_summaries,
             max_insights=config.med_evo_max_insights,
-            insight_recency_tau=config.med_evo_insight_recency_tau,
             insight_every_n_windows=config.med_evo_insight_every_n_windows,
             episode_every_n_windows=config.med_evo_episode_every_n_windows,
         )
