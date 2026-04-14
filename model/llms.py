@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import openai
-from anthropic import Anthropic
+from anthropic import Anthropic, AnthropicVertex
 
 try:
     from google import genai as google_genai_sdk
@@ -72,10 +72,45 @@ class LLMClient:
 
         if self.provider == "anthropic":
             self.model = model or "claude-3-5-sonnet-20241022"
-            api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-            if not api_key:
-                raise ValueError("ANTHROPIC_API_KEY not found in environment")
-            self.client = Anthropic(api_key=api_key)
+            use_vertex_ai = self._resolve_anthropic_vertex_mode()
+            if use_vertex_ai:
+                project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_PROJECT_ID")
+                location = (
+                    os.getenv("ANTHROPIC_VERTEX_REGION")
+                    or os.getenv("GOOGLE_CLOUD_LOCATION")
+                    or os.getenv("GOOGLE_LOCATION")
+                )
+                if not project:
+                    raise ValueError(
+                        "GOOGLE_CLOUD_PROJECT (or GOOGLE_PROJECT_ID) not found in environment for Anthropic Vertex."
+                    )
+                if not location:
+                    raise ValueError(
+                        "ANTHROPIC_VERTEX_REGION (or GOOGLE_CLOUD_LOCATION / GOOGLE_LOCATION) "
+                        "not found in environment for Anthropic Vertex."
+                    )
+                timeout_seconds = self._resolve_timeout_seconds()
+                vertex_kwargs: Dict[str, Any] = {
+                    "project_id": project,
+                    "region": location,
+                }
+                if timeout_seconds is not None:
+                    vertex_kwargs["timeout"] = timeout_seconds
+                self.client = AnthropicVertex(**vertex_kwargs)
+                self.anthropic_sdk = "anthropic_vertex"
+            else:
+                api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+                if not api_key:
+                    raise ValueError(
+                        "ANTHROPIC_API_KEY not found in environment. "
+                        "For Vertex AI Claude, set ANTHROPIC_USE_VERTEXAI=true and configure GOOGLE_CLOUD_PROJECT."
+                    )
+                timeout_seconds = self._resolve_timeout_seconds()
+                anthropic_kwargs: Dict[str, Any] = {"api_key": api_key}
+                if timeout_seconds is not None:
+                    anthropic_kwargs["timeout"] = timeout_seconds
+                self.client = Anthropic(**anthropic_kwargs)
+                self.anthropic_sdk = "anthropic"
 
         elif self.provider == "openai":
             self.model = model or "gpt-4o-mini"
@@ -242,6 +277,12 @@ class LLMClient:
         has_api_key = bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
         return bool(project) and not has_api_key
 
+    def _resolve_anthropic_vertex_mode(self) -> bool:
+        env_value = os.getenv("ANTHROPIC_USE_VERTEXAI")
+        if env_value is None:
+            return False
+        return env_value.strip().lower() in {"1", "true", "yes", "on"}
+
     def _extract_status_code(self, error: Exception) -> Optional[int]:
         """Extract HTTP status code from SDK exceptions when available."""
         status_code = getattr(error, "status_code", None)
@@ -296,8 +337,51 @@ class LLMClient:
         self, prompt: str, system_prompt: Optional[str], response_format: str, **kwargs
     ) -> Dict[str, Any]:
         """Anthropic-specific chat implementation."""
+        request_params: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+            "messages": [{"role": "user", "content": prompt}],
+        }
 
-        raise NotImplementedError("Anthropic chat not implemented yet.")
+        if system_prompt:
+            request_params["system"] = system_prompt
+
+        temperature = self._resolve_temperature(**kwargs)
+        if temperature is not None:
+            request_params["temperature"] = temperature
+
+        timeout_seconds = self._resolve_timeout_seconds(**kwargs)
+        if timeout_seconds is not None:
+            request_params["timeout"] = timeout_seconds
+
+        response = self.client.messages.create(**request_params)
+
+        parts = []
+        for block in getattr(response, "content", []) or []:
+            if getattr(block, "type", None) == "text":
+                text_value = getattr(block, "text", None)
+                if text_value:
+                    parts.append(text_value)
+        content = "".join(parts)
+
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "input_tokens", 0) if usage is not None else 0
+        output_tokens = getattr(usage, "output_tokens", 0) if usage is not None else 0
+
+        result = {
+            "content": content,
+            "model": getattr(response, "model", None) or self.model,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        }
+
+        if response_format == "json":
+            try:
+                result["parsed"] = json.loads(result["content"])
+            except json.JSONDecodeError as e:
+                result["parse_error"] = str(e)
+                result["parsed"] = None
+
+        return result
 
     def _chat_openai(
         self, prompt: str, system_prompt: Optional[str], response_format: str, **kwargs
@@ -369,8 +453,10 @@ class LLMClient:
             err = str(e)
             if "NOT_FOUND" in err and "models/" in err:
                 raise ValueError(
-                    f"Gemini model '{self.model}' is not available for generateContent. "
-                    "Try 'gemini-2.0-flash' or 'gemini-1.5-flash', or choose a model returned by the Gemini ListModels API."
+                    f"Model '{self.model}' is not available for Google generateContent on current project/location. "
+                    "For Model Garden models, use a publisher-prefixed ID like "
+                    "'qwen/qwen3-next-80b-a3b-instruct-maas' or 'anthropic/claude-sonnet-4-5@20250929', "
+                    "and ensure access is granted in Vertex AI."
                 ) from e
             raise
 
@@ -410,7 +496,7 @@ class LLMClient:
 
         result = {
             "content": content,
-            "model": getattr(response, "model_version", self.model),
+            "model": getattr(response, "model_version", None) or self.model,
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
         }
 
@@ -479,7 +565,7 @@ class LLMClient:
 
         result = {
             "content": content,
-            "model": getattr(response, "model_version", self.model),
+            "model": getattr(response, "model_version", None) or self.model,
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
         }
 

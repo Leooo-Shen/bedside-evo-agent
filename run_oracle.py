@@ -722,7 +722,6 @@ def process_batch_for_oracle(
     n_died: Optional[int] = None,
     selection_seed: Optional[int] = DEFAULT_SELECTION_SEED,
     window_workers: int = 4,
-    apply_icu_duration_filter: bool = True,
     resume_run_dir: Optional[str] = None,
 ) -> None:
     """Process a batch of patient trajectories through Oracle."""
@@ -774,11 +773,10 @@ def process_batch_for_oracle(
         print(f"Resume run directory: {run_dir}")
 
     print("\nInitializing data parser...")
-    print(f"  Apply ICU duration filter (4h < duration <= 96h): {bool(apply_icu_duration_filter)}")
+    print("  ICU duration filter: keep stays with duration >= 4h")
     parser = MIMICDataParser(
         events_path=events_path,
         icu_stay_path=icu_stay_path,
-        apply_icu_duration_filter=bool(apply_icu_duration_filter),
     )
     parser.load_data()
 
@@ -864,7 +862,6 @@ def process_batch_for_oracle(
             "n_died": n_died,
             "selection_seed": selection_seed,
             "window_workers": window_workers,
-            "apply_icu_duration_filter": bool(apply_icu_duration_filter),
             "planned_total_patients": planned_total,
         }
         mismatched_keys = [
@@ -921,7 +918,6 @@ def process_batch_for_oracle(
         "n_died": n_died,
         "selection_seed": selection_seed,
         "window_workers": window_workers,
-        "apply_icu_duration_filter": bool(apply_icu_duration_filter),
         "total_patients": planned_total if planned_total is not None else 0,
         "total_windows_evaluated": 0,
         "patients_processed": 0,
@@ -963,7 +959,6 @@ def process_batch_for_oracle(
     summary_stats["n_died"] = n_died
     summary_stats["selection_seed"] = selection_seed
     summary_stats["window_workers"] = window_workers
-    summary_stats["apply_icu_duration_filter"] = bool(apply_icu_duration_filter)
     summary_stats["total_patients"] = planned_total if planned_total is not None else summary_stats.get("total_patients", 0)
     summary_stats["patients_resumed"] = len(completed_patient_ids)
     if not isinstance(summary_stats.get("overall_status_distribution"), dict):
@@ -1020,7 +1015,6 @@ def process_batch_for_oracle(
             "n_died": n_died,
             "selection_seed": selection_seed,
             "window_workers": window_workers,
-            "apply_icu_duration_filter": bool(apply_icu_duration_filter),
             "planned_total_patients": planned_total,
             "completed_patient_ids": list(completed_patient_ids),
             "summary_stats": snapshot,
@@ -1322,12 +1316,6 @@ def main() -> None:
         help=f"Random seed for balanced patient sampling (default: {DEFAULT_SELECTION_SEED}).",
     )
     parser.add_argument(
-        "--disable-icu-duration-filter",
-        action="store_true",
-        help="Disable default ICU duration filter (4h < duration <= 96h).",
-    )
-
-    parser.add_argument(
         "--config",
         type=str,
         default=None,
@@ -1358,7 +1346,6 @@ def main() -> None:
         n_died=args.n_died,
         selection_seed=args.selection_seed,
         window_workers=args.window_workers,
-        apply_icu_duration_filter=not bool(args.disable_icu_duration_filter),
         resume_run_dir=args.resume_run_dir,
     )
 

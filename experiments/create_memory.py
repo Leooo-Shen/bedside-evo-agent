@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -62,6 +63,16 @@ def _sum_numeric_stats(items: List[Dict[str, Any]]) -> Dict[str, float]:
             if isinstance(value, (int, float)):
                 totals[key] = totals.get(key, 0.0) + float(value)
     return totals
+
+
+def _sanitize_output_label(value: str, *, field_name: str) -> str:
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{field_name} must be a non-empty string.")
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower()
+    if not slug:
+        raise ValueError(f"{field_name} must contain at least one alphanumeric character.")
+    return slug
 
 
 def _load_patient_stay_ids_csv(patient_stay_ids_path: str) -> pd.DataFrame:
@@ -499,6 +510,9 @@ def _process_single_patient_memory(
     patient_row: pd.Series,
     parser: MIMICDataParser,
     config,
+    llm_provider: str,
+    llm_model: str,
+    llm_max_tokens: int,
     enable_logging: bool,
     verbose: bool,
     patient_idx: int,
@@ -545,9 +559,9 @@ def _process_single_patient_memory(
     }
 
     agent = MedEvoAgent(
-        provider=config.llm_provider,
-        model=config.llm_model,
-        max_tokens=config.llm_max_tokens,
+        provider=llm_provider,
+        model=llm_model,
+        max_tokens=llm_max_tokens,
         enable_logging=enable_logging,
         window_duration_hours=config.agent_current_window_hours,
         max_working_windows=config.med_evo_max_working_windows,
@@ -629,6 +643,9 @@ def run_experiment(
     patient_stay_ids_path: Optional[str] = None,
     num_workers: int = 1,
     resume_run: Optional[str] = None,
+    llm_provider: Optional[str] = None,
+    llm_model: Optional[str] = None,
+    llm_max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     try:
         num_workers = int(num_workers)
@@ -638,6 +655,21 @@ def run_experiment(
         raise ValueError(f"num_workers must be >= 1, got {num_workers}")
 
     config = get_config()
+    effective_llm_provider = str(llm_provider if llm_provider is not None else config.llm_provider).strip()
+    if not effective_llm_provider:
+        raise ValueError("LLM provider must be set in config.llm.provider or via --llm-provider.")
+
+    base_model = llm_model if llm_model is not None else config.llm_model
+    if base_model is None:
+        raise ValueError("LLM model must be set in config.llm.model or via --llm-model.")
+    effective_llm_model = str(base_model).strip()
+    if not effective_llm_model:
+        raise ValueError("LLM model must be set in config.llm.model or via --llm-model.")
+
+    effective_llm_max_tokens = int(llm_max_tokens) if llm_max_tokens is not None else int(config.llm_max_tokens)
+    if effective_llm_max_tokens <= 0:
+        raise ValueError(f"llm_max_tokens must be > 0, got {effective_llm_max_tokens}")
+
     events_path = str(config.events_path)
     icu_stay_path = str(config.icu_stay_path)
 
@@ -652,6 +684,9 @@ def run_experiment(
         print(f"Observation Window: First {observation_hours:g} hours")
     print(f"Events Path: {events_path}")
     print(f"ICU Stay Path: {icu_stay_path}")
+    print(f"LLM Provider: {effective_llm_provider}")
+    print(f"LLM Model: {effective_llm_model}")
+    print(f"LLM Max Tokens: {effective_llm_max_tokens}")
     print(f"Num Workers: {num_workers}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -660,7 +695,8 @@ def run_experiment(
         results_dir.mkdir(parents=True, exist_ok=True)
         print(f"Resuming Existing Results: {results_dir}")
     else:
-        results_dir = Path("experiment_results") / f"memory_snapshot_med_evo_{timestamp}"
+        model_label = _sanitize_output_label(effective_llm_model, field_name="llm_model")
+        results_dir = Path("experiment_results") / f"memory_snapshot_med_evo_{model_label}_{timestamp}"
         results_dir.mkdir(parents=True, exist_ok=True)
         print(f"Results: {results_dir}")
 
@@ -693,9 +729,9 @@ def run_experiment(
             "pre_icu_history_hours": config.agent_pre_icu_history_hours,
         },
         "llm": {
-            "provider": config.llm_provider,
-            "model": config.llm_model,
-            "max_tokens": config.llm_max_tokens,
+            "provider": effective_llm_provider,
+            "model": effective_llm_model,
+            "max_tokens": effective_llm_max_tokens,
         },
         "med_evo": {
             "max_working_windows": config.med_evo_max_working_windows,
@@ -780,6 +816,9 @@ def run_experiment(
             patient_row=patient_row,
             parser=parser,
             config=config,
+            llm_provider=effective_llm_provider,
+            llm_model=effective_llm_model,
+            llm_max_tokens=effective_llm_max_tokens,
             enable_logging=enable_logging,
             verbose=verbose,
             patient_idx=idx,
@@ -890,6 +929,30 @@ def main() -> None:
             "Completed patient folders are skipped automatically."
         ),
     )
+    parser.add_argument(
+        "--llm-provider",
+        "--provider",
+        dest="llm_provider",
+        type=str,
+        default=None,
+        help="Optional LLM provider override for this run.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        "--model",
+        dest="llm_model",
+        type=str,
+        default=None,
+        help="Optional LLM model override for this run.",
+    )
+    parser.add_argument(
+        "--llm-max-tokens",
+        "--max-tokens",
+        dest="llm_max_tokens",
+        type=int,
+        default=None,
+        help="Optional LLM max_tokens override for this run.",
+    )
 
     args = parser.parse_args()
 
@@ -905,6 +968,9 @@ def main() -> None:
         patient_stay_ids_path=args.patient_stay_ids,
         num_workers=args.num_workers,
         resume_run=args.resume_run,
+        llm_provider=args.llm_provider,
+        llm_model=args.llm_model,
+        llm_max_tokens=args.llm_max_tokens,
     )
 
     print("\n" + "=" * 80)

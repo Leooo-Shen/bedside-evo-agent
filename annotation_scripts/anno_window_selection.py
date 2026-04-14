@@ -209,11 +209,6 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Suppress verbose parser.create_time_windows prints.",
     )
-    parser.add_argument(
-        "--disable-icu-duration-filter",
-        action="store_true",
-        help="Disable default ICU duration filter (4h < duration <= 96h).",
-    )
     return parser.parse_args()
 
 
@@ -845,7 +840,6 @@ def main() -> None:
         icu_stay_path=str(paths["icu_stay_path"]),
         discharge_summary_max_days_after_leave=float(args.max_days_after_leave),
         require_discharge_summary_for_icu_stays=True,
-        apply_icu_duration_filter=not bool(args.disable_icu_duration_filter),
     )
     parser.load_data()
     if parser.icu_stay_df is None:
@@ -1351,7 +1345,6 @@ def main() -> None:
         "patient_stats_csv": str(paths["patient_stats_csv"]),
         "statistics_dir": str(paths["statistics_dir"]),
         "statistics_summary_json": str(paths["statistics_summary_json"]),
-        "apply_icu_duration_filter": not bool(args.disable_icu_duration_filter),
         "ratio_threshold": ratio_threshold,
         "min_windows_per_patient": int(min_windows_per_patient),
         "max_windows_per_patient": int(max_windows_per_patient),

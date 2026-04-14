@@ -367,7 +367,6 @@ class MIMICDataParser:
         icu_stay_path: str,
         discharge_summary_max_days_after_leave: float = 7.0,
         require_discharge_summary_for_icu_stays: bool = True,
-        apply_icu_duration_filter: bool = True,
     ):
         """
         Initialize the parser with paths to MIMIC-demo data files.
@@ -378,8 +377,6 @@ class MIMICDataParser:
             discharge_summary_max_days_after_leave: Selector window for post-ICU discharge summary matching.
             require_discharge_summary_for_icu_stays: Keep only ICU stays with selector-linked discharge
                 summary available. ICU stays without extractable summary are skipped.
-            apply_icu_duration_filter: Apply default ICU duration eligibility filter
-                (keep stays with 4h < duration <= 96h).
         """
         if discharge_summary_max_days_after_leave <= 0:
             raise ValueError("discharge_summary_max_days_after_leave must be > 0")
@@ -392,7 +389,6 @@ class MIMICDataParser:
         self._relevant_vitals_cache: Dict[int, Dict[str, List[str]]] = {}
         self.discharge_summary_max_days_after_leave = float(discharge_summary_max_days_after_leave)
         self.require_discharge_summary_for_icu_stays = bool(require_discharge_summary_for_icu_stays)
-        self.apply_icu_duration_filter = bool(apply_icu_duration_filter)
         self.discharge_summary_selection_df: Optional[pd.DataFrame] = None
         self._selected_discharge_summary_map: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self.pre_icu_history_processor = PreICUHistoryProcessor(
@@ -469,14 +465,9 @@ class MIMICDataParser:
         self.icu_stay_df["birth_time"] = pd.to_datetime(self.icu_stay_df["birth_time"])
 
         initial_count = len(self.icu_stay_df)
-        if self.apply_icu_duration_filter:
-            self.icu_stay_df = self.icu_stay_df[
-                ~((self.icu_stay_df["icu_duration_hours"] <= 4) | (self.icu_stay_df["icu_duration_hours"] > 96))
-            ]
-            filtered_count = initial_count - len(self.icu_stay_df)
-            print(f"Filtered out {filtered_count} patients (< 4h or > 96h ICU duration)")
-        else:
-            print(f"Skipped ICU duration filter; keeping all {initial_count} ICU stays before summary selection")
+        self.icu_stay_df = self.icu_stay_df[self.icu_stay_df["icu_duration_hours"] >= 4]
+        filtered_count = initial_count - len(self.icu_stay_df)
+        print(f"Filtered out {filtered_count} ICU stays with duration < 4h")
 
         # Keep ALL ICU stays for each patient (treat multiple stays independently)
         # Sort by subject_id and enter_time for consistent ordering

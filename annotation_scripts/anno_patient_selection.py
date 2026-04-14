@@ -148,7 +148,6 @@ def _collect_candidates(
             icu_stay_path=str(shard.icu_stay_path),
             discharge_summary_max_days_after_leave=max_days_after_leave,
             require_discharge_summary_for_icu_stays=True,
-            apply_icu_duration_filter=False,
         )
         parser.load_data()
 
@@ -465,7 +464,6 @@ def _validate_output(
         icu_stay_path=str(icu_stay_path),
         discharge_summary_max_days_after_leave=max_days_after_leave,
         require_discharge_summary_for_icu_stays=True,
-        apply_icu_duration_filter=False,
     )
     parser.load_data()
     if parser.icu_stay_df is None:
