@@ -806,8 +806,6 @@ def process_batch_for_oracle(
     oracle = MetaOracle(
         provider=provider,
         model=model,
-        temperature=1.0,
-        max_tokens=4096,
         use_discharge_summary=selected_use_discharge_summary,
         include_icu_outcome_in_prompt=selected_include_icu_outcome_in_prompt,
         compress_pre_icu_history=selected_compress_pre_icu_history,

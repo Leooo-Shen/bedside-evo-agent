@@ -27,12 +27,22 @@ from experiments.create_memory import (
     select_snapshot_by_observation_hour,
 )
 from prompts.predictor_prompts import get_survival_prediction_prompt
+from utils.event_format import format_event_lines
 from utils.json_parse import parse_json_dict_best_effort
+from utils.llm_errors import is_context_length_exceeded_error
 from utils.llm_log_viewer import save_llm_calls_html
 from utils.outcome_utils import evaluate_outcome_match, extract_survival_prediction_fields
 
 RUN_CONFIG_FILENAME = "run_config.json"
 AGGREGATE_FILENAME = "aggregate_results.json"
+CONTEXT_MODE_MED_EVO_MEMORY = "med_evo_memory"
+CONTEXT_MODE_FULL_HISTORY_EVENTS = "full_history_events"
+CONTEXT_MODE_LOCAL_EVENTS_ONLY = "local_events_only"
+SUPPORTED_CONTEXT_MODES = (
+    CONTEXT_MODE_MED_EVO_MEMORY,
+    CONTEXT_MODE_FULL_HISTORY_EVENTS,
+    CONTEXT_MODE_LOCAL_EVENTS_ONLY,
+)
 
 
 def _normalize_token_count(value: Any) -> int:
@@ -63,10 +73,71 @@ def _save_run_config(results_dir: Path, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, indent=2)
 
 
+def _extract_current_window(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    working_memory = snapshot.get("working_memory")
+    if not isinstance(working_memory, list) or not working_memory:
+        raise ValueError("Snapshot missing non-empty working_memory")
+    current_window = working_memory[-1]
+    if not isinstance(current_window, dict):
+        raise ValueError("Snapshot current working_memory entry must be a mapping")
+    return current_window
+
+
+def _window_events(window: Dict[str, Any]) -> List[Dict[str, Any]]:
+    events = window.get("events")
+    if not isinstance(events, list):
+        return []
+    return [dict(event) for event in events if isinstance(event, dict)]
+
+
+def _render_flat_raw_events(events: List[Dict[str, Any]]) -> str:
+    return "\n".join(format_event_lines(events, empty_text="(No events)"))
+
+
+def _build_local_events_only_context(snapshot: Dict[str, Any]) -> str:
+    return _render_flat_raw_events(_window_events(_extract_current_window(snapshot)))
+
+
+def _build_full_history_event_context(
+    selected_window_index: int,
+    selected_snapshot: Dict[str, Any],
+    snapshot_by_window: Dict[int, Dict[str, Any]],
+) -> str:
+    candidate_windows = {int(index) for index in snapshot_by_window.keys() if int(index) <= int(selected_window_index)}
+    candidate_windows.add(int(selected_window_index))
+    merged_events: List[Dict[str, Any]] = []
+    for window_index in sorted(candidate_windows):
+        if int(window_index) == int(selected_window_index):
+            snapshot = selected_snapshot
+        else:
+            snapshot = snapshot_by_window.get(int(window_index))
+            if not isinstance(snapshot, dict):
+                continue
+        merged_events.extend(_window_events(_extract_current_window(snapshot)))
+    return _render_flat_raw_events(merged_events)
+
+
+def _normalize_context_mode(context_mode: str) -> str:
+    normalized = str(context_mode).strip()
+    if normalized not in SUPPORTED_CONTEXT_MODES:
+        raise ValueError(
+            f"Unsupported context_mode={context_mode}. "
+            f"Supported modes: {', '.join(SUPPORTED_CONTEXT_MODES)}"
+        )
+    return normalized
+
+
+def _results_dir_name_for_context_mode(context_mode: str) -> str:
+    if context_mode == CONTEXT_MODE_MED_EVO_MEMORY:
+        return "survival_experiment/memory"
+    return f"survival_experiment/{context_mode}"
+
+
 def process_single_patient(
     patient_record: Dict[str, Any],
     agent: MedEvoAgent,
     snapshot_hour: Optional[float],
+    context_mode: str,
     memory_run_dir: Path,
     results_dir: Path,
     patient_idx: int,
@@ -83,6 +154,7 @@ def process_single_patient(
         print(f"\n[Patient {patient_idx}/{total_patients}] Subject: {subject_id}, ICU Stay: {icu_stay_id}")
         print(f"   Source memory: {source_patient_dir}")
         print(f"   Actual Outcome: {actual_outcome.upper()}")
+        print(f"   Context mode: {context_mode}")
 
     try:
         payload = load_patient_memory_payload(source_patient_dir)
@@ -103,6 +175,8 @@ def process_single_patient(
             print("   WARNING: No snapshots found in source memory, skipping...")
             return None
 
+        snapshot_by_window = {int(window_idx): snapshot for window_idx, snapshot in windowed_snapshots}
+
         final_window_index, _ = windowed_snapshots[-1]
         if snapshot_hour is None:
             selected_window_index, snapshot_for_prediction = windowed_snapshots[-1]
@@ -121,14 +195,42 @@ def process_single_patient(
             selected_window_index = inferred_window_index
         selected_start_hour, selected_end_hour = extract_snapshot_hour_bounds(snapshot_for_prediction)
 
-        context = render_snapshot_to_text(snapshot_for_prediction)
-        prompt = get_survival_prediction_prompt().format(context=context)
-        response = agent.llm_client.chat(prompt=prompt, response_format="text")
+        if context_mode == CONTEXT_MODE_MED_EVO_MEMORY:
+            context = render_snapshot_to_text(snapshot_for_prediction)
+            snapshot_source = "precomputed_med_evo_memory"
+        elif context_mode == CONTEXT_MODE_FULL_HISTORY_EVENTS:
+            context = _build_full_history_event_context(
+                selected_window_index=int(selected_window_index),
+                selected_snapshot=snapshot_for_prediction,
+                snapshot_by_window=snapshot_by_window,
+            )
+            snapshot_source = CONTEXT_MODE_FULL_HISTORY_EVENTS
+        elif context_mode == CONTEXT_MODE_LOCAL_EVENTS_ONLY:
+            context = _build_local_events_only_context(snapshot_for_prediction)
+            snapshot_source = CONTEXT_MODE_LOCAL_EVENTS_ONLY
+        else:
+            raise ValueError(f"Unsupported context_mode={context_mode}")
 
-        raw_response = response.get("content", "")
-        usage = response.get("usage", {})
-        if not isinstance(usage, dict):
-            usage = {}
+        prompt = get_survival_prediction_prompt().format(context=context)
+        raw_response = ""
+        usage: Dict[str, Any] = {}
+        prediction_error: Optional[Dict[str, str]] = None
+        try:
+            response = agent.llm_client.chat(prompt=prompt, response_format="text")
+            raw_response = str(response.get("content", ""))
+            usage_obj = response.get("usage", {})
+            if isinstance(usage_obj, dict):
+                usage = usage_obj
+        except Exception as e:
+            if context_mode == CONTEXT_MODE_FULL_HISTORY_EVENTS and is_context_length_exceeded_error(e):
+                prediction_error = {
+                    "type": "llm_context_length_exceeded",
+                    "message": str(e),
+                }
+                if verbose:
+                    print(f"   WARNING: Window {selected_window_index} skipped by LLM token limit; counted as incorrect.")
+            else:
+                raise
 
         input_tokens = _normalize_token_count(usage.get("input_tokens"))
         output_tokens = _normalize_token_count(usage.get("output_tokens"))
@@ -176,7 +278,9 @@ def process_single_patient(
             "prediction_memory_window_end_hour": float(selected_end_hour),
             "prediction_snapshot_selection_mode": snapshot_selection_mode,
             "prediction_snapshot_observation_hour": snapshot_selection_hour,
+            "context_mode": str(context_mode),
             "prediction": parsed_prediction,
+            "prediction_error": prediction_error,
             "prediction_tokens": {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -203,11 +307,13 @@ def process_single_patient(
                     "llm_provider": agent.llm_client.provider,
                     "llm_model": agent.llm_client.model,
                     "memory_run": str(memory_run_dir),
-                    "snapshot_source": "precomputed_med_evo_memory",
+                    "snapshot_source": snapshot_source,
+                    "context_mode": str(context_mode),
                     "snapshot_selection": snapshot_selection_mode,
                     "snapshot_observation_hour": snapshot_selection_hour,
                     "snapshot_window_start_hour": float(selected_start_hour),
                     "snapshot_window_end_hour": float(selected_end_hour),
+                    "prediction_error": prediction_error,
                 },
             }
             patient_logs = {
@@ -215,6 +321,7 @@ def process_single_patient(
                 "agent_type": "med_evo_survival_from_memory",
                 "llm_provider": getattr(agent.llm_client, "provider", None),
                 "llm_model": getattr(agent.llm_client, "model", None),
+                "context_mode": str(context_mode),
                 "pipeline_agents": [{"name": "survival_predictor", "used": True}],
                 "total_calls": 1,
                 "calls": [llm_call],
@@ -237,6 +344,7 @@ def process_single_patient(
 
 def run_experiment(
     memory_run: str,
+    context_mode: str,
     snapshot_hour: Optional[float] = None,
     verbose: bool = True,
     enable_logging: bool = True,
@@ -259,6 +367,8 @@ def run_experiment(
     if num_workers < 1:
         raise ValueError(f"num_workers must be >= 1, got {num_workers}")
 
+    normalized_context_mode = _normalize_context_mode(context_mode)
+
     config = get_config()
     memory_run_dir = resolve_memory_run_dir(memory_run)
     source_run_config = load_memory_run_config(memory_run_dir)
@@ -267,13 +377,14 @@ def run_experiment(
     print("SURVIVAL PREDICTION EXPERIMENT - FROM MED_EVO MEMORY")
     print("=" * 80)
     print(f"Memory Run: {memory_run_dir}")
+    print(f"Context Mode: {normalized_context_mode}")
     if normalized_snapshot_hour is None:
         print("Snapshot Selection: last_only")
     else:
         print(f"Snapshot Selection: observation_hour={normalized_snapshot_hour:g}")
     print(f"Num Workers: {num_workers}")
 
-    results_dir = memory_run_dir / "survival_experiment"
+    results_dir = memory_run_dir / _results_dir_name_for_context_mode(normalized_context_mode)
     results_dir.mkdir(parents=True, exist_ok=True)
     print(f"Results: {results_dir}")
 
@@ -303,12 +414,17 @@ def run_experiment(
             "num_workers": num_workers,
         },
         "survival_prediction": {
+            "context_mode": str(normalized_context_mode),
+            "local_events_only_scope": "working_memory_last_window_only"
+            if normalized_context_mode == CONTEXT_MODE_LOCAL_EVENTS_ONLY
+            else None,
             "snapshot_selection": "last_only" if normalized_snapshot_hour is None else "observation_hour",
             "snapshot_observation_hour": normalized_snapshot_hour,
         },
         "llm": {
             "provider": config.llm_provider,
             "model": config.llm_model,
+            "temperature": config.llm_temperature,
             "max_tokens": config.llm_max_tokens,
         },
     }
@@ -326,7 +442,6 @@ def run_experiment(
         patient_agent = MedEvoAgent(
             provider=config.llm_provider,
             model=config.llm_model,
-            max_tokens=config.llm_max_tokens,
             enable_logging=False,
             window_duration_hours=config.agent_current_window_hours,
             max_working_windows=config.med_evo_max_working_windows,
@@ -340,6 +455,7 @@ def run_experiment(
             patient_record=patient_record,
             agent=patient_agent,
             snapshot_hour=normalized_snapshot_hour,
+            context_mode=normalized_context_mode,
             memory_run_dir=memory_run_dir,
             results_dir=results_dir,
             patient_idx=idx,
@@ -361,6 +477,7 @@ def run_experiment(
         return {}
 
     correct = sum(1 for item in all_results if bool(item.get("is_correct")))
+    failed_predictions = sum(1 for item in all_results if isinstance(item.get("prediction_error"), dict))
     total = len(all_results)
     accuracy = correct / total if total > 0 else 0.0
 
@@ -383,6 +500,7 @@ def run_experiment(
     print("=" * 80)
     print(f"Total Patients: {total}")
     print(f"Correct: {correct}")
+    print(f"Failed Predictions: {failed_predictions}")
     print(f"Accuracy: {accuracy:.2%}")
     print("\nConfidence Distribution:")
     print(f"  Low: {confidence_distribution['Low']}")
@@ -398,9 +516,14 @@ def run_experiment(
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "experiment": "survival_experiment",
         "memory_run": str(memory_run_dir),
+        "context_mode": str(normalized_context_mode),
+        "local_events_only_scope": "working_memory_last_window_only"
+        if normalized_context_mode == CONTEXT_MODE_LOCAL_EVENTS_ONLY
+        else None,
         "num_workers": num_workers,
         "total_patients": total,
         "correct_predictions": correct,
+        "failed_predictions": failed_predictions,
         "accuracy": accuracy,
         "confidence_distribution": confidence_distribution,
         "agent_stats": {
@@ -446,6 +569,13 @@ def main() -> None:
         default=None,
         help="Optional ICU hour for snapshot selection. If omitted, use the last memory snapshot.",
     )
+    parser.add_argument(
+        "--context-mode",
+        type=str,
+        required=True,
+        choices=list(SUPPORTED_CONTEXT_MODES),
+        help="Context construction mode: med_evo_memory | full_history_events | local_events_only.",
+    )
 
     args = parser.parse_args()
 
@@ -455,6 +585,7 @@ def main() -> None:
 
     run_experiment(
         memory_run=args.memory_run,
+        context_mode=args.context_mode,
         snapshot_hour=args.snapshot_hour,
         verbose=not args.quiet,
         enable_logging=not args.no_logging,

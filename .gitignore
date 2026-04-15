@@ -62,3 +62,4 @@ service-account.json
 *.zip
 evaluation_results/
 tests/
+annotation_scripts/anno_data/

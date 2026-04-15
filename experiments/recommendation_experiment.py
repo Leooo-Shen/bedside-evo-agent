@@ -32,6 +32,7 @@ from experiments.oracle.action_validity_common import ACTIONABLE_EVENT_CODES
 from prompts.predictor_prompts import get_recommendation_action_prompt
 from utils.event_format import format_event_lines
 from utils.json_parse import parse_json_dict_best_effort
+from utils.llm_errors import is_context_length_exceeded_error
 from utils.llm_log_viewer import save_llm_calls_html
 
 RUN_CONFIG_FILENAME = "run_config.json"
@@ -96,6 +97,12 @@ def _normalize_confidence_label(value: Any) -> str:
 
 
 def _coerce_recommended_actions(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _coerce_red_flags(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [dict(item) for item in value if isinstance(item, Mapping)]
@@ -395,12 +402,18 @@ def process_single_patient(
         total_input_tokens = 0
         total_output_tokens = 0
         total_masked_action_events = 0
+        full_history_context_limit_reached = False
+        full_history_context_limit_window_index: Optional[int] = None
+        full_history_context_limit_message = ""
 
         for sequence_idx, (selected_window_index, selected_snapshot) in enumerate(selected_snapshots, start=1):
             lookup_window_index = int(selected_window_index)
             if lookup_window_index <= 0:
                 continue
 
+            skip_due_to_prior_context_limit = (
+                context_mode == CONTEXT_MODE_FULL_HISTORY_EVENTS and full_history_context_limit_reached
+            )
             snapshot_source = context_mode
             if context_mode == CONTEXT_MODE_MED_EVO_MEMORY:
                 previous_snapshot = snapshot_by_window.get(lookup_window_index - 1)
@@ -419,12 +432,22 @@ def process_single_patient(
                 context = render_snapshot_to_text(context_snapshot)
                 snapshot_source = "precomputed_med_evo_memory"
             elif context_mode == CONTEXT_MODE_FULL_HISTORY_EVENTS:
-                context, masked_action_count, non_action_events = build_full_history_event_context(
-                    snapshot_by_window=snapshot_by_window,
-                    current_window_index=lookup_window_index,
-                    current_snapshot=selected_snapshot,
-                    actionable_codes=actionable_codes,
-                )
+                if skip_due_to_prior_context_limit:
+                    current_window = _extract_current_window(selected_snapshot)
+                    current_events = _window_events(current_window)
+                    masked_events, masked_action_count = _filter_non_action_events(
+                        current_events,
+                        actionable_codes=actionable_codes,
+                    )
+                    non_action_events = int(len(masked_events))
+                    context = ""
+                else:
+                    context, masked_action_count, non_action_events = build_full_history_event_context(
+                        snapshot_by_window=snapshot_by_window,
+                        current_window_index=lookup_window_index,
+                        current_snapshot=selected_snapshot,
+                        actionable_codes=actionable_codes,
+                    )
             elif context_mode == CONTEXT_MODE_LOCAL_EVENTS_ONLY:
                 context, masked_action_count, non_action_events = build_local_events_only_context(
                     current_snapshot=selected_snapshot,
@@ -443,30 +466,71 @@ def process_single_patient(
             if inferred_window_index >= 0:
                 window_index = inferred_window_index
 
-            prompt = get_recommendation_action_prompt(
-                top_k_actions=top_k_actions,
-                prediction_horizon_hours=prediction_horizon_hours,
-            ).replace("{context}", context)
-            response = agent.llm_client.chat(prompt=prompt, response_format="text")
-
-            raw_response = response.get("content", "")
-            usage = response.get("usage", {})
-            if not isinstance(usage, dict):
-                usage = {}
+            prompt = ""
+            raw_response = ""
+            usage: Dict[str, Any] = {}
+            prediction_error: Optional[Dict[str, str]] = None
+            if skip_due_to_prior_context_limit:
+                prediction_error = {
+                    "type": "llm_context_length_exceeded",
+                    "message": (
+                        f"Skipped inference after prior context-length failure at window "
+                        f"{full_history_context_limit_window_index}: {full_history_context_limit_message}"
+                    ).strip(),
+                }
+                if verbose:
+                    print(
+                        f"   WARNING: Window {lookup_window_index} skipped after prior full-history token limit at "
+                        f"window {full_history_context_limit_window_index}; counted as prediction error."
+                    )
+            else:
+                prompt = get_recommendation_action_prompt(
+                    top_k_actions=top_k_actions,
+                    prediction_horizon_hours=prediction_horizon_hours,
+                ).replace("{context}", context)
+                try:
+                    response = agent.llm_client.chat(prompt=prompt, response_format="text")
+                    raw_response = str(response.get("content", ""))
+                    usage_obj = response.get("usage", {})
+                    if isinstance(usage_obj, dict):
+                        usage = usage_obj
+                except Exception as e:
+                    if context_mode == CONTEXT_MODE_FULL_HISTORY_EVENTS and is_context_length_exceeded_error(e):
+                        full_history_context_limit_reached = True
+                        full_history_context_limit_window_index = int(lookup_window_index)
+                        full_history_context_limit_message = str(e)
+                        prediction_error = {
+                            "type": "llm_context_length_exceeded",
+                            "message": str(e),
+                        }
+                        if verbose:
+                            print(
+                                f"   WARNING: Window {lookup_window_index} hit full-history token limit; "
+                                "later windows will be skipped and counted as prediction errors."
+                            )
+                    else:
+                        raise
 
             input_tokens = _normalize_token_count(usage.get("input_tokens"))
             output_tokens = _normalize_token_count(usage.get("output_tokens"))
             total_input_tokens += input_tokens
             total_output_tokens += output_tokens
 
-            parsed_prediction = parse_json_dict_best_effort(raw_response)
-            if parsed_prediction is None:
-                parsed_prediction = {}
-
-            recommended_actions = _coerce_recommended_actions(parsed_prediction.get("recommended_actions"))[
-                : int(top_k_actions)
-            ]
-            confidence, rationale = _extract_recommendation_summary_fields(parsed_prediction, recommended_actions)
+            if prediction_error is not None:
+                parsed_prediction = {"recommended_actions": [], "red_flags": []}
+                recommended_actions: List[Dict[str, Any]] = []
+                red_flags: List[Dict[str, Any]] = []
+                confidence = "Unknown"
+                rationale = ""
+            else:
+                parsed_prediction = parse_json_dict_best_effort(raw_response)
+                if parsed_prediction is None:
+                    parsed_prediction = {}
+                recommended_actions = _coerce_recommended_actions(parsed_prediction.get("recommended_actions"))[
+                    : int(top_k_actions)
+                ]
+                red_flags = _coerce_red_flags(parsed_prediction.get("red_flags"))
+                confidence, rationale = _extract_recommendation_summary_fields(parsed_prediction, recommended_actions)
 
             window_duration_hours = infer_window_duration_hours(selected_snapshot)
             future_window_count = compute_future_window_count_for_horizon(
@@ -501,8 +565,11 @@ def process_single_patient(
                 "rationale": rationale,
                 "recommended_actions": recommended_actions,
                 "num_recommendations": int(len(recommended_actions)),
+                "red_flags": red_flags,
+                "num_red_flags": int(len(red_flags)),
                 "ground_truth_action_events": ground_truth_events,
                 "parsed_prediction": parsed_prediction,
+                "prediction_error": prediction_error,
             }
             recommendation_predictions.append(prediction_item)
 
@@ -528,6 +595,7 @@ def process_single_patient(
                         "num_masked_action_events": int(masked_action_count),
                         "top_k_actions": int(top_k_actions),
                         "prediction_horizon_hours": float(prediction_horizon_hours),
+                        "prediction_error": prediction_error,
                     },
                 }
             )
@@ -546,13 +614,19 @@ def process_single_patient(
             return None
 
         total_recommendations = sum(int(item.get("num_recommendations", 0)) for item in recommendation_predictions)
+        total_red_flags = sum(int(item.get("num_red_flags", 0)) for item in recommendation_predictions)
         total_ground_truth_action_events = sum(
             int(item.get("num_ground_truth_action_events", 0)) for item in recommendation_predictions
+        )
+        num_failed_windows = sum(
+            1 for item in recommendation_predictions if isinstance(item.get("prediction_error"), dict)
         )
 
         patient_metrics = {
             "num_windows_predicted": len(recommendation_predictions),
+            "num_failed_windows": int(num_failed_windows),
             "num_recommendations": total_recommendations,
+            "num_red_flags": total_red_flags,
             "num_ground_truth_action_events": total_ground_truth_action_events,
         }
 
@@ -594,7 +668,9 @@ def process_single_patient(
             "num_memory_snapshots": len(windowed_snapshots),
             "snapshot_stride": snapshot_stride,
             "num_windows_predicted": patient_metrics["num_windows_predicted"],
+            "num_failed_windows": patient_metrics["num_failed_windows"],
             "num_recommendations": patient_metrics["num_recommendations"],
+            "num_red_flags": patient_metrics["num_red_flags"],
             "num_ground_truth_action_events": patient_metrics["num_ground_truth_action_events"],
         }
         with open(patient_dir / "prediction.json", "w") as f:
@@ -625,7 +701,9 @@ def process_single_patient(
             "num_memory_snapshots": len(windowed_snapshots),
             "snapshot_stride": snapshot_stride,
             "num_windows_predicted": patient_metrics["num_windows_predicted"],
+            "num_failed_windows": patient_metrics["num_failed_windows"],
             "num_recommendations": patient_metrics["num_recommendations"],
+            "num_red_flags": patient_metrics["num_red_flags"],
             "num_ground_truth_action_events": patient_metrics["num_ground_truth_action_events"],
             "total_masked_action_events": int(total_masked_action_events),
             "recommendation_prediction_tokens": {
@@ -747,6 +825,7 @@ def run_experiment(
         "llm": {
             "provider": config.llm_provider,
             "model": config.llm_model,
+            "temperature": config.llm_temperature,
             "max_tokens": config.llm_max_tokens,
         },
     }
@@ -764,7 +843,6 @@ def run_experiment(
         patient_agent = MedEvoAgent(
             provider=config.llm_provider,
             model=config.llm_model,
-            max_tokens=config.llm_max_tokens,
             enable_logging=False,
             window_duration_hours=config.agent_current_window_hours,
             max_working_windows=config.med_evo_max_working_windows,
@@ -804,7 +882,9 @@ def run_experiment(
 
     total_patients = len(all_results)
     total_window_predictions = sum(int(item.get("num_windows_predicted", 0)) for item in all_results)
+    total_failed_windows = sum(int(item.get("num_failed_windows", 0)) for item in all_results)
     total_recommendations = sum(int(item.get("num_recommendations", 0)) for item in all_results)
+    total_red_flags = sum(int(item.get("num_red_flags", 0)) for item in all_results)
     total_ground_truth_action_events = sum(int(item.get("num_ground_truth_action_events", 0)) for item in all_results)
     total_masked_action_events = sum(int(item.get("total_masked_action_events", 0)) for item in all_results)
 
@@ -815,7 +895,9 @@ def run_experiment(
     print("=" * 80)
     print(f"Total Patients: {total_patients}")
     print(f"Total Predicted Windows: {total_window_predictions}")
+    print(f"Failed Predicted Windows: {total_failed_windows}")
     print(f"Total Recommendations: {total_recommendations}")
+    print(f"Total Red-Flag Actions: {total_red_flags}")
     print(f"Total Ground-Truth Action Events: {total_ground_truth_action_events}")
     print(f"Total Masked Action Events: {total_masked_action_events}")
     print("\nRecommendation Predictor Tokens:")
@@ -839,7 +921,9 @@ def run_experiment(
         "target_output": f"top_{int(normalized_top_k_actions)}",
         "total_patients": total_patients,
         "total_window_predictions": total_window_predictions,
+        "total_failed_windows": total_failed_windows,
         "total_recommendations": total_recommendations,
+        "total_red_flags": total_red_flags,
         "total_ground_truth_action_events": total_ground_truth_action_events,
         "total_masked_action_events": total_masked_action_events,
         "recommendation_prediction_tokens": {
@@ -871,7 +955,7 @@ def main() -> None:
     parser.add_argument(
         "--snapshot-stride",
         type=int,
-        default=1,
+        default=4,
         help="Use every k-th memory snapshot for recommendation prediction.",
     )
     parser.add_argument(
@@ -896,8 +980,8 @@ def main() -> None:
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=4,
-        help="Maximum number of parallel workers for patient processing (default: 4).",
+        default=2,
+        help="Maximum number of parallel workers for patient processing (default: 2).",
     )
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
     parser.add_argument("--no-logging", action="store_true", help="Disable detailed LLM call logging")

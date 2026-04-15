@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 import openai
 from anthropic import Anthropic, AnthropicVertex
+from config.config import get_config
 
 try:
     from google import genai as google_genai_sdk
@@ -42,7 +43,7 @@ class LLMClient:
         model: str = None,
         api_key: str = None,
         temperature: Optional[float] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         max_retries: int = 3,
         retry_base_delay_seconds: float = 1.0,
         retry_max_delay_seconds: float = 30.0,
@@ -55,16 +56,38 @@ class LLMClient:
             provider: "openai", "anthropic", "google", or "gemini"
             model: Model name (e.g., "gpt-4o", "claude-3-5-sonnet-20241022", "gemini-1.5-flash")
             api_key: API key (if None, will use environment variable)
-            temperature: Optional sampling temperature override. If None, provider/model default is used.
-            max_tokens: Maximum tokens in response
+            temperature: Optional sampling temperature override. If None, read from config.llm.temperature.
+            max_tokens: Maximum tokens in response. If None, read from config.llm.max_tokens.
             max_retries: Maximum number of retries for transient API errors
             retry_base_delay_seconds: Base backoff delay in seconds
             retry_max_delay_seconds: Maximum backoff delay in seconds
             request_timeout_seconds: Per-request timeout for provider API calls
         """
         self.provider = provider.lower()
-        self.temperature = temperature
-        self.max_tokens = max_tokens
+        config = None
+        if temperature is None or max_tokens is None:
+            config = get_config()
+
+        resolved_temperature = temperature
+        if resolved_temperature is None:
+            resolved_temperature = config.llm_temperature
+
+        resolved_max_tokens = max_tokens
+        if resolved_max_tokens is None:
+            resolved_max_tokens = config.llm_max_tokens
+
+        try:
+            self.temperature = float(resolved_temperature)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid temperature={resolved_temperature!r}; expected float") from exc
+
+        try:
+            parsed_max_tokens = int(resolved_max_tokens)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid max_tokens={resolved_max_tokens!r}; expected positive integer") from exc
+        if parsed_max_tokens <= 0:
+            raise ValueError(f"Invalid max_tokens={parsed_max_tokens}; must be > 0")
+        self.max_tokens = parsed_max_tokens
         self.max_retries = max_retries
         self.retry_base_delay_seconds = retry_base_delay_seconds
         self.retry_max_delay_seconds = retry_max_delay_seconds

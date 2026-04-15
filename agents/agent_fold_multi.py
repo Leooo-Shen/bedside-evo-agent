@@ -311,7 +311,7 @@ class MultiAgent:
         model: str = None,
         api_key: str = None,
         temperature: Optional[float] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         enable_logging: bool = False,
         window_duration_hours: float = 0.5,
         use_observer_agent: bool = True,

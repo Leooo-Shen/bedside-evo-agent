@@ -26,6 +26,15 @@ NUM_TIME_BINS = 10
 MEMORY_DEPTH_NUM_BINS = 6
 BOOTSTRAP_SAMPLES = 1000
 BOOTSTRAP_SEED = 20260409
+KNOWN_PATIENT_STATUS_MODES = (
+    "memory",
+    "full_history_events",
+    "local_events_only",
+)
+PATIENT_STATUS_ROOT_NAMES = (
+    "patient_status",
+    "patient_status_experiment",
+)
 
 
 @dataclass(frozen=True)
@@ -45,24 +54,36 @@ def _load_json(path: Path) -> Dict[str, Any]:
     return payload
 
 
+def _has_patient_status_predictions(path: Path) -> bool:
+    patients_dir = path / "patients"
+    if not patients_dir.exists() or not patients_dir.is_dir():
+        return False
+    return any(patients_dir.glob("*/patient_status_predictions.json"))
+
+
 def _ensure_predictions_dir(path: Path) -> Path:
     if not path.exists() or not path.is_dir():
         raise FileNotFoundError(f"Prediction directory not found: {path}")
-    direct_patients = path / "patients"
-    nested_patients = path / "patient_status_experiment" / "patients"
-    if direct_patients.exists():
-        matches = list(direct_patients.glob("*/patient_status_predictions.json"))
-        if matches:
-            return path
-    if nested_patients.exists():
-        matches = list(nested_patients.glob("*/patient_status_predictions.json"))
-        if matches:
-            return path / "patient_status_experiment"
+    if _has_patient_status_predictions(path):
+        return path
+    for root_name in PATIENT_STATUS_ROOT_NAMES:
+        nested_root = path / root_name
+        if nested_root.exists() and nested_root.is_dir() and _has_patient_status_predictions(nested_root):
+            return nested_root
     raise FileNotFoundError(
         f"No patient_status_predictions.json found under {path}. "
         "Expected either <dir>/patients/*/patient_status_predictions.json or "
-        "<dir>/patient_status_experiment/patients/*/patient_status_predictions.json."
+        "<dir>/<patient_status|patient_status_experiment>/patients/*/patient_status_predictions.json."
     )
+
+
+def _discover_patient_status_mode_dirs(path: Path) -> Dict[str, Path]:
+    discovered: Dict[str, Path] = {}
+    for mode in KNOWN_PATIENT_STATUS_MODES:
+        candidate = path / mode
+        if candidate.exists() and candidate.is_dir() and _has_patient_status_predictions(candidate):
+            discovered[str(mode)] = candidate
+    return discovered
 
 
 def _ensure_oracle_dir(path: Path) -> Path:
@@ -84,6 +105,20 @@ def _default_output_dir_from_med_evo_root(med_evo_root: Path) -> Path:
     if not experiment_name:
         raise ValueError(f"Cannot infer experiment name from med_evo_root={med_evo_root}")
     return Path("evaluation_results") / memory_run_name / experiment_name
+
+
+def _default_output_root_from_patient_status_input(patient_status_input: Path) -> Path:
+    if patient_status_input.name in PATIENT_STATUS_ROOT_NAMES:
+        memory_run_name = patient_status_input.parent.name
+        if not memory_run_name:
+            raise ValueError(f"Cannot infer memory run name from patient_status_input={patient_status_input}")
+        return Path("evaluation_results") / memory_run_name / patient_status_input.name
+    if patient_status_input.parent.name in PATIENT_STATUS_ROOT_NAMES:
+        memory_run_name = patient_status_input.parent.parent.name
+        if not memory_run_name:
+            raise ValueError(f"Cannot infer memory run name from patient_status_input={patient_status_input}")
+        return Path("evaluation_results") / memory_run_name / patient_status_input.parent.name / patient_status_input.name
+    return _default_output_dir_from_med_evo_root(patient_status_input)
 
 
 def _infer_snapshot_window_index(snapshot: Dict[str, Any]) -> Optional[int]:
@@ -304,13 +339,11 @@ def _load_prediction_rows(
 
 def _compute_accuracy_metrics(frame: pd.DataFrame) -> Dict[str, Any]:
     total_windows = int(len(frame))
-    micro_acc = float(frame["is_correct"].mean()) if total_windows > 0 else float("nan")
     per_patient = frame.groupby("patient_id")["is_correct"].mean().astype(float)
     macro_acc = float(per_patient.mean()) if len(per_patient) > 0 else float("nan")
     return {
         "num_windows": total_windows,
         "num_patients": int(frame["patient_id"].nunique()),
-        "micro_acc": micro_acc,
         "macro_acc": macro_acc,
     }
 
@@ -450,6 +483,98 @@ def _plot_prefix_accuracy(frame: pd.DataFrame, output_path: Path) -> pd.DataFram
     return mean_df
 
 
+def _plot_relative_time_accuracy_by_mode(
+    curves_by_mode: Dict[str, pd.DataFrame],
+    output_path: Path,
+) -> pd.DataFrame:
+    if not curves_by_mode:
+        raise ValueError("No mode curves provided for relative-time comparison plot.")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    rows: List[Dict[str, Any]] = []
+    for mode_name in sorted(curves_by_mode.keys()):
+        curve_df = curves_by_mode[mode_name]
+        med_evo_curve = curve_df[curve_df["system"] == "MedEvo"].copy()
+        if med_evo_curve.empty:
+            continue
+        ordered = med_evo_curve.sort_values("time_bin").reset_index(drop=True)
+        x = ordered["time_bin_mid_pct"].to_numpy(dtype=float)
+        y = ordered["accuracy"].to_numpy(dtype=float)
+        ax.plot(x, y, marker="o", linewidth=2.2, label=str(mode_name))
+        for _, row in ordered.iterrows():
+            rows.append(
+                {
+                    "mode": str(mode_name),
+                    "time_bin": int(row["time_bin"]),
+                    "time_bin_mid_pct": float(row["time_bin_mid_pct"]),
+                    "n_windows": int(row["n_windows"]),
+                    "accuracy": float(row["accuracy"]),
+                    "ci_low": float(row["ci_low"]),
+                    "ci_high": float(row["ci_high"]),
+                }
+            )
+
+    ax.set_xlabel("Relative Window Position (%)")
+    ax.set_ylabel("Window-Level Accuracy")
+    ax.set_title("Relative-Time Accuracy by Mode")
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+    comparison_df = pd.DataFrame(rows)
+    if comparison_df.empty:
+        raise ValueError("No rows generated for relative-time mode comparison plot.")
+    return comparison_df
+
+
+def _plot_prefix_accuracy_by_mode(
+    curves_by_mode: Dict[str, pd.DataFrame],
+    output_path: Path,
+) -> pd.DataFrame:
+    if not curves_by_mode:
+        raise ValueError("No mode curves provided for prefix comparison plot.")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    rows: List[Dict[str, Any]] = []
+    for mode_name in sorted(curves_by_mode.keys()):
+        curve_df = curves_by_mode[mode_name]
+        if curve_df.empty:
+            continue
+        ordered = curve_df.sort_values("relative_time_pct").reset_index(drop=True)
+        x = ordered["relative_time_pct"].to_numpy(dtype=float)
+        y = ordered["cohort_mean_prefix_accuracy"].to_numpy(dtype=float)
+        ax.plot(x, y, marker="o", linewidth=2.2, label=str(mode_name))
+        for _, row in ordered.iterrows():
+            rows.append(
+                {
+                    "mode": str(mode_name),
+                    "relative_time_pct": float(row["relative_time_pct"]),
+                    "num_patients": int(row["num_patients"]),
+                    "cohort_mean_prefix_accuracy": float(row["cohort_mean_prefix_accuracy"]),
+                }
+            )
+
+    ax.set_xlabel("Relative Time (%)")
+    ax.set_ylabel("Cumulative Accuracy")
+    ax.set_title("Prefix Cumulative Accuracy by Mode")
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+    comparison_df = pd.DataFrame(rows)
+    if comparison_df.empty:
+        raise ValueError("No rows generated for prefix mode comparison plot.")
+    return comparison_df
+
+
 def _plot_time_memory_heatmap(frame: pd.DataFrame, output_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     med_evo = frame[frame["system"] == "MedEvo"].copy()
     if med_evo.empty:
@@ -543,23 +668,15 @@ def _save_metrics(
         json.dump(payload, f, indent=2)
 
 
-def run_evaluation(
+def _evaluate_single_prediction_dir(
     *,
-    med_evo_dir: Path,
-    oracle_dir: Path,
-    output_dir: Optional[Path],
-    baseline_dir: Optional[Path],
-) -> None:
-    med_evo_root = _ensure_predictions_dir(med_evo_dir)
-    oracle_root = _ensure_oracle_dir(oracle_dir)
-    baseline_root = _ensure_predictions_dir(baseline_dir) if baseline_dir is not None else None
-
-    if output_dir is None:
-        output_dir = _default_output_dir_from_med_evo_root(med_evo_root)
-
-    oracle_labels = _load_oracle_labels(oracle_root)
+    prediction_dir: Path,
+    oracle_labels: Dict[str, Dict[int, WindowLabel]],
+    output_dir: Path,
+    baseline_root: Optional[Path],
+) -> Dict[str, Any]:
     med_evo_frame = _load_prediction_rows(
-        prediction_dir=med_evo_root,
+        prediction_dir=prediction_dir,
         oracle_labels=oracle_labels,
         system_name="MedEvo",
         include_memory_depth=True,
@@ -616,18 +733,115 @@ def run_evaluation(
     med_evo_heatmap_source.to_csv(output_dir / "plot3_time_memory_source_rows.csv", index=False)
 
     print(f"Saved evaluation outputs to: {output_dir}")
-    print("ACC:")
+    print("Macro ACC:")
     print(
-        f"  MedEvo micro={med_evo_metrics['micro_acc']:.4f} "
-        f"macro={med_evo_metrics['macro_acc']:.4f} "
+        f"  MedEvo macro={med_evo_metrics['macro_acc']:.4f} "
         f"(patients={med_evo_metrics['num_patients']}, windows={med_evo_metrics['num_windows']})"
     )
     if baseline_metrics is not None:
         print(
-            f"  Baseline micro={baseline_metrics['micro_acc']:.4f} "
-            f"macro={baseline_metrics['macro_acc']:.4f} "
+            f"  Baseline macro={baseline_metrics['macro_acc']:.4f} "
             f"(patients={baseline_metrics['num_patients']}, windows={baseline_metrics['num_windows']})"
         )
+
+    return {
+        "relative_curve_df": relative_curve_df,
+        "prefix_curve_df": prefix_curve_df,
+        "output_dir": output_dir,
+    }
+
+
+def run_evaluation(
+    *,
+    med_evo_dir: Path,
+    oracle_dir: Path,
+    output_dir: Optional[Path],
+    baseline_dir: Optional[Path],
+) -> None:
+    oracle_root = _ensure_oracle_dir(oracle_dir)
+    oracle_labels = _load_oracle_labels(oracle_root)
+
+    mode_root_candidates: List[Path] = [med_evo_dir]
+    for root_name in PATIENT_STATUS_ROOT_NAMES:
+        nested_candidate = med_evo_dir / root_name
+        if nested_candidate not in mode_root_candidates:
+            mode_root_candidates.append(nested_candidate)
+
+    discovered_mode_dirs: Dict[str, Path] = {}
+    resolved_mode_root: Optional[Path] = None
+    for candidate in mode_root_candidates:
+        if not candidate.exists() or not candidate.is_dir():
+            continue
+        candidate_modes = _discover_patient_status_mode_dirs(candidate)
+        if candidate_modes:
+            discovered_mode_dirs = candidate_modes
+            resolved_mode_root = candidate
+            break
+
+    if discovered_mode_dirs:
+        if baseline_dir is not None:
+            raise ValueError(
+                "--baseline-dir is not supported when --med-evo-dir points to a multi-mode patient-status root."
+            )
+        if resolved_mode_root is None:
+            raise ValueError(f"Failed to resolve multi-mode root from {med_evo_dir}")
+        output_root = (
+            output_dir
+            if output_dir is not None
+            else _default_output_root_from_patient_status_input(resolved_mode_root)
+        )
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        print(
+            "Detected patient-status modes: "
+            + ", ".join(sorted(discovered_mode_dirs.keys()))
+            + f" under {resolved_mode_root}"
+        )
+        relative_curves_by_mode: Dict[str, pd.DataFrame] = {}
+        prefix_curves_by_mode: Dict[str, pd.DataFrame] = {}
+
+        for mode in sorted(discovered_mode_dirs.keys()):
+            mode_prediction_dir = discovered_mode_dirs[mode]
+            mode_output_dir = output_root / mode
+            print(f"=== Evaluating mode: {mode} ===")
+            mode_result = _evaluate_single_prediction_dir(
+                prediction_dir=mode_prediction_dir,
+                oracle_labels=oracle_labels,
+                output_dir=mode_output_dir,
+                baseline_root=None,
+            )
+            relative_curves_by_mode[mode] = mode_result["relative_curve_df"]
+            prefix_curves_by_mode[mode] = mode_result["prefix_curve_df"]
+
+        if len(relative_curves_by_mode) > 1:
+            combined_relative_df = _plot_relative_time_accuracy_by_mode(
+                relative_curves_by_mode,
+                output_path=output_root / "plot1_relative_time_accuracy_curve_by_mode.png",
+            )
+            combined_relative_df.to_csv(
+                output_root / "plot1_relative_time_accuracy_curve_by_mode.csv", index=False
+            )
+        if len(prefix_curves_by_mode) > 1:
+            combined_prefix_df = _plot_prefix_accuracy_by_mode(
+                prefix_curves_by_mode,
+                output_path=output_root / "plot2_prefix_cumulative_accuracy_curve_by_mode.png",
+            )
+            combined_prefix_df.to_csv(
+                output_root / "plot2_prefix_cumulative_accuracy_curve_by_mode.csv", index=False
+            )
+
+        print(f"Saved multi-mode evaluation outputs to: {output_root}")
+        return
+
+    med_evo_root = _ensure_predictions_dir(med_evo_dir)
+    baseline_root = _ensure_predictions_dir(baseline_dir) if baseline_dir is not None else None
+    final_output_dir = output_dir if output_dir is not None else _default_output_dir_from_med_evo_root(med_evo_root)
+    _evaluate_single_prediction_dir(
+        prediction_dir=med_evo_root,
+        oracle_labels=oracle_labels,
+        output_dir=final_output_dir,
+        baseline_root=baseline_root,
+    )
 
 
 def main() -> None:
@@ -636,7 +850,11 @@ def main() -> None:
         "--med-evo-dir",
         type=str,
         required=True,
-        help="Patient-status prediction directory for MedEvo.",
+        help=(
+            "Patient-status prediction directory for MedEvo. "
+            "Supports single-mode input (<dir>/patients) or multi-mode root "
+            "(<dir>/{memory,full_history_events,local_events_only})."
+        ),
     )
     parser.add_argument(
         "--oracle-dir",
@@ -650,14 +868,15 @@ def main() -> None:
         default=None,
         help=(
             "Directory where metrics and plots will be saved. "
-            "Default: evaluation_results/<memory_run_name>/<experiment_name>."
+            "Default single-mode: evaluation_results/<memory_run_name>/<experiment_name>. "
+            "Default multi-mode: evaluation_results/<memory_run_name>/<patient_status_root>/<mode>."
         ),
     )
     parser.add_argument(
         "--baseline-dir",
         type=str,
         required=False,
-        help="Optional patient-status prediction directory for baseline comparison.",
+        help="Optional patient-status prediction directory for baseline comparison (single-mode only).",
     )
     args = parser.parse_args()
 

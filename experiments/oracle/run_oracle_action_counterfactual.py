@@ -282,7 +282,6 @@ def run_counterfactual_action_experiment(
     oracle = MetaOracle(
         provider=resolved_provider,
         model=resolved_model,
-        max_tokens=config.llm_max_tokens,
         use_discharge_summary=True,
         include_icu_outcome_in_prompt=True,
         mask_discharge_summary_outcome_terms=False,

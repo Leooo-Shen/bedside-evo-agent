@@ -6,7 +6,7 @@
     "max_patients": null
   },
   "data_loading": {
-    "agent_observation_hours": 2,
+    "agent_observation_hours": null,
     "oracle_observation_hours": null
   },
   "oracle_time_windows": {
@@ -36,6 +36,7 @@
   "llm": {
     "provider": "google",
     "model": "qwen/qwen3-235b-a22b-instruct-2507-maas",
+    "temperature": 0,
     "max_tokens": 12800
   },
   "remem": {
@@ -60,8 +61,8 @@
     "max_critical_events": 100,
     "max_window_summaries": 100,
     "max_insights": 10,
-    "insight_every_n_windows": 2,
-    "episode_every_n_windows": 2
+    "insight_every_n_windows": 12,
+    "episode_every_n_windows": 12
   },
   "oracle_logging": {
     "log_dir": "logs/oracle",

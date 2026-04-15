@@ -102,7 +102,7 @@ class MetaOracle:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
         temperature: Optional[float] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         request_timeout_seconds: float = 300.0,
         log_dir: Optional[str] = None,
         use_discharge_summary: bool = False,

@@ -512,7 +512,6 @@ def _process_single_patient_memory(
     config,
     llm_provider: str,
     llm_model: str,
-    llm_max_tokens: int,
     enable_logging: bool,
     verbose: bool,
     patient_idx: int,
@@ -561,7 +560,6 @@ def _process_single_patient_memory(
     agent = MedEvoAgent(
         provider=llm_provider,
         model=llm_model,
-        max_tokens=llm_max_tokens,
         enable_logging=enable_logging,
         window_duration_hours=config.agent_current_window_hours,
         max_working_windows=config.med_evo_max_working_windows,
@@ -644,7 +642,6 @@ def run_experiment(
     resume_run: Optional[str] = None,
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
-    llm_max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     try:
         num_workers = int(num_workers)
@@ -665,9 +662,7 @@ def run_experiment(
     if not effective_llm_model:
         raise ValueError("LLM model must be set in config.llm.model or via --llm-model.")
 
-    effective_llm_max_tokens = int(llm_max_tokens) if llm_max_tokens is not None else int(config.llm_max_tokens)
-    if effective_llm_max_tokens <= 0:
-        raise ValueError(f"llm_max_tokens must be > 0, got {effective_llm_max_tokens}")
+    effective_llm_max_tokens = int(config.llm_max_tokens)
 
     events_path = str(config.events_path)
     icu_stay_path = str(config.icu_stay_path)
@@ -730,6 +725,7 @@ def run_experiment(
         "llm": {
             "provider": effective_llm_provider,
             "model": effective_llm_model,
+            "temperature": config.llm_temperature,
             "max_tokens": effective_llm_max_tokens,
         },
         "med_evo": {
@@ -816,7 +812,6 @@ def run_experiment(
             config=config,
             llm_provider=effective_llm_provider,
             llm_model=effective_llm_model,
-            llm_max_tokens=effective_llm_max_tokens,
             enable_logging=enable_logging,
             verbose=verbose,
             patient_idx=idx,
@@ -943,15 +938,6 @@ def main() -> None:
         default=None,
         help="Optional LLM model override for this run.",
     )
-    parser.add_argument(
-        "--llm-max-tokens",
-        "--max-tokens",
-        dest="llm_max_tokens",
-        type=int,
-        default=None,
-        help="Optional LLM max_tokens override for this run.",
-    )
-
     args = parser.parse_args()
 
     print(f"\n{'='*80}")
@@ -968,7 +954,6 @@ def main() -> None:
         resume_run=args.resume_run,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
-        llm_max_tokens=args.llm_max_tokens,
     )
 
     print("\n" + "=" * 80)

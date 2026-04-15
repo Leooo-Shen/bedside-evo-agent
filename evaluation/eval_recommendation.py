@@ -1,4 +1,4 @@
-"""Evaluate recommendation predictions with configurable action matching."""
+"""Evaluate recommendation predictions with LLM action matching."""
 
 from __future__ import annotations
 
@@ -20,8 +20,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.config import get_config
-from evaluation.embedding_model import EmbeddingActionMatcher
 from experiments.oracle.action_validity_common import (
     event_to_action_text,
     normalize_action_label,
@@ -36,13 +34,17 @@ GT_SOURCE_DATASET_ACTIONS = "dataset_actions"
 GT_SOURCE_ORACLE_REVIEWED_ACTIONS = "oracle_reviewed_actions"
 ORACLE_POSITIVE_LABELS = frozenset({"best_practice", "acceptable"})
 MATCHER_BACKEND_LLM = "llm"
-MATCHER_BACKEND_EMBEDDING = "embedding"
 KNOWN_RECOMMENDATION_MODES = ("memory", "full_history_events", "local_events_only")
+LLM_MATCHER_PROVIDER = "google"
+LLM_MATCHER_MODEL = "qwen/qwen3-235b-a22b-instruct-2507-maas"
+LLM_MATCHER_MAX_TOKENS = 12800
 
 NUM_TIME_BINS = 10
 MEMORY_DEPTH_NUM_BINS = 6
 BOOTSTRAP_SAMPLES = 1000
 BOOTSTRAP_SEED = 20260409
+FIXED_EVAL_K = 5
+HIT_MATCH_COUNT_THRESHOLD = 1
 _THREAD_LOCAL = threading.local()
 
 
@@ -238,13 +240,16 @@ def _ground_truth_action_text(item: Mapping[str, Any]) -> str:
     return event_to_action_text(item)
 
 
-def _load_oracle_reviewed_actions_by_window(oracle_prediction_path: Path) -> Dict[int, List[Dict[str, Any]]]:
+def _load_oracle_targets_by_window(
+    oracle_prediction_path: Path,
+) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[int, List[Dict[str, Any]]]]:
     payload = _load_json(oracle_prediction_path)
     window_outputs = payload.get("window_outputs")
     if not isinstance(window_outputs, list):
         raise ValueError(f"Invalid window_outputs list in {oracle_prediction_path}")
 
     actions_by_window: Dict[int, List[Dict[str, Any]]] = {}
+    red_flags_by_window: Dict[int, List[Dict[str, Any]]] = {}
     for row in window_outputs:
         if not isinstance(row, Mapping):
             raise ValueError(f"Invalid row in window_outputs in {oracle_prediction_path}")
@@ -261,52 +266,81 @@ def _load_oracle_reviewed_actions_by_window(oracle_prediction_path: Path) -> Dic
         if not isinstance(action_review, Mapping):
             continue
         evaluations = action_review.get("evaluations")
-        if evaluations is None:
-            continue
-        if not isinstance(evaluations, list):
+        if evaluations is not None and not isinstance(evaluations, list):
             raise ValueError(
                 f"Invalid action_review.evaluations for window={window_index} in {oracle_prediction_path}"
             )
-
         selected_actions: List[Dict[str, Any]] = []
-        for evaluation in evaluations:
-            if not isinstance(evaluation, Mapping):
-                raise ValueError(
-                    f"Invalid evaluation row for window={window_index} in {oracle_prediction_path}: {evaluation}"
+        if evaluations is not None:
+            for evaluation in evaluations:
+                if not isinstance(evaluation, Mapping):
+                    raise ValueError(
+                        f"Invalid evaluation row for window={window_index} in {oracle_prediction_path}: {evaluation}"
+                    )
+                label = normalize_action_label(evaluation.get("label"))
+                if label not in ORACLE_POSITIVE_LABELS:
+                    continue
+                action_name = str(evaluation.get("action_name") or "").strip()
+                if not action_name:
+                    raise ValueError(
+                        f"Missing action_name for window={window_index} with label={label} in {oracle_prediction_path}"
+                    )
+                rationale = str(evaluation.get("rationale") or evaluation.get("reason") or "").strip()
+                gt_text = f"{action_name}. {rationale}".strip() if rationale else action_name
+                selected_actions.append(
+                    {
+                        "action_name": action_name,
+                        "action_description": rationale,
+                        "gt_action_text": gt_text,
+                        "oracle_label": label,
+                        "oracle_action_id": str(evaluation.get("action_id") or "").strip(),
+                    }
                 )
-            label = normalize_action_label(evaluation.get("label"))
-            if label not in ORACLE_POSITIVE_LABELS:
-                continue
-            action_name = str(evaluation.get("action_name") or "").strip()
-            if not action_name:
-                raise ValueError(
-                    f"Missing action_name for window={window_index} with label={label} in {oracle_prediction_path}"
-                )
-            rationale = str(evaluation.get("rationale") or evaluation.get("reason") or "").strip()
-            gt_text = f"{action_name}. {rationale}".strip() if rationale else action_name
-            selected_actions.append(
-                {
-                    "action_name": action_name,
-                    "action_description": rationale,
-                    "gt_action_text": gt_text,
-                    "oracle_label": label,
-                    "oracle_action_id": str(evaluation.get("action_id") or "").strip(),
-                }
-            )
 
-        if not selected_actions:
-            continue
-        if window_index in actions_by_window:
-            raise ValueError(
-                f"Duplicate oracle action reviews for source window={window_index} in {oracle_prediction_path}"
-            )
-        actions_by_window[window_index] = selected_actions
-    return actions_by_window
+        if selected_actions:
+            if window_index in actions_by_window:
+                raise ValueError(
+                    f"Duplicate oracle action reviews for source window={window_index} in {oracle_prediction_path}"
+                )
+            actions_by_window[window_index] = selected_actions
+
+        red_flags = action_review.get("red_flags")
+        if red_flags is not None and not isinstance(red_flags, list):
+            raise ValueError(f"Invalid action_review.red_flags for window={window_index} in {oracle_prediction_path}")
+        selected_red_flags: List[Dict[str, Any]] = []
+        if red_flags is not None:
+            for red_flag in red_flags:
+                if not isinstance(red_flag, Mapping):
+                    raise ValueError(
+                        f"Invalid red_flag row for window={window_index} in {oracle_prediction_path}: {red_flag}"
+                    )
+                contraindicated_action = str(red_flag.get("contraindicated_action") or "").strip()
+                if not contraindicated_action:
+                    raise ValueError(
+                        f"Missing contraindicated_action for window={window_index} in {oracle_prediction_path}"
+                    )
+                reason = str(red_flag.get("reason") or "").strip()
+                gt_text = f"{contraindicated_action}. {reason}".strip() if reason else contraindicated_action
+                selected_red_flags.append(
+                    {
+                        "contraindicated_action": contraindicated_action,
+                        "reason": reason,
+                        "gt_action_text": gt_text,
+                    }
+                )
+
+        if selected_red_flags:
+            if window_index in red_flags_by_window:
+                raise ValueError(f"Duplicate oracle red_flags for source window={window_index} in {oracle_prediction_path}")
+            red_flags_by_window[window_index] = selected_red_flags
+
+    return actions_by_window, red_flags_by_window
 
 
 def _build_window_matching_prompt(
     prediction_items: Sequence[Mapping[str, Any]],
-    gt_items: Sequence[Mapping[str, Any]],
+    oracle_recommended_gt_items: Sequence[Mapping[str, Any]],
+    oracle_red_flag_gt_items: Sequence[Mapping[str, Any]],
 ) -> str:
     prediction_payload = []
     for idx, item in enumerate(prediction_items):
@@ -318,9 +352,17 @@ def _build_window_matching_prompt(
             }
         )
 
-    gt_payload = []
-    for idx, item in enumerate(gt_items):
-        gt_payload.append(
+    recommended_gt_payload = []
+    for idx, item in enumerate(oracle_recommended_gt_items):
+        recommended_gt_payload.append(
+            {
+                "gt_index": int(idx),
+                "action_description": _ground_truth_action_text(item),
+            }
+        )
+    red_flag_gt_payload = []
+    for idx, item in enumerate(oracle_red_flag_gt_items):
+        red_flag_gt_payload.append(
             {
                 "gt_index": int(idx),
                 "action_description": _ground_truth_action_text(item),
@@ -329,10 +371,12 @@ def _build_window_matching_prompt(
 
     prompt_template = get_action_matcher_prompt()
     predicted_actions = json.dumps(prediction_payload, ensure_ascii=False, indent=2)
-    ground_truth_actions = json.dumps(gt_payload, ensure_ascii=False, indent=2)
-    return prompt_template.replace("{predicted_actions}", predicted_actions).replace(
-        "{ground_truth_actions}",
-        ground_truth_actions,
+    oracle_recommended_actions = json.dumps(recommended_gt_payload, ensure_ascii=False, indent=2)
+    oracle_red_flag_actions = json.dumps(red_flag_gt_payload, ensure_ascii=False, indent=2)
+    return (
+        prompt_template.replace("{predicted_actions}", predicted_actions)
+        .replace("{oracle_recommended_actions}", oracle_recommended_actions)
+        .replace("{oracle_red_flag_actions}", oracle_red_flag_actions)
     )
 
 
@@ -348,7 +392,6 @@ def _extract_match_pairs(
         if isinstance(matches_raw, list):
             matched_pairs = []
             seen_predictions = set()
-            seen_gt_indices = set()
             for row in matches_raw:
                 if not isinstance(row, Mapping):
                     raise ValueError(f"Invalid matches row: {row}")
@@ -361,7 +404,7 @@ def _extract_match_pairs(
                 if prediction_index < 0 or prediction_index >= num_predictions:
                     raise ValueError(f"pred_idx out of range: {prediction_index}")
                 if prediction_index in seen_predictions:
-                    raise ValueError(f"Duplicate pred_idx in matches: {prediction_index}")
+                    continue
                 seen_predictions.add(prediction_index)
 
                 if not isinstance(gt_indices_raw, list):
@@ -374,16 +417,10 @@ def _extract_match_pairs(
                         raise ValueError(f"Invalid gt index in gt_indices: {value}") from exc
                     if gt_index < 0 or gt_index >= num_ground_truth:
                         raise ValueError(f"gt index out of range: {gt_index}")
-                    if gt_index in seen_gt_indices:
-                        raise ValueError(
-                            "Ground-truth action index is matched more than once across predictions: " f"{gt_index}"
-                        )
                     parsed_gt_indices.append(gt_index)
 
                 if not parsed_gt_indices:
                     continue
-                for gt_index in parsed_gt_indices:
-                    seen_gt_indices.add(gt_index)
                 matched_pairs.append(
                     {
                         "prediction_index": int(prediction_index),
@@ -406,14 +443,13 @@ def _extract_match_pairs(
             if prediction_index < 0 or prediction_index >= num_predictions:
                 raise ValueError(f"Prediction index out of range: {prediction_index}")
             if prediction_index in seen_predictions:
-                raise ValueError(f"Duplicate prediction index in LLM output: {prediction_index}")
+                continue
             seen_predictions.add(prediction_index)
             matched_pairs.append({"prediction_index": int(prediction_index), "gt_index": -1})
         return matched_pairs
 
     matched_pairs = []
     seen_predictions = set()
-    seen_gt_indices = set()
     for row in matched_pairs_raw:
         if not isinstance(row, Mapping):
             raise ValueError(f"Invalid matched pair row: {row}")
@@ -431,35 +467,64 @@ def _extract_match_pairs(
         if gt_index < 0 or gt_index >= num_ground_truth:
             raise ValueError(f"gt_index out of range: {gt_index}")
         if prediction_index in seen_predictions:
-            raise ValueError(f"Duplicate prediction_index in matched_pairs: {prediction_index}")
-        if gt_index in seen_gt_indices:
-            raise ValueError(f"Duplicate gt_index in matched_pairs: {gt_index}")
+            continue
 
         seen_predictions.add(prediction_index)
-        seen_gt_indices.add(gt_index)
         matched_pairs.append({"prediction_index": int(prediction_index), "gt_index": int(gt_index)})
 
     return matched_pairs
+
+
+def _extract_match_pairs_from_section(
+    section_payload: Any,
+    *,
+    num_predictions: int,
+    num_ground_truth: int,
+) -> List[Dict[str, int]]:
+    if num_ground_truth == 0:
+        return []
+    if section_payload is None:
+        return []
+    if isinstance(section_payload, Mapping):
+        return _extract_match_pairs(
+            dict(section_payload),
+            num_predictions=num_predictions,
+            num_ground_truth=num_ground_truth,
+        )
+    if isinstance(section_payload, list):
+        return _extract_match_pairs(
+            {"matches": list(section_payload)},
+            num_predictions=num_predictions,
+            num_ground_truth=num_ground_truth,
+        )
+    raise ValueError(f"Invalid matcher section payload: {section_payload}")
 
 
 def _match_window_with_llm(
     llm_client: LLMClient,
     *,
     prediction_items: Sequence[Mapping[str, Any]],
-    gt_items: Sequence[Mapping[str, Any]],
+    oracle_recommended_gt_items: Sequence[Mapping[str, Any]],
+    oracle_red_flag_gt_items: Sequence[Mapping[str, Any]],
     patient_id: str,
     window_index: int,
 ) -> Dict[str, Any]:
-    if not prediction_items or not gt_items:
+    if not prediction_items or (not oracle_recommended_gt_items and not oracle_red_flag_gt_items):
         return {
-            "matched_pairs": [],
-            "matched_prediction_indices": [],
+            "recommended_matched_pairs": [],
+            "recommended_matched_prediction_indices": [],
+            "red_flag_matched_pairs": [],
+            "red_flag_matched_prediction_indices": [],
             "raw_response": "",
             "input_tokens": 0,
             "output_tokens": 0,
         }
 
-    prompt = _build_window_matching_prompt(prediction_items=prediction_items, gt_items=gt_items)
+    prompt = _build_window_matching_prompt(
+        prediction_items=prediction_items,
+        oracle_recommended_gt_items=oracle_recommended_gt_items,
+        oracle_red_flag_gt_items=oracle_red_flag_gt_items,
+    )
     response = llm_client.chat(prompt=prompt, response_format="text", temperature=1)
     raw_response = response.get("content", "")
     usage = response.get("usage", {})
@@ -475,165 +540,73 @@ def _match_window_with_llm(
             f"Response preview: {preview}"
         )
 
-    matched_pairs = _extract_match_pairs(
-        parsed,
-        num_predictions=len(prediction_items),
-        num_ground_truth=len(gt_items),
-    )
-    matched_prediction_indices = sorted({int(item["prediction_index"]) for item in matched_pairs})
+    recommended_pairs: List[Dict[str, int]]
+    red_flag_pairs: List[Dict[str, int]]
+    if "recommended_action_matches" in parsed or "red_flag_matches" in parsed:
+        recommended_pairs = _extract_match_pairs_from_section(
+            parsed.get("recommended_action_matches"),
+            num_predictions=len(prediction_items),
+            num_ground_truth=len(oracle_recommended_gt_items),
+        )
+        red_flag_pairs = _extract_match_pairs_from_section(
+            parsed.get("red_flag_matches"),
+            num_predictions=len(prediction_items),
+            num_ground_truth=len(oracle_red_flag_gt_items),
+        )
+    else:
+        recommended_pairs = _extract_match_pairs(
+            parsed,
+            num_predictions=len(prediction_items),
+            num_ground_truth=len(oracle_recommended_gt_items),
+        )
+        red_flag_pairs = []
+    recommended_indices = sorted({int(item["prediction_index"]) for item in recommended_pairs})
+    red_flag_indices = sorted({int(item["prediction_index"]) for item in red_flag_pairs})
 
     return {
-        "matched_pairs": matched_pairs,
-        "matched_prediction_indices": matched_prediction_indices,
+        "recommended_matched_pairs": recommended_pairs,
+        "recommended_matched_prediction_indices": recommended_indices,
+        "red_flag_matched_pairs": red_flag_pairs,
+        "red_flag_matched_prediction_indices": red_flag_indices,
         "raw_response": raw_response,
         "input_tokens": _normalize_token_count(usage.get("input_tokens")),
         "output_tokens": _normalize_token_count(usage.get("output_tokens")),
     }
 
 
-def _get_thread_llm_client(
-    *,
-    llm_provider: str,
-    llm_model: str,
-    llm_max_tokens: int,
-) -> LLMClient:
+def _get_thread_llm_client() -> LLMClient:
     client = getattr(_THREAD_LOCAL, "llm_client", None)
     client_key = getattr(_THREAD_LOCAL, "llm_client_key", None)
-    next_key = (str(llm_provider), str(llm_model), int(llm_max_tokens))
+    next_key = (LLM_MATCHER_PROVIDER, LLM_MATCHER_MODEL, int(LLM_MATCHER_MAX_TOKENS))
     if client is None or client_key != next_key:
         client = LLMClient(
-            provider=str(llm_provider),
-            model=str(llm_model),
-            max_tokens=int(llm_max_tokens),
+            provider=LLM_MATCHER_PROVIDER,
+            model=LLM_MATCHER_MODEL,
+            max_tokens=int(LLM_MATCHER_MAX_TOKENS),
         )
         _THREAD_LOCAL.llm_client = client
         _THREAD_LOCAL.llm_client_key = next_key
     return client
 
 
-def _get_thread_embedding_matcher(
-    *,
-    embedding_model_name: str,
-    embedding_similarity_threshold: float,
-    embedding_device: Optional[str],
-) -> EmbeddingActionMatcher:
-    matcher = getattr(_THREAD_LOCAL, "embedding_matcher", None)
-    matcher_key = getattr(_THREAD_LOCAL, "embedding_matcher_key", None)
-    next_key = (
-        str(embedding_model_name),
-        float(embedding_similarity_threshold),
-        str(embedding_device) if embedding_device is not None else None,
-    )
-    if matcher is None or matcher_key != next_key:
-        matcher = EmbeddingActionMatcher(
-            model_name=str(embedding_model_name),
-            similarity_threshold=float(embedding_similarity_threshold),
-            device=str(embedding_device) if embedding_device is not None else None,
-        )
-        _THREAD_LOCAL.embedding_matcher = matcher
-        _THREAD_LOCAL.embedding_matcher_key = next_key
-    return matcher
-
-
-def _prediction_action_text(item: Mapping[str, Any]) -> str:
-    text = recommendation_to_text(item)
-    if text:
-        return text
-    action_name = str(item.get("action_name") or "").strip()
-    action_description = str(item.get("action_description") or "").strip()
-    if action_name and action_description and action_name.lower() not in action_description.lower():
-        return f"{action_name}. {action_description}".strip()
-    return (action_description or action_name).strip()
-
-
-def _match_window_with_embedding(
-    embedding_matcher: EmbeddingActionMatcher,
-    *,
-    prediction_items: Sequence[Mapping[str, Any]],
-    gt_items: Sequence[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    if not prediction_items or not gt_items:
-        return {
-            "matched_pairs": [],
-            "matched_prediction_indices": [],
-            "raw_response": "",
-            "input_tokens": 0,
-            "output_tokens": 0,
-        }
-
-    prediction_texts = [_prediction_action_text(item) for item in prediction_items]
-    gt_texts = [_ground_truth_action_text(item) for item in gt_items]
-    match_payload = embedding_matcher.match(
-        prediction_texts=prediction_texts,
-        gt_texts=gt_texts,
-    )
-    raw_response = json.dumps(match_payload, ensure_ascii=False)
-    return {
-        "matched_pairs": list(match_payload["matched_pairs"]),
-        "matched_prediction_indices": list(match_payload["matched_prediction_indices"]),
-        "raw_response": raw_response,
-        "input_tokens": 0,
-        "output_tokens": 0,
-    }
-
-
 def _run_window_match_task(
     task: Dict[str, Any],
-    *,
-    matcher_backend: str,
-    llm_provider: Optional[str],
-    llm_model: Optional[str],
-    llm_max_tokens: Optional[int],
-    embedding_model_name: Optional[str],
-    embedding_similarity_threshold: Optional[float],
-    embedding_device: Optional[str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    backend = str(matcher_backend)
-    if backend == MATCHER_BACKEND_LLM:
-        if llm_provider is None or llm_model is None or llm_max_tokens is None:
-            raise ValueError("LLM matcher requires llm_provider, llm_model, and llm_max_tokens.")
-        llm_client = _get_thread_llm_client(
-            llm_provider=str(llm_provider),
-            llm_model=str(llm_model),
-            llm_max_tokens=int(llm_max_tokens),
+    llm_client = _get_thread_llm_client()
+    try:
+        match_result = _match_window_with_llm(
+            llm_client,
+            prediction_items=task["prediction_items"],
+            oracle_recommended_gt_items=task["oracle_recommended_gt_items"],
+            oracle_red_flag_gt_items=task["oracle_red_flag_gt_items"],
+            patient_id=str(task["patient_id"]),
+            window_index=int(task["window_index"]),
         )
-        try:
-            match_result = _match_window_with_llm(
-                llm_client,
-                prediction_items=task["prediction_items"],
-                gt_items=task["gt_items"],
-                patient_id=str(task["patient_id"]),
-                window_index=int(task["window_index"]),
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"LLM matching failed for patient={task['patient_id']} window={task['window_index']}: {exc}"
-            ) from exc
-        return task, match_result
-
-    if backend == MATCHER_BACKEND_EMBEDDING:
-        if embedding_model_name is None:
-            raise ValueError("Embedding matcher requires embedding_model_name.")
-        if embedding_similarity_threshold is None:
-            raise ValueError("Embedding matcher requires embedding_similarity_threshold.")
-        embedding_matcher = _get_thread_embedding_matcher(
-            embedding_model_name=str(embedding_model_name),
-            embedding_similarity_threshold=float(embedding_similarity_threshold),
-            embedding_device=str(embedding_device) if embedding_device is not None else None,
-        )
-        try:
-            match_result = _match_window_with_embedding(
-                embedding_matcher,
-                prediction_items=task["prediction_items"],
-                gt_items=task["gt_items"],
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Embedding matching failed for patient={task['patient_id']} window={task['window_index']}: {exc}"
-            ) from exc
-        return task, match_result
-
-    raise ValueError(f"Unsupported matcher_backend={matcher_backend}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"LLM matching failed for patient={task['patient_id']} window={task['window_index']}: {exc}"
+        ) from exc
+    return task, match_result
 
 
 def _build_rows_from_match(
@@ -642,10 +615,14 @@ def _build_rows_from_match(
     match_result: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     prediction_items = task["prediction_items"]
-    gt_items = task["gt_items"]
-    matched_pairs = match_result["matched_pairs"]
-    matched_prediction_indices = match_result["matched_prediction_indices"]
-    matched_index_set = set(int(value) for value in matched_prediction_indices)
+    recommended_gt_items = task["oracle_recommended_gt_items"]
+    red_flag_gt_items = task["oracle_red_flag_gt_items"]
+    recommended_pairs = match_result["recommended_matched_pairs"]
+    red_flag_pairs = match_result["red_flag_matched_pairs"]
+    recommended_prediction_indices = match_result["recommended_matched_prediction_indices"]
+    red_flag_prediction_indices = match_result["red_flag_matched_prediction_indices"]
+    recommended_match_set = set(int(value) for value in recommended_prediction_indices)
+    red_flag_match_set = set(int(value) for value in red_flag_prediction_indices)
 
     window_row = {
         "patient_id": task["patient_id"],
@@ -659,11 +636,14 @@ def _build_rows_from_match(
         "top_k_actions": int(task["top_k_actions"]),
         "num_recommendations": int(task["num_recommendations"]),
         "num_ground_truth_actions": int(task["num_ground_truth_actions"]),
+        "num_ground_truth_red_flags": int(task["num_ground_truth_red_flags"]),
         "ground_truth_source": str(task["ground_truth_source"]),
         "matcher_backend": str(task["matcher_backend"]),
         "memory_depth": task["memory_depth"],
-        "matched_prediction_indices": list(matched_prediction_indices),
-        "matched_pairs": list(matched_pairs),
+        "matched_prediction_indices": list(recommended_prediction_indices),
+        "matched_pairs": list(recommended_pairs),
+        "matched_red_flag_prediction_indices": list(red_flag_prediction_indices),
+        "matched_red_flag_pairs": list(red_flag_pairs),
         "matcher_input_tokens": int(match_result["input_tokens"]),
         "matcher_output_tokens": int(match_result["output_tokens"]),
         "matcher_raw_response": str(match_result["raw_response"]),
@@ -673,8 +653,12 @@ def _build_rows_from_match(
     }
 
     prediction_rows: List[Dict[str, Any]] = []
-    gt_texts = [_ground_truth_action_text(item) for item in gt_items]
-    pair_by_prediction = {int(pair["prediction_index"]): int(pair["gt_index"]) for pair in matched_pairs}
+    recommended_gt_texts = [_ground_truth_action_text(item) for item in recommended_gt_items]
+    red_flag_gt_texts = [_ground_truth_action_text(item) for item in red_flag_gt_items]
+    recommended_pair_by_prediction = {
+        int(pair["prediction_index"]): int(pair["gt_index"]) for pair in recommended_pairs
+    }
+    red_flag_pair_by_prediction = {int(pair["prediction_index"]): int(pair["gt_index"]) for pair in red_flag_pairs}
     for prediction_index, prediction_item in enumerate(prediction_items):
         prediction_rows.append(
             {
@@ -683,20 +667,39 @@ def _build_rows_from_match(
                 "icu_stay_id": int(task["icu_stay_id"]),
                 "window_index": int(task["window_index"]),
                 "prediction_index": int(prediction_index),
-                "is_matched": int(prediction_index in matched_index_set),
-                "matched_gt_index": pair_by_prediction.get(prediction_index),
+                "is_matched": int(prediction_index in recommended_match_set),
+                "is_matched_recommended": int(prediction_index in recommended_match_set),
+                "is_matched_red_flag": int(prediction_index in red_flag_match_set),
+                "matched_gt_index": recommended_pair_by_prediction.get(prediction_index),
+                "matched_recommended_gt_index": recommended_pair_by_prediction.get(prediction_index),
+                "matched_red_flag_gt_index": red_flag_pair_by_prediction.get(prediction_index),
                 "matcher_backend": str(task["matcher_backend"]),
                 "recommended_action_name": str(prediction_item.get("action_name") or "").strip(),
                 "recommended_action_description": str(prediction_item.get("action_description") or "").strip(),
                 "recommended_action_text": recommendation_to_text(prediction_item),
                 "matched_gt_action_text": (
-                    gt_texts[pair_by_prediction[prediction_index]]
-                    if prediction_index in pair_by_prediction
-                    and pair_by_prediction[prediction_index] >= 0
-                    and pair_by_prediction[prediction_index] < len(gt_texts)
+                    recommended_gt_texts[recommended_pair_by_prediction[prediction_index]]
+                    if prediction_index in recommended_pair_by_prediction
+                    and recommended_pair_by_prediction[prediction_index] >= 0
+                    and recommended_pair_by_prediction[prediction_index] < len(recommended_gt_texts)
+                    else ""
+                ),
+                "matched_recommended_gt_action_text": (
+                    recommended_gt_texts[recommended_pair_by_prediction[prediction_index]]
+                    if prediction_index in recommended_pair_by_prediction
+                    and recommended_pair_by_prediction[prediction_index] >= 0
+                    and recommended_pair_by_prediction[prediction_index] < len(recommended_gt_texts)
+                    else ""
+                ),
+                "matched_red_flag_action_text": (
+                    red_flag_gt_texts[red_flag_pair_by_prediction[prediction_index]]
+                    if prediction_index in red_flag_pair_by_prediction
+                    and red_flag_pair_by_prediction[prediction_index] >= 0
+                    and red_flag_pair_by_prediction[prediction_index] < len(red_flag_gt_texts)
                     else ""
                 ),
                 "num_ground_truth_actions": int(task["num_ground_truth_actions"]),
+                "num_ground_truth_red_flags": int(task["num_ground_truth_red_flags"]),
                 "ground_truth_source": str(task["ground_truth_source"]),
             }
         )
@@ -708,13 +711,6 @@ def _load_window_and_prediction_rows(
     *,
     gt_source: str,
     oracle_results_dir: Optional[Path],
-    matcher_backend: str,
-    llm_provider: Optional[str],
-    llm_model: Optional[str],
-    llm_max_tokens: Optional[int],
-    embedding_model_name: Optional[str],
-    embedding_similarity_threshold: Optional[float],
-    embedding_device: Optional[str],
     window_stride: Optional[int],
     num_workers: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
@@ -727,17 +723,7 @@ def _load_window_and_prediction_rows(
         normalized_window_stride = int(window_stride)
         if normalized_window_stride < 1:
             raise ValueError(f"window_stride must be >= 1 when provided, got {window_stride}")
-    backend = str(matcher_backend)
-    if backend not in {MATCHER_BACKEND_LLM, MATCHER_BACKEND_EMBEDDING}:
-        raise ValueError(f"Unsupported matcher_backend={matcher_backend}")
-    if backend == MATCHER_BACKEND_LLM:
-        if llm_provider is None or llm_model is None or llm_max_tokens is None:
-            raise ValueError("LLM matcher requires llm_provider, llm_model, and llm_max_tokens.")
-    if backend == MATCHER_BACKEND_EMBEDDING:
-        if embedding_model_name is None:
-            raise ValueError("Embedding matcher requires embedding_model_name.")
-        if embedding_similarity_threshold is None:
-            raise ValueError("Embedding matcher requires embedding_similarity_threshold.")
+    backend = MATCHER_BACKEND_LLM
 
     prediction_files = sorted((prediction_dir / "patients").glob("*/recommendation_predictions.json"))
     if not prediction_files:
@@ -745,19 +731,21 @@ def _load_window_and_prediction_rows(
 
     tasks: List[Dict[str, Any]] = []
     skipped_no_oracle_gt_windows = 0
+    windows_without_oracle_red_flags = 0
+    skipped_missing_oracle_patients = 0
     for pred_path in prediction_files:
         payload = _load_json(pred_path)
         patient_id = pred_path.parent.name
         oracle_actions_by_window: Optional[Dict[int, List[Dict[str, Any]]]] = None
+        oracle_red_flags_by_window: Optional[Dict[int, List[Dict[str, Any]]]] = None
         if gt_source == GT_SOURCE_ORACLE_REVIEWED_ACTIONS:
             if oracle_results_dir is None:
                 raise ValueError("oracle_results_dir is required when gt_source=oracle_reviewed_actions")
             oracle_prediction_path = oracle_results_dir / "patients" / patient_id / "oracle_predictions.json"
             if not oracle_prediction_path.exists():
-                raise FileNotFoundError(
-                    f"Missing oracle_predictions.json for patient={patient_id}: {oracle_prediction_path}"
-                )
-            oracle_actions_by_window = _load_oracle_reviewed_actions_by_window(oracle_prediction_path)
+                skipped_missing_oracle_patients += 1
+                continue
+            oracle_actions_by_window, oracle_red_flags_by_window = _load_oracle_targets_by_window(oracle_prediction_path)
 
         subject_id_raw = payload.get("subject_id")
         icu_stay_id_raw = payload.get("icu_stay_id")
@@ -808,18 +796,24 @@ def _load_window_and_prediction_rows(
             if not isinstance(recommended_actions, list):
                 raise ValueError(f"Missing recommended_actions list in {pred_path} window={window_index}")
             prediction_items = [dict(action) for action in recommended_actions if isinstance(action, Mapping)]
+            red_flag_gt_items: List[Dict[str, Any]] = []
             if gt_source == GT_SOURCE_DATASET_ACTIONS:
                 ground_truth_action_events = item.get("ground_truth_action_events")
                 if not isinstance(ground_truth_action_events, list):
                     raise ValueError(f"Missing ground_truth_action_events list in {pred_path} window={window_index}")
                 gt_items = [dict(event) for event in ground_truth_action_events if isinstance(event, Mapping)]
             elif gt_source == GT_SOURCE_ORACLE_REVIEWED_ACTIONS:
-                if oracle_actions_by_window is None:
+                if oracle_actions_by_window is None or oracle_red_flags_by_window is None:
                     raise ValueError(f"Oracle review cache unavailable for {pred_path}")
                 if window_index not in oracle_actions_by_window:
                     skipped_no_oracle_gt_windows += 1
                     continue
                 gt_items = [dict(action) for action in oracle_actions_by_window[window_index]]
+                red_flag_gt_items = [
+                    dict(action) for action in oracle_red_flags_by_window.get(window_index, [])
+                ]
+                if not red_flag_gt_items:
+                    windows_without_oracle_red_flags += 1
             else:
                 raise ValueError(f"Unsupported gt_source={gt_source}")
 
@@ -847,23 +841,32 @@ def _load_window_and_prediction_rows(
                     "top_k_actions": int(top_k_actions),
                     "num_recommendations": int(len(prediction_items)),
                     "num_ground_truth_actions": int(len(gt_items)),
+                    "num_ground_truth_red_flags": int(len(red_flag_gt_items)),
                     "memory_depth": memory_depth,
                     "ground_truth_source": str(gt_source),
                     "matcher_backend": str(backend),
                     "prediction_items": prediction_items,
-                    "gt_items": gt_items,
+                    "oracle_recommended_gt_items": gt_items,
+                    "oracle_red_flag_gt_items": red_flag_gt_items,
                 }
             )
 
     total_tasks = int(len(tasks))
     if total_tasks == 0:
+        if gt_source == GT_SOURCE_ORACLE_REVIEWED_ACTIONS and skipped_missing_oracle_patients > 0:
+            raise ValueError(
+                "No recommendation prediction windows found for evaluation after skipping "
+                f"{skipped_missing_oracle_patients} patients without oracle_predictions.json."
+            )
         raise ValueError("No recommendation prediction windows found for evaluation.")
     print(
         f"Loaded recommendation predictions: patients={len(prediction_files)}, "
         f"windows={total_tasks}, workers={int(num_workers)}"
     )
     if gt_source == GT_SOURCE_ORACLE_REVIEWED_ACTIONS:
+        print(f"Skipped patients with missing oracle_predictions.json: {skipped_missing_oracle_patients}")
         print(f"Skipped windows with no Oracle best_practice/acceptable actions: {skipped_no_oracle_gt_windows}")
+        print(f"Windows with no Oracle red_flags: {windows_without_oracle_red_flags}")
 
     window_rows: List[Dict[str, Any]] = []
     prediction_rows: List[Dict[str, Any]] = []
@@ -878,7 +881,9 @@ def _load_window_and_prediction_rows(
         match_result: Dict[str, Any],
     ) -> None:
         nonlocal matcher_calls, total_input_tokens, total_output_tokens
-        if task["prediction_items"] and task["gt_items"]:
+        if task["prediction_items"] and (
+            task["oracle_recommended_gt_items"] or task["oracle_red_flag_gt_items"]
+        ):
             matcher_calls += 1
             total_input_tokens += int(match_result["input_tokens"])
             total_output_tokens += int(match_result["output_tokens"])
@@ -888,20 +893,15 @@ def _load_window_and_prediction_rows(
         print(
             f"[{completed}/{total_tasks}] matched patient={task['patient_id']} "
             f"window={task['window_index']} rec={task['num_recommendations']} "
-            f"gt={task['num_ground_truth_actions']} matched={len(match_result['matched_prediction_indices'])}"
+            f"gt={task['num_ground_truth_actions']} matched={len(match_result['recommended_matched_prediction_indices'])} "
+            f"red_flags={task['num_ground_truth_red_flags']} "
+            f"matched_red_flags={len(match_result['red_flag_matched_prediction_indices'])}"
         )
 
     if int(num_workers) == 1:
         for completed, task in enumerate(tasks, start=1):
             _, match_result = _run_window_match_task(
                 task,
-                matcher_backend=backend,
-                llm_provider=llm_provider,
-                llm_model=llm_model,
-                llm_max_tokens=llm_max_tokens,
-                embedding_model_name=embedding_model_name,
-                embedding_similarity_threshold=embedding_similarity_threshold,
-                embedding_device=embedding_device,
             )
             _finalize_window(completed=completed, task=task, match_result=match_result)
     else:
@@ -910,13 +910,6 @@ def _load_window_and_prediction_rows(
                 executor.submit(
                     _run_window_match_task,
                     task,
-                    matcher_backend=backend,
-                    llm_provider=llm_provider,
-                    llm_model=llm_model,
-                    llm_max_tokens=llm_max_tokens,
-                    embedding_model_name=embedding_model_name,
-                    embedding_similarity_threshold=embedding_similarity_threshold,
-                    embedding_device=embedding_device,
                 )
                 for task in tasks
             ]
@@ -942,16 +935,11 @@ def _load_window_and_prediction_rows(
         "input_tokens": int(total_input_tokens),
         "output_tokens": int(total_output_tokens),
         "total_tokens": int(total_input_tokens + total_output_tokens),
+        "skipped_missing_oracle_patients": int(skipped_missing_oracle_patients),
         "skipped_no_oracle_gt_windows": int(skipped_no_oracle_gt_windows),
+        "windows_without_oracle_red_flags": int(windows_without_oracle_red_flags),
     }
     return window_frame, prediction_frame, matcher_usage
-
-
-def _k_values(window_frame: pd.DataFrame) -> List[int]:
-    max_top_k = int(pd.to_numeric(window_frame["top_k_actions"], errors="coerce").max())
-    if max_top_k < 1:
-        raise ValueError("Cannot infer K values: top_k_actions must be >= 1.")
-    return list(range(1, max_top_k + 1))
 
 
 def _expand_window_rows_by_k(window_frame: pd.DataFrame, *, k_values: Sequence[int]) -> pd.DataFrame:
@@ -962,6 +950,11 @@ def _expand_window_rows_by_k(window_frame: pd.DataFrame, *, k_values: Sequence[i
         if not isinstance(matched_prediction_indices, list):
             matched_prediction_indices = []
         matched_set = {int(value) for value in matched_prediction_indices}
+        matched_red_flag_prediction_indices = row.get("matched_red_flag_prediction_indices")
+        if not isinstance(matched_red_flag_prediction_indices, list):
+            matched_red_flag_prediction_indices = []
+        matched_red_flag_set = {int(value) for value in matched_red_flag_prediction_indices}
+        num_ground_truth_red_flags = int(row.get("num_ground_truth_red_flags") or 0)
 
         base = {
             "patient_id": row["patient_id"],
@@ -975,17 +968,27 @@ def _expand_window_rows_by_k(window_frame: pd.DataFrame, *, k_values: Sequence[i
             "memory_depth": row["memory_depth"],
             "num_recommendations": int(num_recommendations),
             "num_ground_truth_actions": int(row["num_ground_truth_actions"]),
+            "num_ground_truth_red_flags": int(num_ground_truth_red_flags),
             "top_k_actions": int(row["top_k_actions"]),
         }
 
         for k in k_values:
             num_considered = min(int(k), int(num_recommendations))
             num_matches_at_k = sum(1 for idx in matched_set if idx < num_considered)
-            hit_at_k = int(num_matches_at_k > 0)
+            hit_at_k = int(num_matches_at_k > int(HIT_MATCH_COUNT_THRESHOLD))
             if num_considered > 0:
                 precision_at_k = float(num_matches_at_k) / float(num_considered)
             else:
                 precision_at_k = 0.0
+            num_red_flag_matches_at_k = sum(1 for idx in matched_red_flag_set if idx < num_considered)
+            red_flag_hit_at_k: float
+            red_flag_precision_at_k: float
+            if num_ground_truth_red_flags > 0:
+                red_flag_hit_at_k = float(int(num_red_flag_matches_at_k > 0))
+                red_flag_precision_at_k = float(num_red_flag_matches_at_k) / float(num_considered) if num_considered > 0 else 0.0
+            else:
+                red_flag_hit_at_k = float("nan")
+                red_flag_precision_at_k = float("nan")
 
             rows.append(
                 {
@@ -995,6 +998,9 @@ def _expand_window_rows_by_k(window_frame: pd.DataFrame, *, k_values: Sequence[i
                     "num_matches_at_k": int(num_matches_at_k),
                     "hit_at_k": int(hit_at_k),
                     "precision_at_k": float(precision_at_k),
+                    "num_red_flag_matches_at_k": int(num_red_flag_matches_at_k),
+                    "red_flag_hit_at_k": float(red_flag_hit_at_k),
+                    "red_flag_precision_at_k": float(red_flag_precision_at_k),
                 }
             )
 
@@ -1029,6 +1035,24 @@ def _compute_metrics_by_k(window_k_frame: pd.DataFrame) -> pd.DataFrame:
         patient_precision = subset.groupby("patient_id")["precision_at_k"].mean().astype(float)
         macro_hit = float(patient_hit.mean()) if len(patient_hit) > 0 else float("nan")
         macro_precision = float(patient_precision.mean()) if len(patient_precision) > 0 else float("nan")
+        red_flag_subset = subset.dropna(subset=["red_flag_hit_at_k", "red_flag_precision_at_k"])
+        red_flag_windows = int(len(red_flag_subset))
+        red_flag_micro_hit = float(red_flag_subset["red_flag_hit_at_k"].mean()) if red_flag_windows > 0 else float("nan")
+        red_flag_micro_precision = (
+            float(red_flag_subset["red_flag_precision_at_k"].mean()) if red_flag_windows > 0 else float("nan")
+        )
+        if red_flag_windows > 0:
+            red_flag_patient_hit = red_flag_subset.groupby("patient_id")["red_flag_hit_at_k"].mean().astype(float)
+            red_flag_patient_precision = (
+                red_flag_subset.groupby("patient_id")["red_flag_precision_at_k"].mean().astype(float)
+            )
+            red_flag_macro_hit = float(red_flag_patient_hit.mean()) if len(red_flag_patient_hit) > 0 else float("nan")
+            red_flag_macro_precision = (
+                float(red_flag_patient_precision.mean()) if len(red_flag_patient_precision) > 0 else float("nan")
+            )
+        else:
+            red_flag_macro_hit = float("nan")
+            red_flag_macro_precision = float("nan")
 
         rows.append(
             {
@@ -1041,6 +1065,14 @@ def _compute_metrics_by_k(window_k_frame: pd.DataFrame) -> pd.DataFrame:
                 "macro_precision_at_k": float(macro_precision),
                 "total_matches_at_k": int(subset["num_matches_at_k"].sum()),
                 "total_recommendations_at_k": int(subset["num_recommendations_at_k"].sum()),
+                "num_windows_with_red_flags": int(red_flag_windows),
+                "num_patients_with_red_flags": int(red_flag_subset["patient_id"].nunique()),
+                "red_flag_micro_hit_at_k": float(red_flag_micro_hit),
+                "red_flag_macro_hit_at_k": float(red_flag_macro_hit),
+                "red_flag_micro_precision_at_k": float(red_flag_micro_precision),
+                "red_flag_macro_precision_at_k": float(red_flag_macro_precision),
+                "total_red_flag_matches_at_k": int(red_flag_subset["num_red_flag_matches_at_k"].sum()),
+                "total_red_flag_recommendations_at_k": int(red_flag_subset["num_recommendations_at_k"].sum()),
             }
         )
     metrics_df = pd.DataFrame(rows).sort_values("k").reset_index(drop=True)
@@ -1519,16 +1551,16 @@ def _plot_patient_mode_relative_curve(
             )
 
     axes[0].set_xlabel("Relative Window Position (%)")
-    axes[0].set_ylabel("Hit@K")
-    axes[0].set_title(f"Patient {patient_id}: Relative-Time Hit@K by Mode")
+    axes[0].set_ylabel(f"Hit@{FIXED_EVAL_K}")
+    axes[0].set_title(f"Patient {patient_id}: Relative-Time Hit@{FIXED_EVAL_K} by Mode")
     axes[0].set_xlim(0, 100)
     axes[0].set_ylim(0, 1)
     axes[0].grid(alpha=0.3)
     axes[0].legend()
 
     axes[1].set_xlabel("Relative Window Position (%)")
-    axes[1].set_ylabel("Precision@K")
-    axes[1].set_title(f"Patient {patient_id}: Relative-Time Precision@K by Mode")
+    axes[1].set_ylabel(f"Precision@{FIXED_EVAL_K}")
+    axes[1].set_title(f"Patient {patient_id}: Relative-Time Precision@{FIXED_EVAL_K} by Mode")
     axes[1].set_xlim(0, 100)
     axes[1].set_ylim(0, 1)
     axes[1].grid(alpha=0.3)
@@ -1574,16 +1606,16 @@ def _plot_patient_mode_prefix_curve(
             )
 
     axes[0].set_xlabel("Relative Time (%)")
-    axes[0].set_ylabel("Cumulative Hit@K")
-    axes[0].set_title(f"Patient {patient_id}: Prefix Cumulative Hit@K by Mode")
+    axes[0].set_ylabel(f"Cumulative Hit@{FIXED_EVAL_K}")
+    axes[0].set_title(f"Patient {patient_id}: Prefix Cumulative Hit@{FIXED_EVAL_K} by Mode")
     axes[0].set_xlim(0, 100)
     axes[0].set_ylim(0, 1)
     axes[0].grid(alpha=0.3)
     axes[0].legend()
 
     axes[1].set_xlabel("Relative Time (%)")
-    axes[1].set_ylabel("Cumulative Precision@K")
-    axes[1].set_title(f"Patient {patient_id}: Prefix Cumulative Precision@K by Mode")
+    axes[1].set_ylabel(f"Cumulative Precision@{FIXED_EVAL_K}")
+    axes[1].set_title(f"Patient {patient_id}: Prefix Cumulative Precision@{FIXED_EVAL_K} by Mode")
     axes[1].set_xlim(0, 100)
     axes[1].set_ylim(0, 1)
     axes[1].grid(alpha=0.3)
@@ -1628,7 +1660,7 @@ def _plot_patient_mode_comparison_curves(
         for mode_name, result in mode_results.items():
             mode_frame = result["window_k_frame"]
             selected_k = int(result["selected_k"])
-            label = f"{mode_name} (K={selected_k})"
+            label = f"{mode_name} (K={FIXED_EVAL_K})"
             try:
                 relative_by_mode[label] = _build_patient_relative_time_curve(
                     mode_frame,
@@ -1700,16 +1732,16 @@ def _plot_relative_time_curve_by_mode(
             )
 
     axes[0].set_xlabel("Relative Window Position (%)")
-    axes[0].set_ylabel("Hit@K")
-    axes[0].set_title("Relative-Time Hit@K by Mode")
+    axes[0].set_ylabel(f"Hit@{FIXED_EVAL_K}")
+    axes[0].set_title(f"Relative-Time Hit@{FIXED_EVAL_K} by Mode")
     axes[0].set_xlim(0, 100)
     axes[0].set_ylim(0, 1)
     axes[0].grid(alpha=0.3)
     axes[0].legend()
 
     axes[1].set_xlabel("Relative Window Position (%)")
-    axes[1].set_ylabel("Precision@K")
-    axes[1].set_title("Relative-Time Precision@K by Mode")
+    axes[1].set_ylabel(f"Precision@{FIXED_EVAL_K}")
+    axes[1].set_title(f"Relative-Time Precision@{FIXED_EVAL_K} by Mode")
     axes[1].set_xlim(0, 100)
     axes[1].set_ylim(0, 1)
     axes[1].grid(alpha=0.3)
@@ -1756,16 +1788,16 @@ def _plot_prefix_curve_by_mode(
             )
 
     axes[0].set_xlabel("Relative Time (%)")
-    axes[0].set_ylabel("Cumulative Hit@K")
-    axes[0].set_title("Prefix Cumulative Hit@K by Mode")
+    axes[0].set_ylabel(f"Cumulative Hit@{FIXED_EVAL_K}")
+    axes[0].set_title(f"Prefix Cumulative Hit@{FIXED_EVAL_K} by Mode")
     axes[0].set_xlim(0, 100)
     axes[0].set_ylim(0, 1)
     axes[0].grid(alpha=0.3)
     axes[0].legend()
 
     axes[1].set_xlabel("Relative Time (%)")
-    axes[1].set_ylabel("Cumulative Precision@K")
-    axes[1].set_title("Prefix Cumulative Precision@K by Mode")
+    axes[1].set_ylabel(f"Cumulative Precision@{FIXED_EVAL_K}")
+    axes[1].set_title(f"Prefix Cumulative Precision@{FIXED_EVAL_K} by Mode")
     axes[1].set_xlim(0, 100)
     axes[1].set_ylim(0, 1)
     axes[1].grid(alpha=0.3)
@@ -1787,10 +1819,6 @@ def _evaluate_single_prediction_dir(
     output_dir: Path,
     gt_source: str,
     oracle_results_dir: Optional[Path],
-    matcher_backend: str,
-    embedding_model_name: Optional[str],
-    embedding_similarity_threshold: Optional[float],
-    embedding_device: Optional[str],
     window_stride: Optional[int],
     num_workers: int,
 ) -> Dict[str, Any]:
@@ -1802,30 +1830,7 @@ def _evaluate_single_prediction_dir(
     else:
         oracle_results_root = None
 
-    backend = str(matcher_backend)
-    if backend not in {MATCHER_BACKEND_LLM, MATCHER_BACKEND_EMBEDDING}:
-        raise ValueError(f"Unsupported matcher_backend={matcher_backend}")
-
-    llm_provider: Optional[str] = None
-    llm_model: Optional[str] = None
-    llm_max_tokens: Optional[int] = None
-    if backend == MATCHER_BACKEND_LLM:
-        config = get_config()
-        llm_provider = config.llm_provider
-        llm_model = config.llm_model
-        llm_max_tokens = config.llm_max_tokens
-        if not llm_provider:
-            raise ValueError("Missing llm.provider in config")
-        if not llm_model:
-            raise ValueError("Missing llm.model in config")
-        if llm_max_tokens is None:
-            raise ValueError("Missing llm.max_tokens in config")
-
-    if backend == MATCHER_BACKEND_EMBEDDING:
-        if embedding_model_name is None:
-            raise ValueError("--embedding-model-name is required when --matcher-backend=embedding")
-        if embedding_similarity_threshold is None:
-            raise ValueError("--embedding-similarity-threshold is required when --matcher-backend=embedding")
+    backend = MATCHER_BACKEND_LLM
 
     if int(num_workers) < 1:
         raise ValueError(f"num_workers must be >= 1, got {num_workers}")
@@ -1836,52 +1841,28 @@ def _evaluate_single_prediction_dir(
     print(f"Ground-truth source: {gt_source}")
     if oracle_results_root is not None:
         print(f"Oracle results directory: {oracle_results_root}")
-    if backend == MATCHER_BACKEND_LLM:
-        print(
-            f"Matcher config: backend={backend}, provider={llm_provider}, model={llm_model}, "
-            f"max_tokens={int(llm_max_tokens)}, workers={int(num_workers)}, window_stride={window_stride}"
-        )
-    else:
-        print(
-            f"Matcher config: backend={backend}, embedding_model={embedding_model_name}, "
-            f"similarity_threshold={float(embedding_similarity_threshold)}, "
-            f"device={embedding_device}, workers={int(num_workers)}, window_stride={window_stride}"
-        )
+    print(
+        f"Matcher config: backend={backend}, provider={LLM_MATCHER_PROVIDER}, model={LLM_MATCHER_MODEL}, "
+        f"max_tokens={int(LLM_MATCHER_MAX_TOKENS)}, workers={int(num_workers)}, window_stride={window_stride}"
+    )
 
     window_frame, prediction_frame, matcher_usage = _load_window_and_prediction_rows(
         prediction_dir=prediction_root,
         gt_source=str(gt_source),
         oracle_results_dir=oracle_results_root,
-        matcher_backend=backend,
-        llm_provider=str(llm_provider) if llm_provider is not None else None,
-        llm_model=str(llm_model) if llm_model is not None else None,
-        llm_max_tokens=int(llm_max_tokens) if llm_max_tokens is not None else None,
-        embedding_model_name=str(embedding_model_name) if embedding_model_name is not None else None,
-        embedding_similarity_threshold=(
-            float(embedding_similarity_threshold) if embedding_similarity_threshold is not None else None
-        ),
-        embedding_device=str(embedding_device) if embedding_device is not None else None,
         window_stride=int(window_stride) if window_stride is not None else None,
         num_workers=int(num_workers),
     )
 
-    if backend == MATCHER_BACKEND_LLM:
-        llm_usage = {
-            "llm_calls": int(matcher_usage["matcher_calls"]),
-            "input_tokens": int(matcher_usage["input_tokens"]),
-            "output_tokens": int(matcher_usage["output_tokens"]),
-            "total_tokens": int(matcher_usage["total_tokens"]),
-        }
-    else:
-        llm_usage = {
-            "llm_calls": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-        }
+    llm_usage = {
+        "llm_calls": int(matcher_usage["matcher_calls"]),
+        "input_tokens": int(matcher_usage["input_tokens"]),
+        "output_tokens": int(matcher_usage["output_tokens"]),
+        "total_tokens": int(matcher_usage["total_tokens"]),
+    }
 
-    k_values = _k_values(window_frame)
-    selected_k = int(max(k_values))
+    k_values = [int(FIXED_EVAL_K)]
+    selected_k = int(FIXED_EVAL_K)
 
     window_k_frame = _expand_window_rows_by_k(window_frame, k_values=k_values)
     metrics_by_k_df = _compute_metrics_by_k(window_k_frame)
@@ -1894,15 +1875,13 @@ def _evaluate_single_prediction_dir(
         "ground_truth_source": str(gt_source),
         "oracle_results_dir": str(oracle_results_root) if oracle_results_root is not None else None,
         "matcher_backend": str(backend),
-        "llm_provider": str(llm_provider) if llm_provider is not None else None,
-        "llm_model": str(llm_model) if llm_model is not None else None,
-        "embedding_model_name": str(embedding_model_name) if embedding_model_name is not None else None,
-        "embedding_similarity_threshold": (
-            float(embedding_similarity_threshold) if embedding_similarity_threshold is not None else None
-        ),
-        "embedding_device": str(embedding_device) if embedding_device is not None else None,
+        "llm_provider": LLM_MATCHER_PROVIDER,
+        "llm_model": LLM_MATCHER_MODEL,
+        "llm_max_tokens": int(LLM_MATCHER_MAX_TOKENS),
         "matcher_usage": matcher_usage,
         "llm_usage": llm_usage,
+        "fixed_k": int(FIXED_EVAL_K),
+        "hit_match_count_threshold_exclusive": int(HIT_MATCH_COUNT_THRESHOLD),
         "window_stride": int(window_stride) if window_stride is not None else None,
         "num_patients": int(window_k_frame["patient_id"].nunique()),
         "num_windows": int(window_frame.shape[0]),
@@ -1919,6 +1898,12 @@ def _evaluate_single_prediction_dir(
         lambda value: json.dumps(value, ensure_ascii=False)
     )
     window_export_df["matched_pairs"] = window_export_df["matched_pairs"].map(
+        lambda value: json.dumps(value, ensure_ascii=False)
+    )
+    window_export_df["matched_red_flag_prediction_indices"] = window_export_df["matched_red_flag_prediction_indices"].map(
+        lambda value: json.dumps(value, ensure_ascii=False)
+    )
+    window_export_df["matched_red_flag_pairs"] = window_export_df["matched_red_flag_pairs"].map(
         lambda value: json.dumps(value, ensure_ascii=False)
     )
     window_export_df.to_csv(output_dir / "window_level_windows.csv", index=False)
@@ -1962,24 +1947,27 @@ def _evaluate_single_prediction_dir(
     print(f"Saved evaluation outputs to: {output_dir}")
     print("Recommendation Evaluation:")
     print(
-        f"  K={selected_k} "
+        f"  K={selected_k} (fixed), hit rule: matches > {int(HIT_MATCH_COUNT_THRESHOLD)} "
         f"micro_hit={float(summary_row['micro_hit_at_k']):.4f} "
         f"micro_precision={float(summary_row['micro_precision_at_k']):.4f} "
         f"macro_hit={float(summary_row['macro_hit_at_k']):.4f} "
         f"macro_precision={float(summary_row['macro_precision_at_k']):.4f} "
         f"(patients={int(summary_row['num_patients'])}, windows={int(summary_row['num_windows'])})"
     )
-    if backend == MATCHER_BACKEND_LLM:
+    if not pd.isna(summary_row["red_flag_micro_hit_at_k"]):
         print(
-            f"  LLM matcher: provider={llm_provider}, model={llm_model}, "
-            f"calls={llm_usage['llm_calls']}, tokens={llm_usage['total_tokens']}"
+            f"  Red-Flag@K={selected_k} "
+            f"micro_hit={float(summary_row['red_flag_micro_hit_at_k']):.4f} "
+            f"micro_precision={float(summary_row['red_flag_micro_precision_at_k']):.4f} "
+            f"macro_hit={float(summary_row['red_flag_macro_hit_at_k']):.4f} "
+            f"macro_precision={float(summary_row['red_flag_macro_precision_at_k']):.4f} "
+            f"(patients={int(summary_row['num_patients_with_red_flags'])}, "
+            f"windows={int(summary_row['num_windows_with_red_flags'])})"
         )
-    else:
-        print(
-            f"  Embedding matcher: model={embedding_model_name}, "
-            f"threshold={float(embedding_similarity_threshold)}, "
-            f"device={embedding_device}, calls={matcher_usage['matcher_calls']}"
-        )
+    print(
+        f"  LLM matcher: provider={LLM_MATCHER_PROVIDER}, model={LLM_MATCHER_MODEL}, "
+        f"calls={llm_usage['llm_calls']}, tokens={llm_usage['total_tokens']}"
+    )
     print(
         f"  Patient plots: patients={int(num_patient_plots)}, "
         f"heatmaps_generated={int(num_patient_heatmaps)} "
@@ -2002,18 +1990,12 @@ def run_evaluation(
     output_dir: Optional[Path],
     gt_source: str,
     oracle_results_dir: Optional[Path],
-    matcher_backend: str,
-    embedding_model_name: Optional[str],
-    embedding_similarity_threshold: Optional[float],
-    embedding_device: Optional[str],
     window_stride: Optional[int],
     num_workers: int,
 ) -> None:
     if gt_source not in {GT_SOURCE_DATASET_ACTIONS, GT_SOURCE_ORACLE_REVIEWED_ACTIONS}:
         raise ValueError(f"Unsupported gt_source={gt_source}")
-    backend = str(matcher_backend).strip()
-    if backend not in {MATCHER_BACKEND_LLM, MATCHER_BACKEND_EMBEDDING}:
-        raise ValueError(f"Unsupported matcher_backend={matcher_backend}")
+    backend = MATCHER_BACKEND_LLM
 
     mode_dirs = _discover_recommendation_mode_dirs(prediction_dir)
     if mode_dirs:
@@ -2037,12 +2019,6 @@ def run_evaluation(
                 output_dir=mode_output_dir,
                 gt_source=str(gt_source),
                 oracle_results_dir=oracle_results_dir,
-                matcher_backend=str(backend),
-                embedding_model_name=str(embedding_model_name) if embedding_model_name is not None else None,
-                embedding_similarity_threshold=(
-                    float(embedding_similarity_threshold) if embedding_similarity_threshold is not None else None
-                ),
-                embedding_device=str(embedding_device) if embedding_device is not None else None,
                 window_stride=int(window_stride) if window_stride is not None else None,
                 num_workers=int(num_workers),
             )
@@ -2092,19 +2068,13 @@ def run_evaluation(
         output_dir=final_output_dir,
         gt_source=str(gt_source),
         oracle_results_dir=oracle_results_dir,
-        matcher_backend=str(backend),
-        embedding_model_name=str(embedding_model_name) if embedding_model_name is not None else None,
-        embedding_similarity_threshold=(
-            float(embedding_similarity_threshold) if embedding_similarity_threshold is not None else None
-        ),
-        embedding_device=str(embedding_device) if embedding_device is not None else None,
         window_stride=int(window_stride) if window_stride is not None else None,
         num_workers=int(num_workers),
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate recommendation predictions with configurable matching.")
+    parser = argparse.ArgumentParser(description="Evaluate recommendation predictions with LLM action matching.")
     parser.add_argument(
         "--prediction-dir",
         type=str,
@@ -2117,11 +2087,11 @@ def main() -> None:
         default=None,
         help=(
             "Directory where metrics and plots will be saved. "
-            "Results are saved under a backend subfolder (<llm|embedding>). "
+            "Results are saved under an llm subfolder. "
             "Default for multi-mode input: "
-            "evaluation_results/<memory_run_name>/recommendation_experiment/<backend>/<mode>. "
+            "evaluation_results/<memory_run_name>/recommendation_experiment/llm/<mode>. "
             "Default for single-mode input: "
-            "evaluation_results/<memory_run_name>/recommendation_experiment/<mode>/<backend>."
+            "evaluation_results/<memory_run_name>/recommendation_experiment/<mode>/llm."
         ),
     )
     parser.add_argument(
@@ -2152,31 +2122,6 @@ def main() -> None:
         default=None,
         help="Evaluate every n-th window by window_index modulo n. If omitted, evaluate all windows.",
     )
-    parser.add_argument(
-        "--matcher-backend",
-        type=str,
-        default=MATCHER_BACKEND_LLM,
-        choices=[MATCHER_BACKEND_LLM, MATCHER_BACKEND_EMBEDDING],
-        help="Action matcher backend.",
-    )
-    parser.add_argument(
-        "--embedding-model-name",
-        type=str,
-        default="abhinand/MedEmbed-base-v0.1",
-        help="Sentence-transformers model name for embedding matcher.",
-    )
-    parser.add_argument(
-        "--embedding-similarity-threshold",
-        type=float,
-        default=0.8,
-        help="Cosine-similarity threshold for embedding matcher.",
-    )
-    parser.add_argument(
-        "--embedding-device",
-        type=str,
-        default="mps",
-        help="Embedding model device (cpu/cuda/mps).",
-    )
     args = parser.parse_args()
 
     run_evaluation(
@@ -2184,12 +2129,6 @@ def main() -> None:
         output_dir=Path(args.output_dir) if args.output_dir else None,
         gt_source=str(args.gt_source),
         oracle_results_dir=Path(args.oracle_results_dir) if args.oracle_results_dir else None,
-        matcher_backend=str(args.matcher_backend),
-        embedding_model_name=str(args.embedding_model_name) if args.embedding_model_name else None,
-        embedding_similarity_threshold=(
-            float(args.embedding_similarity_threshold) if args.embedding_similarity_threshold is not None else None
-        ),
-        embedding_device=str(args.embedding_device) if args.embedding_device else None,
         window_stride=int(args.window_stride) if args.window_stride is not None else None,
         num_workers=int(args.num_workers),
     )

@@ -30,7 +30,7 @@ import pandas as pd
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from config.config import Config
+from config.config import Config, load_config
 from data_parser import MIMICDataParser
 from model.llms import LLMClient
 from utils.discharge_summary_selector import (
@@ -102,12 +102,6 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="gemini-3.1-flash-lite-preview",
         help="LLM model (default: gemini-3.1-flash-lite-preview).",
-    )
-    parser.add_argument(
-        "--response-max-tokens",
-        type=int,
-        default=16,
-        help="Max output tokens for yes/no response (default: 16).",
     )
     parser.add_argument(
         "--max-workers",
@@ -243,7 +237,6 @@ def _get_thread_llm_client(args: argparse.Namespace) -> LLMClient:
         client = LLMClient(
             provider=args.provider,
             model=args.model,
-            max_tokens=args.response_max_tokens,
         )
         _THREAD_LOCAL.llm_client = client
     return client
@@ -409,7 +402,6 @@ def _evaluate_one_case(
         response = llm_client.chat(
             prompt=prompt,
             response_format="text",
-            max_tokens=args.response_max_tokens,
         )
         response_text = _safe_text(response.get("content")).strip()
         answer = _normalize_yes_no(response_text)
@@ -471,7 +463,7 @@ def main() -> None:
     if args.max_days_after_leave <= 0:
         raise ValueError("--max-days-after-leave must be > 0.")
 
-    config = Config(args.config)
+    config = load_config(args.config)
     events_path = args.events_path or config.events_path
     icu_stay_path = args.icu_stay_path or config.icu_stay_path
 
@@ -581,7 +573,7 @@ def main() -> None:
         "llm_provider": args.provider,
         "llm_model": args.model,
         "max_workers": args.max_workers,
-        "response_max_tokens": args.response_max_tokens,
+        "response_max_tokens": int(config.llm_max_tokens),
         "max_events_per_stay": args.max_events_per_stay,
         "max_text_chars_per_event": args.max_text_chars_per_event,
         "selection_summary": selection_summary,

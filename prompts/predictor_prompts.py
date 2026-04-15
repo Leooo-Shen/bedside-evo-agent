@@ -50,31 +50,6 @@ Based on the above, predict whether this patient will die during their ICU stay.
 """
 
 
-def get_survival_prediction_prompt_naive() -> str:
-    return """You are a clinical decision support AI specializing in ICU outcome prediction. Your task is to predict whether the patient will die during their current ICU stay, based on the observed ICU timeline provided below.
-
-## OUTPUT FORMAT
-Respond in JSON format only:
-{{
-  "prediction": "Survive" | "Die",
-  "confidence": "Low" | "Moderate" | "High",
-  "supporting_evidence": [
-    {{
-      "source": "raw_event" | "critical_event" | "trajectory" | "insight" | "metadata",
-      "content": "Brief summary of the evidence",
-      "significance": "Why this supports the prediction"
-    }}
-  ],
-  "rationale": "1–3 sentences of concise clinical reasoning"
-}}
-
-## CLINICAL CONTEXT
-{context}
-
-Based on the above, predict whether this patient will die during their ICU stay.
-"""
-
-
 def get_patient_status_prediction_prompt() -> str:
     return """You are a clinical decision support AI. Assess the patient's overall clinical status for the current ICU window.
 

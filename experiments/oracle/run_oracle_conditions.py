@@ -496,7 +496,6 @@ def _run_single_condition(
     oracle = MetaOracle(
         provider=provider,
         model=model,
-        max_tokens=config.llm_max_tokens,
         use_discharge_summary=True,  # Forced ON so discharge-summary masking differences are meaningful.
         include_icu_outcome_in_prompt=condition.include_icu_outcome_in_prompt,
         mask_discharge_summary_outcome_terms=condition.mask_discharge_summary_outcome_terms,

@@ -310,7 +310,7 @@ class FoldAgent:
         model: str = None,
         api_key: str = None,
         temperature: Optional[float] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         enable_logging: bool = False,
         window_duration_hours: float = 0.5,
     ):
@@ -322,7 +322,7 @@ class FoldAgent:
             model: Model name
             api_key: API key
             temperature: Optional sampling temperature override
-            max_tokens: Maximum tokens in response
+            max_tokens: Optional maximum response tokens override
             enable_logging: Enable detailed logging of all LLM calls
             window_duration_hours: Duration of each window in hours (default 0.5)
         """

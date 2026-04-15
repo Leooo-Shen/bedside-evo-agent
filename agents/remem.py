@@ -124,7 +124,7 @@ class RememAgent:
         model: str = None,
         api_key: str = None,
         temperature: Optional[float] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         max_state_length: int = 1500,
         enable_logging: bool = False,
         enable_intra_patient_refinement: bool = False,
@@ -137,7 +137,7 @@ class RememAgent:
             model: Model name
             api_key: API key
             temperature: Optional sampling temperature override
-            max_tokens: Maximum tokens in response
+            max_tokens: Optional maximum response tokens override
             max_state_length: Maximum length of state summary
             enable_logging: Enable detailed logging of all LLM calls
             enable_intra_patient_refinement: Enable Think-Refine-Act loop for window state updates

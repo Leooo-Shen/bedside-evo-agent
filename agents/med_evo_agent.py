@@ -811,7 +811,7 @@ class MedEvoAgent:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
         temperature: Optional[float] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         enable_logging: bool = False,
         window_duration_hours: float = 0.5,
         max_working_windows: int = 3,
@@ -1544,38 +1544,103 @@ class MedEvoAgent:
             return ordered[-self.max_window_summaries :]
         return ordered
 
-    def _build_insight_context(self, memory: MedEvoMemory) -> Tuple[List[Dict[str, Any]], List[CriticalEvent]]:
-        trajectory_items = [deepcopy(item) for item in memory.trajectory_memory if isinstance(item, dict)]
+    def _window_summary_from_trajectory_item(self, item: Dict[str, Any]) -> Optional[WindowSummary]:
+        if not isinstance(item, dict):
+            return None
+        if item.get("type") != "window_summary":
+            return None
 
-        critical_by_id: Dict[int, CriticalEvent] = {}
-        for critical in memory.critical_events:
-            critical_by_id[int(critical.event_id)] = critical
+        try:
+            window_id = int(item.get("window_id"))
+        except (TypeError, ValueError):
+            return None
 
-        selected_critical_events: List[CriticalEvent] = []
-        selected_ids = set()
-        for item in trajectory_items:
-            supporting_event_ids = _normalize_int_list(item.get("supporting_event_ids", []))
-            for event_id in supporting_event_ids:
-                if event_id in selected_ids:
-                    continue
-                critical = critical_by_id.get(event_id)
-                if critical is None:
-                    continue
-                selected_ids.add(event_id)
-                selected_critical_events.append(deepcopy(critical))
+        start_hour = _to_optional_float(item.get("start_hour"))
+        end_hour = _to_optional_float(item.get("end_hour"))
+        if start_hour is None or end_hour is None:
+            return None
 
-        if selected_critical_events:
-            return trajectory_items, selected_critical_events
+        text = _safe_text(item.get("text"))
+        if not text:
+            text = f"Window {window_id} processed with event-grounded update."
 
-        deduped_critical_events: List[CriticalEvent] = []
+        supporting_event_ids = _normalize_int_list(item.get("supporting_event_ids", []))
+        supporting_events_payload = item.get("supporting_events")
+        supporting_events: List[Dict[str, Any]] = []
+        if isinstance(supporting_events_payload, list):
+            supporting_events = [deepcopy(event) for event in supporting_events_payload if isinstance(event, dict)]
+
+        return WindowSummary(
+            window_id=window_id,
+            start_hour=float(start_hour),
+            end_hour=float(end_hour),
+            text=text,
+            supporting_event_ids=supporting_event_ids,
+            supporting_events=supporting_events,
+        )
+
+    @staticmethod
+    def _dedupe_critical_events(critical_events: List[CriticalEvent]) -> List[CriticalEvent]:
+        deduped: List[CriticalEvent] = []
         seen = set()
-        for critical in memory.critical_events:
+        for critical in critical_events:
             event_id = int(critical.event_id)
             if event_id in seen:
                 continue
             seen.add(event_id)
-            deduped_critical_events.append(deepcopy(critical))
-        return trajectory_items, deduped_critical_events
+            deduped.append(deepcopy(critical))
+        return deduped
+
+    def _select_critical_events_by_ids(self, memory: MedEvoMemory, event_ids: List[int]) -> List[CriticalEvent]:
+        critical_by_id: Dict[int, CriticalEvent] = {}
+        for critical in memory.critical_events:
+            critical_by_id[int(critical.event_id)] = critical
+
+        selected: List[CriticalEvent] = []
+        seen = set()
+        for event_id in _normalize_int_list(event_ids):
+            if event_id in seen:
+                continue
+            critical = critical_by_id.get(event_id)
+            if critical is None:
+                continue
+            seen.add(event_id)
+            selected.append(deepcopy(critical))
+        return selected
+
+    def _build_episode_context(self, memory: MedEvoMemory) -> Tuple[List[WindowSummary], List[CriticalEvent]]:
+        if self.episode_every_n_windows <= 0:
+            return [], []
+
+        all_window_summaries: List[WindowSummary] = []
+        for item in memory.trajectory_memory:
+            summary = self._window_summary_from_trajectory_item(item)
+            if summary is None:
+                continue
+            all_window_summaries.append(summary)
+
+        if len(all_window_summaries) < self.episode_every_n_windows:
+            return [], []
+
+        recent_window_summaries = all_window_summaries[-self.episode_every_n_windows :]
+        supporting_event_ids: List[int] = []
+        for summary in recent_window_summaries:
+            supporting_event_ids.extend(summary.supporting_event_ids)
+
+        selected_critical_events = self._select_critical_events_by_ids(memory, supporting_event_ids)
+        return recent_window_summaries, selected_critical_events
+
+    def _build_insight_context(self, memory: MedEvoMemory) -> Tuple[List[Dict[str, Any]], List[CriticalEvent]]:
+        trajectory_items = [deepcopy(item) for item in memory.trajectory_memory if isinstance(item, dict)]
+        supporting_event_ids: List[int] = []
+        for item in trajectory_items:
+            supporting_event_ids.extend(_normalize_int_list(item.get("supporting_event_ids", [])))
+
+        selected_critical_events = self._select_critical_events_by_ids(memory, supporting_event_ids)
+        if selected_critical_events:
+            return trajectory_items, selected_critical_events
+
+        return trajectory_items, self._dedupe_critical_events(memory.critical_events)
 
     def create_memory_snapshots(
         self,
@@ -1608,9 +1673,6 @@ class MedEvoAgent:
                 print(f"  Pre-ICU summary prepared ({len(pre_icu_summary)} chars)")
 
         processed_window_count = 0
-        pending_summaries_for_episode: List[WindowSummary] = []
-        pending_critical_for_episode: List[CriticalEvent] = []
-        pending_critical_ids_for_episode = set()
         for idx, window in enumerate(windows):
             current_events = window.get("current_events", [])
             if not current_events:
@@ -1675,24 +1737,16 @@ class MedEvoAgent:
             )
             memory.trajectory_memory = self._truncate_trajectory_memory(memory.trajectory_memory)
 
-            pending_summaries_for_episode.append(deepcopy(summary))
-            for critical in critical_events:
-                if critical.event_id in pending_critical_ids_for_episode:
-                    continue
-                pending_critical_ids_for_episode.add(critical.event_id)
-                pending_critical_for_episode.append(deepcopy(critical))
-
-            run_episode_agent = self.episode_every_n_windows > 0 and (
-                len(pending_summaries_for_episode) >= self.episode_every_n_windows
-            )
+            recent_episode_summaries, recent_episode_critical = self._build_episode_context(memory)
+            run_episode_agent = bool(recent_episode_summaries)
             if run_episode_agent:
-                episode_start = pending_summaries_for_episode[0]
-                episode_end = pending_summaries_for_episode[-1]
+                episode_start = recent_episode_summaries[0]
+                episode_end = recent_episode_summaries[-1]
 
                 episode_parsed, episode_raw, episode_usage, episode_prompt, episode_parse_error = (
                     self.episode_agent.analyze(
-                        recent_window_summaries=pending_summaries_for_episode,
-                        recent_critical_events=pending_critical_for_episode,
+                        recent_window_summaries=recent_episode_summaries,
+                        recent_critical_events=recent_episode_critical,
                         patient_metadata=memory.patient_metadata,
                     )
                 )
@@ -1700,8 +1754,8 @@ class MedEvoAgent:
 
                 if episode_parse_error is not None:
                     episode_parsed = self._build_default_episode_payload(
-                        pending_summaries_for_episode,
-                        pending_critical_for_episode,
+                        recent_episode_summaries,
+                        recent_episode_critical,
                     )
 
                 grounded_episode = self._ground_episode(
@@ -1710,12 +1764,12 @@ class MedEvoAgent:
                     end_window=episode_end.window_id,
                     start_hour=episode_start.start_hour,
                     end_hour=episode_end.end_hour,
-                    recent_window_summaries=pending_summaries_for_episode,
-                    recent_critical_events=pending_critical_for_episode,
+                    recent_window_summaries=recent_episode_summaries,
+                    recent_critical_events=recent_episode_critical,
                 )
                 self._replace_window_summaries_with_episode(
                     memory=memory,
-                    covered_summaries=pending_summaries_for_episode,
+                    covered_summaries=recent_episode_summaries,
                     episode=grounded_episode,
                 )
 
@@ -1736,12 +1790,8 @@ class MedEvoAgent:
                     },
                 )
 
-                pending_summaries_for_episode = []
-                pending_critical_for_episode = []
-                pending_critical_ids_for_episode = set()
-
-            run_insight_agent = (processed_window_count % self.insight_every_n_windows) == 0
             processed_window_count += 1
+            run_insight_agent = (processed_window_count % self.insight_every_n_windows) == 0
 
             insight_parsed: Dict[str, Any] = {"insight_updates": [], "new_insights": []}
             insight_parse_error: Optional[str] = None

@@ -263,7 +263,28 @@ class Config:
     @property
     def llm_max_tokens(self) -> int:
         """Maximum tokens for LLM responses."""
-        return self.get("llm.max_tokens")
+        value = self.get("llm.max_tokens")
+        if value is None:
+            raise ValueError("Missing required config: llm.max_tokens")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid config llm.max_tokens={value!r}; expected positive integer") from exc
+        if parsed <= 0:
+            raise ValueError(f"Invalid config llm.max_tokens={parsed}; must be > 0")
+        return parsed
+
+    @property
+    def llm_temperature(self) -> float:
+        """Sampling temperature for LLM responses."""
+        value = self.get("llm.temperature")
+        if value is None:
+            raise ValueError("Missing required config: llm.temperature")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid config llm.temperature={value!r}; expected float") from exc
+        return parsed
 
     # ========================================================================
     # Logging Configuration
