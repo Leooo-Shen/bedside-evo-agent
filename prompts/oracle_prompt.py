@@ -103,7 +103,6 @@ Now, evaluate the CURRENT OBSERVATION WINDOW according to the instructions above
 
 
 def format_pre_icu_compression_prompt(pre_icu_history: Dict[str, Any], max_summary_chars: int = 1800) -> str:
-    """Build prompt for one-shot pre-ICU compression reused across all windows."""
     payload = {
         "source": str(pre_icu_history.get("source") or "").strip(),
         "items": int(_safe_float(pre_icu_history.get("items"))),

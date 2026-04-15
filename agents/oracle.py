@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 VALID_STATUS = {"improving", "stable", "deteriorating", "insufficient_data"}
 VALID_ACTION_REVIEW_LABEL = {"best_practice", "acceptable", "potentially_harmful", "insufficient_data"}
+ORACLE_SCHEMA_MAX_ATTEMPTS = 4
 OUTCOME_MASK_TOKEN = "[OUTCOME_MASKED]"
 OUTCOME_LEAK_TERMS_PATTERN = re.compile(
     r"(?i)\b(expired|deceased|dead|died|passed\s+away|death|hospice|comfort\s+measures)\b"
@@ -619,74 +620,98 @@ class MetaOracle:
             top_k=self.top_k_recommendations,
             include_icu_outcome=self.include_icu_outcome_in_prompt,
         )
-
         response: Dict[str, Any] = {}
-        call_logged = False
+        parsed_payload: Dict[str, Any] = {}
+        parse_source = "best_effort_json"
         evaluation_number: Optional[int] = None
+        attempt_errors: List[str] = []
+        total_attempt_tokens = 0
         try:
-            response = self.llm_client.chat(
-                prompt=prompt,
-                response_format="text",
-                timeout_seconds=self.request_timeout_seconds,
-            )
+            for attempt_index in range(1, ORACLE_SCHEMA_MAX_ATTEMPTS + 1):
+                response = {}
+                parsed_payload = {}
+                parse_source = "best_effort_json"
+                schema_error: Optional[str] = None
+                call_error: Optional[str] = None
 
-            # print("====" * 50)
-            # print(response)
+                try:
+                    response = self.llm_client.chat(
+                        prompt=prompt,
+                        response_format="text",
+                        timeout_seconds=self.request_timeout_seconds,
+                    )
+                    total_attempt_tokens += _usage_tokens(response.get("usage", {}))
+                    parsed_candidate = response.get("parsed")
+                    if isinstance(parsed_candidate, dict):
+                        parsed_payload = parsed_candidate
+                        parse_source = "provider"
+                    else:
+                        parsed_payload = _best_effort_parse_json(response.get("content", ""))
+                        parse_source = "best_effort_json"
+                    schema_ok, schema_error = _validate_oracle_output_schema(parsed_payload)
+                except Exception as exc:
+                    call_error = str(exc)
+                    schema_ok = False
+                    schema_error = f"LLM call error: {call_error}"
+
+                self._record_llm_call(
+                    step_type="oracle_evaluator",
+                    subject_id=window_data.get("subject_id"),
+                    icu_stay_id=window_data.get("icu_stay_id"),
+                    prompt=prompt,
+                    response=response,
+                    parsed_response=parsed_payload if isinstance(parsed_payload, dict) else None,
+                    window_data=window_data,
+                    metadata={
+                        "window_start_time": window_data.get("current_window_start"),
+                        "window_end_time": window_data.get("current_window_end"),
+                        "context_mode": context_info.get("mode"),
+                        "use_discharge_summary": context_info.get("use_discharge_summary", self.use_discharge_summary),
+                        "context_tokens": context_info.get("context_tokens"),
+                        "context_event_count": context_info.get("context_event_count"),
+                        "context_history_event_count": context_info.get("context_history_event_count"),
+                        "context_current_window_event_count": context_info.get("context_current_window_event_count"),
+                        "context_future_event_count": context_info.get("context_future_event_count"),
+                        "context_anchor_time": context_info.get("context_anchor_time"),
+                        "context_window_start": context_info.get("context_window_start"),
+                        "context_window_end": context_info.get("context_window_end"),
+                        "history_hours": context_info.get("history_hours"),
+                        "future_hours": context_info.get("future_hours"),
+                        "context_history_events": context_info.get("context_history_events", []),
+                        "context_current_window_events": context_info.get("context_current_window_events", []),
+                        "context_future_events": context_info.get("context_future_events", []),
+                        "pre_icu_history_source": window_data.get("pre_icu_history_source"),
+                        "pre_icu_history_items": window_data.get("pre_icu_history_items"),
+                        "current_discharge_summary_selection_rule": context_info.get(
+                            "current_discharge_summary_selection_rule"
+                        ),
+                        "has_current_discharge_summary": context_info.get("has_current_discharge_summary", False),
+                        "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
+                        "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
+                        "parse_source": parse_source,
+                        "schema_valid": bool(schema_ok),
+                        "schema_error": schema_error,
+                        "attempt_index": attempt_index,
+                        "attempt_max": ORACLE_SCHEMA_MAX_ATTEMPTS,
+                    },
+                )
+
+                if schema_ok:
+                    break
+                attempt_errors.append(schema_error or "Schema validation failed.")
+            else:
+                joined_errors = " | ".join(attempt_errors)
+                raise RuntimeError(
+                    f"Oracle schema validation failed after {ORACLE_SCHEMA_MAX_ATTEMPTS} attempts: {joined_errors}"
+                )
 
             with self._stats_lock:
                 self.evaluation_count += 1
-                self.total_tokens_used += _usage_tokens(response.get("usage", {}))
+                self.total_tokens_used += int(total_attempt_tokens)
                 evaluation_number = self.evaluation_count
 
-            parsed = response.get("parsed")
-            if parsed is None:
-                parsed = _best_effort_parse_json(response.get("content", ""))
-
-            parse_source = "provider"
-            if response.get("parsed") is None:
-                parse_source = "best_effort_json"
-
-            self._record_llm_call(
-                step_type="oracle_evaluator",
-                subject_id=window_data.get("subject_id"),
-                icu_stay_id=window_data.get("icu_stay_id"),
-                prompt=prompt,
-                response=response,
-                parsed_response=parsed if isinstance(parsed, dict) else None,
-                window_data=window_data,
-                metadata={
-                    "window_start_time": window_data.get("current_window_start"),
-                    "window_end_time": window_data.get("current_window_end"),
-                    "context_mode": context_info.get("mode"),
-                    "use_discharge_summary": context_info.get("use_discharge_summary", self.use_discharge_summary),
-                    "context_tokens": context_info.get("context_tokens"),
-                    "context_event_count": context_info.get("context_event_count"),
-                    "context_history_event_count": context_info.get("context_history_event_count"),
-                    "context_current_window_event_count": context_info.get("context_current_window_event_count"),
-                    "context_future_event_count": context_info.get("context_future_event_count"),
-                    "context_anchor_time": context_info.get("context_anchor_time"),
-                    "context_window_start": context_info.get("context_window_start"),
-                    "context_window_end": context_info.get("context_window_end"),
-                    "history_hours": context_info.get("history_hours"),
-                    "future_hours": context_info.get("future_hours"),
-                    "context_history_events": context_info.get("context_history_events", []),
-                    "context_current_window_events": context_info.get("context_current_window_events", []),
-                    "context_future_events": context_info.get("context_future_events", []),
-                    "pre_icu_history_source": window_data.get("pre_icu_history_source"),
-                    "pre_icu_history_items": window_data.get("pre_icu_history_items"),
-                    "current_discharge_summary_selection_rule": context_info.get(
-                        "current_discharge_summary_selection_rule"
-                    ),
-                    "has_current_discharge_summary": context_info.get("has_current_discharge_summary", False),
-                    "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
-                    "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
-                    "parse_source": parse_source,
-                },
-            )
-            call_logged = True
-
             report = OracleReport.from_dict(
-                data=parsed if isinstance(parsed, dict) else {},
+                data=parsed_payload if isinstance(parsed_payload, dict) else {},
                 window_data=window_data,
                 context_mode=context_info.get("mode", "raw_local_trajectory_icu_events_only"),
                 context_stats={
@@ -723,73 +748,39 @@ class MetaOracle:
             return report
 
         except Exception as e:
-            if not call_logged:
-                self._record_llm_call(
-                    step_type="oracle_evaluator",
-                    subject_id=window_data.get("subject_id"),
-                    icu_stay_id=window_data.get("icu_stay_id"),
-                    prompt=prompt,
-                    response=response if isinstance(response, dict) else {},
-                    parsed_response=(
-                        _best_effort_parse_json(response.get("content", "")) if isinstance(response, dict) else None
-                    ),
-                    window_data=window_data,
-                    metadata={
-                        "window_start_time": window_data.get("current_window_start"),
-                        "window_end_time": window_data.get("current_window_end"),
-                        "context_mode": context_info.get("mode"),
-                        "use_discharge_summary": context_info.get("use_discharge_summary", self.use_discharge_summary),
-                        "history_hours": context_info.get("history_hours"),
-                        "future_hours": context_info.get("future_hours"),
-                        "context_history_events": context_info.get("context_history_events", []),
-                        "context_current_window_events": context_info.get("context_current_window_events", []),
-                        "context_future_events": context_info.get("context_future_events", []),
-                        "pre_icu_history_source": window_data.get("pre_icu_history_source"),
-                        "pre_icu_history_items": window_data.get("pre_icu_history_items"),
-                        "current_discharge_summary_selection_rule": context_info.get(
-                            "current_discharge_summary_selection_rule"
-                        ),
-                        "has_current_discharge_summary": context_info.get("has_current_discharge_summary", False),
-                        "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
-                        "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
-                        "error": str(e),
-                    },
-                )
-
-            report = OracleReport(
-                patient_assessment=_normalize_patient_assessment({}),
-                action_review=_normalize_action_review({}),
-                window_data=window_data,
-                context_mode=context_info.get("mode", "raw_local_trajectory_icu_events_only"),
-                context_stats={
-                    "context_tokens": context_info.get("context_tokens"),
-                    "context_event_count": context_info.get("context_event_count"),
-                    "context_history_event_count": context_info.get("context_history_event_count"),
-                    "context_current_window_event_count": context_info.get("context_current_window_event_count"),
-                    "context_future_event_count": context_info.get("context_future_event_count"),
-                    "use_discharge_summary": context_info.get("use_discharge_summary", self.use_discharge_summary),
-                    "has_current_discharge_summary": context_info.get("has_current_discharge_summary", False),
-                    "current_discharge_summary_selection_rule": context_info.get(
-                        "current_discharge_summary_selection_rule"
-                    ),
-                    "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
-                    "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
-                    "context_anchor_time": context_info.get("context_anchor_time"),
-                    "context_window_start": context_info.get("context_window_start"),
-                    "context_window_end": context_info.get("context_window_end"),
-                },
-                error=f"Oracle evaluation error: {e}",
-            )
             self._save_log(
                 window_data,
                 prompt,
-                {"content": None, "error": str(e)},
-                report,
+                response if isinstance(response, dict) else {"content": None, "error": str(e)},
+                OracleReport(
+                    patient_assessment=_normalize_patient_assessment({}),
+                    action_review=_normalize_action_review({}),
+                    window_data=window_data,
+                    context_mode=context_info.get("mode", "raw_local_trajectory_icu_events_only"),
+                    context_stats={
+                        "context_tokens": context_info.get("context_tokens"),
+                        "context_event_count": context_info.get("context_event_count"),
+                        "context_history_event_count": context_info.get("context_history_event_count"),
+                        "context_current_window_event_count": context_info.get("context_current_window_event_count"),
+                        "context_future_event_count": context_info.get("context_future_event_count"),
+                        "use_discharge_summary": context_info.get("use_discharge_summary", self.use_discharge_summary),
+                        "has_current_discharge_summary": context_info.get("has_current_discharge_summary", False),
+                        "current_discharge_summary_selection_rule": context_info.get(
+                            "current_discharge_summary_selection_rule"
+                        ),
+                        "include_icu_outcome_in_prompt": self.include_icu_outcome_in_prompt,
+                        "mask_discharge_summary_outcome_terms": self.mask_discharge_summary_outcome_terms,
+                        "context_anchor_time": context_info.get("context_anchor_time"),
+                        "context_window_start": context_info.get("context_window_start"),
+                        "context_window_end": context_info.get("context_window_end"),
+                    },
+                    error=f"Oracle evaluation error: {e}",
+                ),
                 context_info=context_info,
                 error=str(e),
                 evaluation_number=evaluation_number,
             )
-            return report
+            raise
 
     def evaluate_trajectory(self, windows: List[Dict[str, Any]]) -> List[OracleReport]:
         reports: List[OracleReport] = []
@@ -846,17 +837,10 @@ class MetaOracle:
                     if show_progress:
                         print(f"Completed window {completed_count}/{len(windows)} " f"(Hour {window_hour})")
                 except Exception as e:
-                    print(f"Error evaluating window {index} (Hour {window_hour}): {e}")
-                    results[index] = OracleReport(
-                        patient_assessment=_normalize_patient_assessment({}),
-                        action_review=_normalize_action_review({}),
-                        window_data=window,
-                        context_mode="raw_local_trajectory_icu_events_only",
-                        context_stats={
-                            "use_discharge_summary": self.use_discharge_summary,
-                        },
-                        error=f"Parallel evaluation error: {e}",
-                    )
+                    for pending_future in future_to_index:
+                        if not pending_future.done():
+                            pending_future.cancel()
+                    raise RuntimeError(f"Error evaluating window {index} (Hour {window_hour}): {e}") from e
 
         if show_progress:
             print(f"Parallel evaluation complete: {completed_count}/{len(windows)} windows evaluated")
@@ -867,19 +851,7 @@ class MetaOracle:
                 reports.append(report)
                 continue
 
-            window = windows_with_index[index]
-            reports.append(
-                OracleReport(
-                    patient_assessment=_normalize_patient_assessment({}),
-                    action_review=_normalize_action_review({}),
-                    window_data=window,
-                    context_mode="raw_local_trajectory_icu_events_only",
-                    context_stats={
-                        "use_discharge_summary": self.use_discharge_summary,
-                    },
-                    error="Parallel evaluation produced no result for window.",
-                )
-            )
+            raise RuntimeError(f"Parallel evaluation produced no result for window index={index}.")
 
         return reports
 
@@ -1356,6 +1328,79 @@ def _normalize_action_review(value: Any) -> Dict[str, Any]:
         "evaluations": evaluations,
         "red_flags": red_flags,
     }
+
+
+def _validate_oracle_output_schema(payload: Any) -> Tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "Top-level payload is not a JSON object."
+
+    patient_assessment = payload.get("patient_assessment")
+    if not isinstance(patient_assessment, dict):
+        return False, "Missing patient_assessment object."
+
+    overall = patient_assessment.get("overall")
+    if not isinstance(overall, dict):
+        return False, "Missing patient_assessment.overall object."
+
+    overall_label = _safe_text(overall.get("label")).lower().replace("-", "_").replace(" ", "_")
+    if overall_label not in VALID_STATUS:
+        return False, "Invalid patient_assessment.overall.label."
+
+    overall_rationale = _safe_text(overall.get("rationale"))
+    if not overall_rationale:
+        return False, "Missing patient_assessment.overall.rationale."
+
+    active_risks = patient_assessment.get("active_risks")
+    if not isinstance(active_risks, list):
+        return False, "patient_assessment.active_risks must be a list."
+    for risk in active_risks:
+        if not isinstance(risk, dict):
+            return False, "Each active_risks item must be an object."
+        risk_name = _safe_text(risk.get("risk_name"))
+        if not risk_name:
+            return False, "Each active_risks item must include risk_name."
+        if not isinstance(risk.get("key_evidence"), list):
+            return False, "Each active_risks item must include key_evidence list."
+
+    action_review = payload.get("action_review")
+    if not isinstance(action_review, dict):
+        return False, "Missing action_review object."
+
+    evaluations = action_review.get("evaluations")
+    if not isinstance(evaluations, list):
+        return False, "action_review.evaluations must be a list."
+    for evaluation in evaluations:
+        if not isinstance(evaluation, dict):
+            return False, "Each evaluations item must be an object."
+        action_id = _safe_text(evaluation.get("action_id"))
+        action_name = _safe_text(evaluation.get("action_name"))
+        label = _safe_text(evaluation.get("label")).lower().replace("-", "_").replace(" ", "_")
+        rationale = _safe_text(evaluation.get("rationale"))
+        if not action_id:
+            return False, "Each evaluations item must include action_id."
+        if not action_name:
+            return False, "Each evaluations item must include action_name."
+        if label not in VALID_ACTION_REVIEW_LABEL:
+            return False, "Invalid evaluations.label."
+        if not rationale:
+            return False, "Each evaluations item must include rationale."
+
+    red_flags = action_review.get("red_flags")
+    if not isinstance(red_flags, list):
+        return False, "action_review.red_flags must be a list."
+    for red_flag in red_flags:
+        if not isinstance(red_flag, dict):
+            return False, "Each red_flags item must be an object."
+        contraindicated_action = _safe_text(red_flag.get("contraindicated_action"))
+        reason = _safe_text(red_flag.get("reason"))
+        if not contraindicated_action:
+            return False, "Each red_flags item must include contraindicated_action."
+        if not reason:
+            return False, "Each red_flags item must include reason."
+        if not isinstance(red_flag.get("key_evidence"), list):
+            return False, "Each red_flags item must include key_evidence list."
+
+    return True, ""
 
 
 def _best_effort_parse_json(content: str) -> Dict[str, Any]:

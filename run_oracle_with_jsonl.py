@@ -547,11 +547,8 @@ def process_jsonl_for_oracle(
                 except Exception as compression_exception:
                     compression_error = str(compression_exception)
 
-            for window_idx, window in enumerate(windows):
-                try:
-                    report = oracle.evaluate_window(window)
-                except Exception as e:
-                    report = _build_error_report(window, error_message=f"Oracle evaluation error: {e}")
+            for window in windows:
+                report = oracle.evaluate_window(window)
                 reports.append(report)
         finally:
             llm_calls = oracle.pop_patient_llm_call_logs(subject_id=subject_id, icu_stay_id=icu_stay_id)
@@ -649,16 +646,10 @@ def process_jsonl_for_oracle(
                 try:
                     patient_eval = future.result()
                 except Exception as e:
-                    patient_eval = {
-                        "patient_id": patient_id,
-                        "reports": [
-                            _build_error_report(window, error_message=f"Stay-level evaluation error: {e}")
-                            for window in windows
-                        ],
-                        "llm_calls": [],
-                        "compression_used": False,
-                        "compression_error": str(e),
-                    }
+                    for pending_future in future_to_patient:
+                        if not pending_future.done():
+                            pending_future.cancel()
+                    raise RuntimeError(f"Stay-level evaluation failed for {patient_id}: {e}") from e
 
                 print(f"\nSaving Patient {patient_id}")
                 try:
