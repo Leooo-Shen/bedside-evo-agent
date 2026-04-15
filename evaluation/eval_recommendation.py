@@ -164,17 +164,17 @@ def _default_output_root_from_recommendation_input(recommendation_input: Path) -
         memory_run_name = recommendation_input.parent.parent.name
         if not memory_run_name:
             raise ValueError(f"Cannot infer memory run name from recommendation_input={recommendation_input}")
-        return Path("evaluation_results") / memory_run_name / "recommendation_experiment" / recommendation_input.name
+        return Path("evaluation_results") / memory_run_name / "recommendation_experiment"
     return _default_output_dir_from_recommendation_root(recommendation_input)
 
 
-def _output_root_with_backend(base_output_dir: Path, matcher_backend: str) -> Path:
-    backend = str(matcher_backend).strip()
-    if not backend:
-        raise ValueError("matcher_backend cannot be empty when constructing output directory.")
-    if base_output_dir.name == backend:
+def _output_root_with_gt_source(base_output_dir: Path, gt_source: str) -> Path:
+    source = str(gt_source).strip()
+    if not source:
+        raise ValueError("gt_source cannot be empty when constructing output directory.")
+    if base_output_dir.name == source:
         return base_output_dir
-    return base_output_dir / backend
+    return base_output_dir / source
 
 
 def _infer_snapshot_window_index(snapshot: Mapping[str, Any]) -> Optional[int]:
@@ -1995,14 +1995,13 @@ def run_evaluation(
 ) -> None:
     if gt_source not in {GT_SOURCE_DATASET_ACTIONS, GT_SOURCE_ORACLE_REVIEWED_ACTIONS}:
         raise ValueError(f"Unsupported gt_source={gt_source}")
-    backend = MATCHER_BACKEND_LLM
 
     mode_dirs = _discover_recommendation_mode_dirs(prediction_dir)
     if mode_dirs:
         base_output_root = (
             output_dir if output_dir is not None else _default_output_root_from_recommendation_input(prediction_dir)
         )
-        output_root = _output_root_with_backend(base_output_root, matcher_backend=backend)
+        output_root = _output_root_with_gt_source(base_output_root, gt_source=gt_source)
         output_root.mkdir(parents=True, exist_ok=True)
         print("Detected recommendation modes: " + ", ".join(sorted(mode_dirs.keys())) + f" under {prediction_dir}")
 
@@ -2062,7 +2061,11 @@ def run_evaluation(
     base_final_output_dir = (
         output_dir if output_dir is not None else _default_output_root_from_recommendation_input(prediction_root)
     )
-    final_output_dir = _output_root_with_backend(base_final_output_dir, matcher_backend=backend)
+    final_output_root = _output_root_with_gt_source(base_final_output_dir, gt_source=gt_source)
+    if prediction_root.parent.name == "recommendation_experiment":
+        final_output_dir = final_output_root / prediction_root.name
+    else:
+        final_output_dir = final_output_root
     _evaluate_single_prediction_dir(
         prediction_root=prediction_root,
         output_dir=final_output_dir,
@@ -2087,11 +2090,11 @@ def main() -> None:
         default=None,
         help=(
             "Directory where metrics and plots will be saved. "
-            "Results are saved under an llm subfolder. "
+            "Results are saved under a gt-source subfolder. "
             "Default for multi-mode input: "
-            "evaluation_results/<memory_run_name>/recommendation_experiment/llm/<mode>. "
+            "evaluation_results/<memory_run_name>/recommendation_experiment/<gt_source>/<mode>. "
             "Default for single-mode input: "
-            "evaluation_results/<memory_run_name>/recommendation_experiment/<mode>/llm."
+            "evaluation_results/<memory_run_name>/recommendation_experiment/<gt_source>/<mode>."
         ),
     )
     parser.add_argument(
