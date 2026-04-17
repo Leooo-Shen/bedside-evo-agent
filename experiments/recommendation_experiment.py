@@ -28,7 +28,7 @@ from experiments.create_memory import (
     resolve_memory_run_dir,
     select_snapshots_with_stride,
 )
-from experiments.oracle.action_validity_common import ACTIONABLE_EVENT_CODES
+from experiments.oracle.action_validity_common import ACTIONABLE_EVENT_CODES, normalize_action_label
 from prompts.predictor_prompts import get_recommendation_action_prompt
 from utils.event_format import format_event_lines
 from utils.json_parse import parse_json_dict_best_effort
@@ -45,6 +45,7 @@ SUPPORTED_CONTEXT_MODES = (
     CONTEXT_MODE_FULL_HISTORY_EVENTS,
     CONTEXT_MODE_LOCAL_EVENTS_ONLY,
 )
+ORACLE_POSITIVE_ACTION_LABELS = frozenset({"best_practice", "acceptable"})
 
 
 def _normalize_token_count(value: Any) -> int:
@@ -151,14 +152,6 @@ def _extract_current_window(snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
     return current_window
 
 
-def _extract_current_events(snapshot: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    current_window = _extract_current_window(snapshot)
-    events = current_window.get("events")
-    if not isinstance(events, list):
-        return []
-    return [dict(event) for event in events if isinstance(event, Mapping)]
-
-
 def _event_code(event: Mapping[str, Any]) -> str:
     return str(event.get("code") or "").strip().upper()
 
@@ -246,6 +239,106 @@ def _results_dir_name_for_context_mode(context_mode: str) -> str:
     return f"recommendation_experiment/{context_mode}"
 
 
+def _read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing file: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in {path}")
+    return payload
+
+
+def _resolve_oracle_window_index(row: Mapping[str, Any], oracle_prediction_path: Path) -> int:
+    metadata = row.get("window_metadata")
+    metadata_source_window_index = metadata.get("source_window_index") if isinstance(metadata, Mapping) else None
+    metadata_stride_source_window_index = (
+        metadata.get("stride_source_window_index") if isinstance(metadata, Mapping) else None
+    )
+    candidates = (
+        ("source_window_index", row.get("source_window_index")),
+        ("stride_source_window_index", row.get("stride_source_window_index")),
+        ("window_metadata.source_window_index", metadata_source_window_index),
+        ("window_metadata.stride_source_window_index", metadata_stride_source_window_index),
+        ("window_index", row.get("window_index")),
+    )
+    for field_name, value in candidates:
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid {field_name}={value!r} in window_outputs row in {oracle_prediction_path}"
+            ) from exc
+    raise ValueError(f"Missing window index fields in window_outputs row in {oracle_prediction_path}")
+
+
+def _load_oracle_positive_actions_by_window(oracle_prediction_path: Path) -> Dict[int, List[Dict[str, Any]]]:
+    payload = _read_json(oracle_prediction_path)
+    window_outputs = payload.get("window_outputs")
+    if not isinstance(window_outputs, list):
+        raise ValueError(f"Invalid window_outputs list in {oracle_prediction_path}")
+
+    actions_by_window: Dict[int, List[Dict[str, Any]]] = {}
+    for row in window_outputs:
+        if not isinstance(row, Mapping):
+            raise ValueError(f"Invalid row in window_outputs in {oracle_prediction_path}")
+        window_index = _resolve_oracle_window_index(row=row, oracle_prediction_path=oracle_prediction_path)
+
+        oracle_output = row.get("oracle_output")
+        if not isinstance(oracle_output, Mapping):
+            continue
+        action_review = oracle_output.get("action_review")
+        if not isinstance(action_review, Mapping):
+            continue
+        evaluations = action_review.get("evaluations")
+        if evaluations is None:
+            continue
+        if not isinstance(evaluations, list):
+            raise ValueError(
+                f"Invalid action_review.evaluations for source window={window_index} in {oracle_prediction_path}"
+            )
+
+        selected_actions: List[Dict[str, Any]] = []
+        for evaluation in evaluations:
+            if not isinstance(evaluation, Mapping):
+                raise ValueError(
+                    f"Invalid evaluation row for source window={window_index} in {oracle_prediction_path}"
+                )
+            label = normalize_action_label(evaluation.get("label"))
+            if label not in ORACLE_POSITIVE_ACTION_LABELS:
+                continue
+            action_name = str(evaluation.get("action_name") or "").strip()
+            if not action_name:
+                raise ValueError(
+                    f"Missing action_name for source window={window_index} with label={label} "
+                    f"in {oracle_prediction_path}"
+                )
+            rationale = str(evaluation.get("rationale") or evaluation.get("reason") or "").strip()
+            gt_text = f"{action_name}. {rationale}".strip() if rationale else action_name
+            selected_actions.append(
+                {
+                    "action_name": action_name,
+                    "action_description": rationale,
+                    "gt_action_text": gt_text,
+                    "oracle_label": label,
+                    "oracle_action_id": str(evaluation.get("action_id") or "").strip(),
+                    "oracle_source_window_index": int(window_index),
+                }
+            )
+
+        if not selected_actions:
+            continue
+        if window_index in actions_by_window:
+            raise ValueError(
+                f"Duplicate oracle action reviews for source window={window_index} in {oracle_prediction_path}"
+            )
+        actions_by_window[window_index] = selected_actions
+
+    return actions_by_window
+
+
 def build_masked_recommendation_snapshot(
     previous_snapshot: Mapping[str, Any],
     current_snapshot: Mapping[str, Any],
@@ -276,28 +369,26 @@ def build_masked_recommendation_snapshot(
     return context_snapshot, masked_action_count, len(masked_events)
 
 
-def collect_union_ground_truth_action_events(
-    snapshot_by_window: Mapping[int, Mapping[str, Any]],
+def collect_union_ground_truth_actions(
+    oracle_actions_by_window: Mapping[int, Sequence[Mapping[str, Any]]],
     current_window_index: int,
     future_window_count: int,
-    actionable_codes: Sequence[str],
 ) -> Tuple[List[Dict[str, Any]], List[int]]:
     if future_window_count < 0:
         raise ValueError(f"future_window_count must be >= 0, got {future_window_count}")
 
-    action_code_set = {str(code).strip().upper() for code in actionable_codes if str(code).strip()}
     events: List[Dict[str, Any]] = []
     included_windows: List[int] = []
     for offset in range(0, int(future_window_count) + 1):
         window_index = int(current_window_index) + int(offset)
-        snapshot = snapshot_by_window.get(window_index)
-        if snapshot is None:
+        window_events = oracle_actions_by_window.get(window_index)
+        if not isinstance(window_events, list):
             continue
         included_windows.append(window_index)
-        for event in _extract_current_events(snapshot):
-            if _event_code(event) in action_code_set:
-                events.append(event)
-
+        for event in window_events:
+            if not isinstance(event, Mapping):
+                continue
+            events.append(dict(event))
     return events, included_windows
 
 
@@ -346,6 +437,7 @@ def process_single_patient(
     top_k_actions: int,
     prediction_horizon_hours: float,
     context_mode: str,
+    oracle_results_dir: Path,
     memory_run_dir: Path,
     results_dir: Path,
     patient_idx: int,
@@ -389,6 +481,10 @@ def process_single_patient(
         )
 
         snapshot_by_window = {int(window_idx): snapshot for window_idx, snapshot in windowed_snapshots}
+        oracle_prediction_path = (
+            oracle_results_dir / "patients" / f"{subject_id}_{icu_stay_id}" / "oracle_predictions.json"
+        )
+        oracle_actions_by_window = _load_oracle_positive_actions_by_window(oracle_prediction_path)
 
         if verbose:
             print(
@@ -402,6 +498,7 @@ def process_single_patient(
         total_input_tokens = 0
         total_output_tokens = 0
         total_masked_action_events = 0
+        num_windows_skipped_no_ground_truth = 0
         full_history_context_limit_reached = False
         full_history_context_limit_window_index: Optional[int] = None
         full_history_context_limit_message = ""
@@ -456,15 +553,26 @@ def process_single_patient(
             else:
                 raise ValueError(f"Unsupported context_mode={context_mode}")
 
-            if int(masked_action_count) <= 0:
-                if verbose:
-                    print(f"   Skipping Window {lookup_window_index}: " "no actionable events in current window")
-                continue
-
             inferred_window_index, hours, _ = extract_snapshot_window_features(selected_snapshot)
             window_index = int(lookup_window_index)
             if inferred_window_index >= 0:
                 window_index = inferred_window_index
+
+            window_duration_hours = infer_window_duration_hours(selected_snapshot)
+            future_window_count = compute_future_window_count_for_horizon(
+                prediction_horizon_hours=prediction_horizon_hours,
+                window_duration_hours=window_duration_hours,
+            )
+            ground_truth_events, included_horizon_windows = collect_union_ground_truth_actions(
+                oracle_actions_by_window=oracle_actions_by_window,
+                current_window_index=lookup_window_index,
+                future_window_count=future_window_count,
+            )
+            if not ground_truth_events:
+                num_windows_skipped_no_ground_truth += 1
+                if verbose:
+                    print(f"   Skipping Window {lookup_window_index}: no GT actions in horizon")
+                continue
 
             prompt = ""
             raw_response = ""
@@ -532,19 +640,6 @@ def process_single_patient(
                 red_flags = _coerce_red_flags(parsed_prediction.get("red_flags"))
                 confidence, rationale = _extract_recommendation_summary_fields(parsed_prediction, recommended_actions)
 
-            window_duration_hours = infer_window_duration_hours(selected_snapshot)
-            future_window_count = compute_future_window_count_for_horizon(
-                prediction_horizon_hours=prediction_horizon_hours,
-                window_duration_hours=window_duration_hours,
-            )
-
-            ground_truth_events, included_horizon_windows = collect_union_ground_truth_action_events(
-                snapshot_by_window=snapshot_by_window,
-                current_window_index=lookup_window_index,
-                future_window_count=future_window_count,
-                actionable_codes=actionable_codes,
-            )
-
             total_masked_action_events += int(masked_action_count)
 
             prediction_item = {
@@ -610,7 +705,7 @@ def process_single_patient(
                 )
 
         if not recommendation_predictions:
-            print("   WARNING: No eligible windows after leakage-safe filtering, skipping...")
+            print("   WARNING: No eligible windows after GT-aware filtering, skipping...")
             return None
 
         total_recommendations = sum(int(item.get("num_recommendations", 0)) for item in recommendation_predictions)
@@ -625,6 +720,7 @@ def process_single_patient(
         patient_metrics = {
             "num_windows_predicted": len(recommendation_predictions),
             "num_failed_windows": int(num_failed_windows),
+            "num_windows_skipped_no_ground_truth": int(num_windows_skipped_no_ground_truth),
             "num_recommendations": total_recommendations,
             "num_red_flags": total_red_flags,
             "num_ground_truth_action_events": total_ground_truth_action_events,
@@ -640,6 +736,7 @@ def process_single_patient(
             "memory_run": str(memory_run_dir),
             "source_patient_dir": str(source_patient_dir),
             "context_mode": str(context_mode),
+            "oracle_results_dir": str(oracle_results_dir),
             "num_memory_snapshots": len(windowed_snapshots),
             "snapshot_stride": snapshot_stride,
             "action_horizon": "current_plus_dynamic_future_windows",
@@ -669,6 +766,7 @@ def process_single_patient(
             "snapshot_stride": snapshot_stride,
             "num_windows_predicted": patient_metrics["num_windows_predicted"],
             "num_failed_windows": patient_metrics["num_failed_windows"],
+            "num_windows_skipped_no_ground_truth": patient_metrics["num_windows_skipped_no_ground_truth"],
             "num_recommendations": patient_metrics["num_recommendations"],
             "num_red_flags": patient_metrics["num_red_flags"],
             "num_ground_truth_action_events": patient_metrics["num_ground_truth_action_events"],
@@ -702,6 +800,7 @@ def process_single_patient(
             "snapshot_stride": snapshot_stride,
             "num_windows_predicted": patient_metrics["num_windows_predicted"],
             "num_failed_windows": patient_metrics["num_failed_windows"],
+            "num_windows_skipped_no_ground_truth": patient_metrics["num_windows_skipped_no_ground_truth"],
             "num_recommendations": patient_metrics["num_recommendations"],
             "num_red_flags": patient_metrics["num_red_flags"],
             "num_ground_truth_action_events": patient_metrics["num_ground_truth_action_events"],
@@ -732,6 +831,7 @@ def run_experiment(
     top_k_actions: int,
     prediction_horizon_hours: float,
     context_mode: str,
+    oracle_results_dir: str,
     verbose: bool,
     enable_logging: bool,
     patient_stay_ids_path: Optional[str],
@@ -762,6 +862,12 @@ def run_experiment(
     if normalized_num_workers < 1:
         raise ValueError(f"num_workers must be >= 1, got {normalized_num_workers}")
     normalized_context_mode = _normalize_context_mode(context_mode)
+    normalized_oracle_results_dir = Path(str(oracle_results_dir))
+    if not normalized_oracle_results_dir.exists() or not normalized_oracle_results_dir.is_dir():
+        raise FileNotFoundError(f"Oracle results directory not found: {normalized_oracle_results_dir}")
+    oracle_patients_dir = normalized_oracle_results_dir / "patients"
+    if not oracle_patients_dir.exists() or not oracle_patients_dir.is_dir():
+        raise FileNotFoundError(f"Oracle patients directory not found: {oracle_patients_dir}")
 
     config = get_config()
     memory_run_dir = resolve_memory_run_dir(memory_run)
@@ -775,6 +881,7 @@ def run_experiment(
     print(f"Top-K Actions: {normalized_top_k_actions}")
     print(f"Prediction Horizon (hours): {normalized_prediction_horizon_hours}")
     print(f"Context Mode: {normalized_context_mode}")
+    print(f"Oracle Results Dir: {normalized_oracle_results_dir}")
     print(f"Num Workers: {normalized_num_workers}")
 
     results_dir = memory_run_dir / _results_dir_name_for_context_mode(normalized_context_mode)
@@ -812,6 +919,7 @@ def run_experiment(
             "action_horizon": "current_plus_dynamic_future_windows",
             "prediction_horizon_hours": float(normalized_prediction_horizon_hours),
             "context_mode": str(normalized_context_mode),
+            "oracle_results_dir": str(normalized_oracle_results_dir),
             "local_events_only_scope": (
                 "working_memory_last_window_only"
                 if normalized_context_mode == CONTEXT_MODE_LOCAL_EVENTS_ONLY
@@ -859,6 +967,7 @@ def run_experiment(
             top_k_actions=normalized_top_k_actions,
             prediction_horizon_hours=normalized_prediction_horizon_hours,
             context_mode=normalized_context_mode,
+            oracle_results_dir=normalized_oracle_results_dir,
             memory_run_dir=memory_run_dir,
             results_dir=results_dir,
             patient_idx=idx,
@@ -887,6 +996,9 @@ def run_experiment(
     total_red_flags = sum(int(item.get("num_red_flags", 0)) for item in all_results)
     total_ground_truth_action_events = sum(int(item.get("num_ground_truth_action_events", 0)) for item in all_results)
     total_masked_action_events = sum(int(item.get("total_masked_action_events", 0)) for item in all_results)
+    total_windows_skipped_no_ground_truth = sum(
+        int(item.get("num_windows_skipped_no_ground_truth", 0)) for item in all_results
+    )
 
     token_totals = _sum_numeric_stats([item.get("recommendation_prediction_tokens", {}) for item in all_results])
 
@@ -900,6 +1012,7 @@ def run_experiment(
     print(f"Total Red-Flag Actions: {total_red_flags}")
     print(f"Total Ground-Truth Action Events: {total_ground_truth_action_events}")
     print(f"Total Masked Action Events: {total_masked_action_events}")
+    print(f"Skipped Windows (No GT in Horizon): {total_windows_skipped_no_ground_truth}")
     print("\nRecommendation Predictor Tokens:")
     print(f"  Input: {int(token_totals.get('input_tokens', 0))}")
     print(f"  Output: {int(token_totals.get('output_tokens', 0))}")
@@ -910,6 +1023,7 @@ def run_experiment(
         "experiment": "recommendation_experiment",
         "memory_run": str(memory_run_dir),
         "context_mode": str(normalized_context_mode),
+        "oracle_results_dir": str(normalized_oracle_results_dir),
         "snapshot_stride": normalized_stride,
         "num_workers": normalized_num_workers,
         "top_k_actions": int(normalized_top_k_actions),
@@ -926,6 +1040,7 @@ def run_experiment(
         "total_red_flags": total_red_flags,
         "total_ground_truth_action_events": total_ground_truth_action_events,
         "total_masked_action_events": total_masked_action_events,
+        "total_windows_skipped_no_ground_truth": total_windows_skipped_no_ground_truth,
         "recommendation_prediction_tokens": {
             "input_tokens": int(token_totals.get("input_tokens", 0)),
             "output_tokens": int(token_totals.get("output_tokens", 0)),
@@ -955,7 +1070,7 @@ def main() -> None:
     parser.add_argument(
         "--snapshot-stride",
         type=int,
-        default=4,
+        default=1,
         help="Use every k-th memory snapshot for recommendation prediction.",
     )
     parser.add_argument(
@@ -976,6 +1091,12 @@ def main() -> None:
         required=True,
         choices=list(SUPPORTED_CONTEXT_MODES),
         help=("Context construction mode: " "med_evo_memory | full_history_events | local_events_only."),
+    )
+    parser.add_argument(
+        "--oracle-results-dir",
+        type=str,
+        required=True,
+        help="Oracle run directory containing patients/*/oracle_predictions.json; GT uses acceptable/best_practice.",
     )
     parser.add_argument(
         "--num-workers",
@@ -1004,6 +1125,7 @@ def main() -> None:
         top_k_actions=args.top_k_actions,
         prediction_horizon_hours=args.prediction_horizon_hours,
         context_mode=args.context_mode,
+        oracle_results_dir=args.oracle_results_dir,
         verbose=not args.quiet,
         enable_logging=not args.no_logging,
         patient_stay_ids_path=args.patient_stay_ids,

@@ -30,8 +30,6 @@ from model.llms import LLMClient
 from prompts.action_matcher_prompts import get_action_matcher_prompt
 from utils.json_parse import parse_json_dict_best_effort
 
-GT_SOURCE_DATASET_ACTIONS = "dataset_actions"
-GT_SOURCE_ORACLE_REVIEWED_ACTIONS = "oracle_reviewed_actions"
 ORACLE_POSITIVE_LABELS = frozenset({"best_practice", "acceptable"})
 MATCHER_BACKEND_LLM = "llm"
 KNOWN_RECOMMENDATION_MODES = ("memory", "full_history_events", "local_events_only")
@@ -168,15 +166,6 @@ def _default_output_root_from_recommendation_input(recommendation_input: Path) -
     return _default_output_dir_from_recommendation_root(recommendation_input)
 
 
-def _output_root_with_gt_source(base_output_dir: Path, gt_source: str) -> Path:
-    source = str(gt_source).strip()
-    if not source:
-        raise ValueError("gt_source cannot be empty when constructing output directory.")
-    if base_output_dir.name == source:
-        return base_output_dir
-    return base_output_dir / source
-
-
 def _infer_snapshot_window_index(snapshot: Mapping[str, Any]) -> Optional[int]:
     working_memory = snapshot.get("working_memory")
     if not isinstance(working_memory, list) or not working_memory:
@@ -240,6 +229,31 @@ def _ground_truth_action_text(item: Mapping[str, Any]) -> str:
     return event_to_action_text(item)
 
 
+def _resolve_oracle_window_index(row: Mapping[str, Any], oracle_prediction_path: Path) -> int:
+    metadata = row.get("window_metadata")
+    metadata_source_window_index = metadata.get("source_window_index") if isinstance(metadata, Mapping) else None
+    metadata_stride_source_window_index = (
+        metadata.get("stride_source_window_index") if isinstance(metadata, Mapping) else None
+    )
+    candidates = (
+        ("source_window_index", row.get("source_window_index")),
+        ("stride_source_window_index", row.get("stride_source_window_index")),
+        ("window_metadata.source_window_index", metadata_source_window_index),
+        ("window_metadata.stride_source_window_index", metadata_stride_source_window_index),
+        ("window_index", row.get("window_index")),
+    )
+    for field_name, value in candidates:
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid {field_name}={value!r} in window_outputs row in {oracle_prediction_path}"
+            ) from exc
+    raise ValueError(f"Missing window index fields in window_outputs row in {oracle_prediction_path}")
+
+
 def _load_oracle_targets_by_window(
     oracle_prediction_path: Path,
 ) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[int, List[Dict[str, Any]]]]:
@@ -253,11 +267,7 @@ def _load_oracle_targets_by_window(
     for row in window_outputs:
         if not isinstance(row, Mapping):
             raise ValueError(f"Invalid row in window_outputs in {oracle_prediction_path}")
-        source_window_index_raw = row.get("source_window_index")
-        window_index_raw = source_window_index_raw if source_window_index_raw is not None else row.get("window_index")
-        if window_index_raw is None:
-            raise ValueError(f"Missing window index in window_outputs row in {oracle_prediction_path}")
-        window_index = int(window_index_raw)
+        window_index = _resolve_oracle_window_index(row=row, oracle_prediction_path=oracle_prediction_path)
 
         oracle_output = row.get("oracle_output")
         if not isinstance(oracle_output, Mapping):
@@ -331,7 +341,9 @@ def _load_oracle_targets_by_window(
 
         if selected_red_flags:
             if window_index in red_flags_by_window:
-                raise ValueError(f"Duplicate oracle red_flags for source window={window_index} in {oracle_prediction_path}")
+                raise ValueError(
+                    f"Duplicate oracle red_flags for source window={window_index} in {oracle_prediction_path}"
+                )
             red_flags_by_window[window_index] = selected_red_flags
 
     return actions_by_window, red_flags_by_window
@@ -525,7 +537,7 @@ def _match_window_with_llm(
         oracle_recommended_gt_items=oracle_recommended_gt_items,
         oracle_red_flag_gt_items=oracle_red_flag_gt_items,
     )
-    response = llm_client.chat(prompt=prompt, response_format="text", temperature=1)
+    response = llm_client.chat(prompt=prompt, response_format="text", temperature=0)
     raw_response = response.get("content", "")
     usage = response.get("usage", {})
     if not isinstance(usage, dict):
@@ -637,7 +649,6 @@ def _build_rows_from_match(
         "num_recommendations": int(task["num_recommendations"]),
         "num_ground_truth_actions": int(task["num_ground_truth_actions"]),
         "num_ground_truth_red_flags": int(task["num_ground_truth_red_flags"]),
-        "ground_truth_source": str(task["ground_truth_source"]),
         "matcher_backend": str(task["matcher_backend"]),
         "memory_depth": task["memory_depth"],
         "matched_prediction_indices": list(recommended_prediction_indices),
@@ -700,7 +711,6 @@ def _build_rows_from_match(
                 ),
                 "num_ground_truth_actions": int(task["num_ground_truth_actions"]),
                 "num_ground_truth_red_flags": int(task["num_ground_truth_red_flags"]),
-                "ground_truth_source": str(task["ground_truth_source"]),
             }
         )
     return window_row, prediction_rows
@@ -709,8 +719,7 @@ def _build_rows_from_match(
 def _load_window_and_prediction_rows(
     prediction_dir: Path,
     *,
-    gt_source: str,
-    oracle_results_dir: Optional[Path],
+    oracle_results_dir: Path,
     window_stride: Optional[int],
     num_workers: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
@@ -736,16 +745,11 @@ def _load_window_and_prediction_rows(
     for pred_path in prediction_files:
         payload = _load_json(pred_path)
         patient_id = pred_path.parent.name
-        oracle_actions_by_window: Optional[Dict[int, List[Dict[str, Any]]]] = None
-        oracle_red_flags_by_window: Optional[Dict[int, List[Dict[str, Any]]]] = None
-        if gt_source == GT_SOURCE_ORACLE_REVIEWED_ACTIONS:
-            if oracle_results_dir is None:
-                raise ValueError("oracle_results_dir is required when gt_source=oracle_reviewed_actions")
-            oracle_prediction_path = oracle_results_dir / "patients" / patient_id / "oracle_predictions.json"
-            if not oracle_prediction_path.exists():
-                skipped_missing_oracle_patients += 1
-                continue
-            oracle_actions_by_window, oracle_red_flags_by_window = _load_oracle_targets_by_window(oracle_prediction_path)
+        oracle_prediction_path = oracle_results_dir / "patients" / patient_id / "oracle_predictions.json"
+        if not oracle_prediction_path.exists():
+            skipped_missing_oracle_patients += 1
+            continue
+        oracle_actions_by_window, oracle_red_flags_by_window = _load_oracle_targets_by_window(oracle_prediction_path)
 
         subject_id_raw = payload.get("subject_id")
         icu_stay_id_raw = payload.get("icu_stay_id")
@@ -797,25 +801,13 @@ def _load_window_and_prediction_rows(
                 raise ValueError(f"Missing recommended_actions list in {pred_path} window={window_index}")
             prediction_items = [dict(action) for action in recommended_actions if isinstance(action, Mapping)]
             red_flag_gt_items: List[Dict[str, Any]] = []
-            if gt_source == GT_SOURCE_DATASET_ACTIONS:
-                ground_truth_action_events = item.get("ground_truth_action_events")
-                if not isinstance(ground_truth_action_events, list):
-                    raise ValueError(f"Missing ground_truth_action_events list in {pred_path} window={window_index}")
-                gt_items = [dict(event) for event in ground_truth_action_events if isinstance(event, Mapping)]
-            elif gt_source == GT_SOURCE_ORACLE_REVIEWED_ACTIONS:
-                if oracle_actions_by_window is None or oracle_red_flags_by_window is None:
-                    raise ValueError(f"Oracle review cache unavailable for {pred_path}")
-                if window_index not in oracle_actions_by_window:
-                    skipped_no_oracle_gt_windows += 1
-                    continue
-                gt_items = [dict(action) for action in oracle_actions_by_window[window_index]]
-                red_flag_gt_items = [
-                    dict(action) for action in oracle_red_flags_by_window.get(window_index, [])
-                ]
-                if not red_flag_gt_items:
-                    windows_without_oracle_red_flags += 1
-            else:
-                raise ValueError(f"Unsupported gt_source={gt_source}")
+            if window_index not in oracle_actions_by_window:
+                skipped_no_oracle_gt_windows += 1
+                continue
+            gt_items = [dict(action) for action in oracle_actions_by_window[window_index]]
+            red_flag_gt_items = [dict(action) for action in oracle_red_flags_by_window.get(window_index, [])]
+            if not red_flag_gt_items:
+                windows_without_oracle_red_flags += 1
 
             num_windows = int(num_memory_snapshots)
             if num_windows > 1:
@@ -843,7 +835,6 @@ def _load_window_and_prediction_rows(
                     "num_ground_truth_actions": int(len(gt_items)),
                     "num_ground_truth_red_flags": int(len(red_flag_gt_items)),
                     "memory_depth": memory_depth,
-                    "ground_truth_source": str(gt_source),
                     "matcher_backend": str(backend),
                     "prediction_items": prediction_items,
                     "oracle_recommended_gt_items": gt_items,
@@ -853,7 +844,7 @@ def _load_window_and_prediction_rows(
 
     total_tasks = int(len(tasks))
     if total_tasks == 0:
-        if gt_source == GT_SOURCE_ORACLE_REVIEWED_ACTIONS and skipped_missing_oracle_patients > 0:
+        if skipped_missing_oracle_patients > 0:
             raise ValueError(
                 "No recommendation prediction windows found for evaluation after skipping "
                 f"{skipped_missing_oracle_patients} patients without oracle_predictions.json."
@@ -863,10 +854,9 @@ def _load_window_and_prediction_rows(
         f"Loaded recommendation predictions: patients={len(prediction_files)}, "
         f"windows={total_tasks}, workers={int(num_workers)}"
     )
-    if gt_source == GT_SOURCE_ORACLE_REVIEWED_ACTIONS:
-        print(f"Skipped patients with missing oracle_predictions.json: {skipped_missing_oracle_patients}")
-        print(f"Skipped windows with no Oracle best_practice/acceptable actions: {skipped_no_oracle_gt_windows}")
-        print(f"Windows with no Oracle red_flags: {windows_without_oracle_red_flags}")
+    print(f"Skipped patients with missing oracle_predictions.json: {skipped_missing_oracle_patients}")
+    print(f"Skipped windows with no Oracle best_practice/acceptable actions: {skipped_no_oracle_gt_windows}")
+    print(f"Windows with no Oracle red_flags: {windows_without_oracle_red_flags}")
 
     window_rows: List[Dict[str, Any]] = []
     prediction_rows: List[Dict[str, Any]] = []
@@ -881,9 +871,7 @@ def _load_window_and_prediction_rows(
         match_result: Dict[str, Any],
     ) -> None:
         nonlocal matcher_calls, total_input_tokens, total_output_tokens
-        if task["prediction_items"] and (
-            task["oracle_recommended_gt_items"] or task["oracle_red_flag_gt_items"]
-        ):
+        if task["prediction_items"] and (task["oracle_recommended_gt_items"] or task["oracle_red_flag_gt_items"]):
             matcher_calls += 1
             total_input_tokens += int(match_result["input_tokens"])
             total_output_tokens += int(match_result["output_tokens"])
@@ -975,7 +963,7 @@ def _expand_window_rows_by_k(window_frame: pd.DataFrame, *, k_values: Sequence[i
         for k in k_values:
             num_considered = min(int(k), int(num_recommendations))
             num_matches_at_k = sum(1 for idx in matched_set if idx < num_considered)
-            hit_at_k = int(num_matches_at_k > int(HIT_MATCH_COUNT_THRESHOLD))
+            hit_at_k = int(num_matches_at_k >= int(HIT_MATCH_COUNT_THRESHOLD))
             if num_considered > 0:
                 precision_at_k = float(num_matches_at_k) / float(num_considered)
             else:
@@ -985,7 +973,9 @@ def _expand_window_rows_by_k(window_frame: pd.DataFrame, *, k_values: Sequence[i
             red_flag_precision_at_k: float
             if num_ground_truth_red_flags > 0:
                 red_flag_hit_at_k = float(int(num_red_flag_matches_at_k > 0))
-                red_flag_precision_at_k = float(num_red_flag_matches_at_k) / float(num_considered) if num_considered > 0 else 0.0
+                red_flag_precision_at_k = (
+                    float(num_red_flag_matches_at_k) / float(num_considered) if num_considered > 0 else 0.0
+                )
             else:
                 red_flag_hit_at_k = float("nan")
                 red_flag_precision_at_k = float("nan")
@@ -1037,7 +1027,9 @@ def _compute_metrics_by_k(window_k_frame: pd.DataFrame) -> pd.DataFrame:
         macro_precision = float(patient_precision.mean()) if len(patient_precision) > 0 else float("nan")
         red_flag_subset = subset.dropna(subset=["red_flag_hit_at_k", "red_flag_precision_at_k"])
         red_flag_windows = int(len(red_flag_subset))
-        red_flag_micro_hit = float(red_flag_subset["red_flag_hit_at_k"].mean()) if red_flag_windows > 0 else float("nan")
+        red_flag_micro_hit = (
+            float(red_flag_subset["red_flag_hit_at_k"].mean()) if red_flag_windows > 0 else float("nan")
+        )
         red_flag_micro_precision = (
             float(red_flag_subset["red_flag_precision_at_k"].mean()) if red_flag_windows > 0 else float("nan")
         )
@@ -1817,18 +1809,11 @@ def _evaluate_single_prediction_dir(
     *,
     prediction_root: Path,
     output_dir: Path,
-    gt_source: str,
-    oracle_results_dir: Optional[Path],
+    oracle_results_dir: Path,
     window_stride: Optional[int],
     num_workers: int,
 ) -> Dict[str, Any]:
-    oracle_results_root: Optional[Path]
-    if gt_source == GT_SOURCE_ORACLE_REVIEWED_ACTIONS:
-        if oracle_results_dir is None:
-            raise ValueError("--oracle-results-dir is required when --gt-source=oracle_reviewed_actions")
-        oracle_results_root = _ensure_oracle_results_dir(oracle_results_dir)
-    else:
-        oracle_results_root = None
+    oracle_results_root = _ensure_oracle_results_dir(oracle_results_dir)
 
     backend = MATCHER_BACKEND_LLM
 
@@ -1838,9 +1823,7 @@ def _evaluate_single_prediction_dir(
         raise ValueError(f"window_stride must be >= 1 when provided, got {window_stride}")
 
     print(f"Prediction directory: {prediction_root}")
-    print(f"Ground-truth source: {gt_source}")
-    if oracle_results_root is not None:
-        print(f"Oracle results directory: {oracle_results_root}")
+    print(f"Oracle results directory: {oracle_results_root}")
     print(
         f"Matcher config: backend={backend}, provider={LLM_MATCHER_PROVIDER}, model={LLM_MATCHER_MODEL}, "
         f"max_tokens={int(LLM_MATCHER_MAX_TOKENS)}, workers={int(num_workers)}, window_stride={window_stride}"
@@ -1848,7 +1831,6 @@ def _evaluate_single_prediction_dir(
 
     window_frame, prediction_frame, matcher_usage = _load_window_and_prediction_rows(
         prediction_dir=prediction_root,
-        gt_source=str(gt_source),
         oracle_results_dir=oracle_results_root,
         window_stride=int(window_stride) if window_stride is not None else None,
         num_workers=int(num_workers),
@@ -1872,8 +1854,7 @@ def _evaluate_single_prediction_dir(
     metrics_payload = {
         "generated_at": datetime.now().isoformat(),
         "prediction_dir": str(prediction_root),
-        "ground_truth_source": str(gt_source),
-        "oracle_results_dir": str(oracle_results_root) if oracle_results_root is not None else None,
+        "oracle_results_dir": str(oracle_results_root),
         "matcher_backend": str(backend),
         "llm_provider": LLM_MATCHER_PROVIDER,
         "llm_model": LLM_MATCHER_MODEL,
@@ -1900,9 +1881,9 @@ def _evaluate_single_prediction_dir(
     window_export_df["matched_pairs"] = window_export_df["matched_pairs"].map(
         lambda value: json.dumps(value, ensure_ascii=False)
     )
-    window_export_df["matched_red_flag_prediction_indices"] = window_export_df["matched_red_flag_prediction_indices"].map(
-        lambda value: json.dumps(value, ensure_ascii=False)
-    )
+    window_export_df["matched_red_flag_prediction_indices"] = window_export_df[
+        "matched_red_flag_prediction_indices"
+    ].map(lambda value: json.dumps(value, ensure_ascii=False))
     window_export_df["matched_red_flag_pairs"] = window_export_df["matched_red_flag_pairs"].map(
         lambda value: json.dumps(value, ensure_ascii=False)
     )
@@ -1988,20 +1969,16 @@ def run_evaluation(
     *,
     prediction_dir: Path,
     output_dir: Optional[Path],
-    gt_source: str,
-    oracle_results_dir: Optional[Path],
+    oracle_results_dir: Path,
     window_stride: Optional[int],
     num_workers: int,
 ) -> None:
-    if gt_source not in {GT_SOURCE_DATASET_ACTIONS, GT_SOURCE_ORACLE_REVIEWED_ACTIONS}:
-        raise ValueError(f"Unsupported gt_source={gt_source}")
-
     mode_dirs = _discover_recommendation_mode_dirs(prediction_dir)
     if mode_dirs:
         base_output_root = (
             output_dir if output_dir is not None else _default_output_root_from_recommendation_input(prediction_dir)
         )
-        output_root = _output_root_with_gt_source(base_output_root, gt_source=gt_source)
+        output_root = base_output_root
         output_root.mkdir(parents=True, exist_ok=True)
         print("Detected recommendation modes: " + ", ".join(sorted(mode_dirs.keys())) + f" under {prediction_dir}")
 
@@ -2016,7 +1993,6 @@ def run_evaluation(
             single_result = _evaluate_single_prediction_dir(
                 prediction_root=prediction_root,
                 output_dir=mode_output_dir,
-                gt_source=str(gt_source),
                 oracle_results_dir=oracle_results_dir,
                 window_stride=int(window_stride) if window_stride is not None else None,
                 num_workers=int(num_workers),
@@ -2061,7 +2037,7 @@ def run_evaluation(
     base_final_output_dir = (
         output_dir if output_dir is not None else _default_output_root_from_recommendation_input(prediction_root)
     )
-    final_output_root = _output_root_with_gt_source(base_final_output_dir, gt_source=gt_source)
+    final_output_root = base_final_output_dir
     if prediction_root.parent.name == "recommendation_experiment":
         final_output_dir = final_output_root / prediction_root.name
     else:
@@ -2069,7 +2045,6 @@ def run_evaluation(
     _evaluate_single_prediction_dir(
         prediction_root=prediction_root,
         output_dir=final_output_dir,
-        gt_source=str(gt_source),
         oracle_results_dir=oracle_results_dir,
         window_stride=int(window_stride) if window_stride is not None else None,
         num_workers=int(num_workers),
@@ -2090,27 +2065,19 @@ def main() -> None:
         default=None,
         help=(
             "Directory where metrics and plots will be saved. "
-            "Results are saved under a gt-source subfolder. "
             "Default for multi-mode input: "
-            "evaluation_results/<memory_run_name>/recommendation_experiment/<gt_source>/<mode>. "
+            "evaluation_results/<memory_run_name>/recommendation_experiment/<mode>. "
             "Default for single-mode input: "
-            "evaluation_results/<memory_run_name>/recommendation_experiment/<gt_source>/<mode>."
+            "evaluation_results/<memory_run_name>/recommendation_experiment/<mode>."
         ),
-    )
-    parser.add_argument(
-        "--gt-source",
-        type=str,
-        required=True,
-        choices=[GT_SOURCE_DATASET_ACTIONS, GT_SOURCE_ORACLE_REVIEWED_ACTIONS],
-        help="Ground-truth action source used for evaluation.",
     )
     parser.add_argument(
         "--oracle-results-dir",
         type=str,
-        default=None,
+        required=True,
         help=(
             "Oracle run directory with patients/*/oracle_predictions.json. "
-            "Required when --gt-source=oracle_reviewed_actions."
+            "Only actions labeled acceptable/best_practice are used as GT."
         ),
     )
     parser.add_argument(
@@ -2130,8 +2097,7 @@ def main() -> None:
     run_evaluation(
         prediction_dir=Path(args.prediction_dir),
         output_dir=Path(args.output_dir) if args.output_dir else None,
-        gt_source=str(args.gt_source),
-        oracle_results_dir=Path(args.oracle_results_dir) if args.oracle_results_dir else None,
+        oracle_results_dir=Path(args.oracle_results_dir),
         window_stride=int(args.window_stride) if args.window_stride is not None else None,
         num_workers=int(args.num_workers),
     )

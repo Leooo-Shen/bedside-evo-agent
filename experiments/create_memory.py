@@ -510,6 +510,7 @@ def _process_single_patient_memory(
     patient_row: pd.Series,
     parser: MIMICDataParser,
     config,
+    window_step_hours: float,
     llm_provider: str,
     llm_model: str,
     enable_logging: bool,
@@ -535,7 +536,7 @@ def _process_single_patient_memory(
     windows = parser.create_time_windows(
         trajectory,
         current_window_hours=config.agent_current_window_hours,
-        window_step_hours=config.agent_window_step_hours,
+        window_step_hours=window_step_hours,
         include_pre_icu_data=config.agent_include_pre_icu_data,
         use_first_n_hours_after_icu=config.agent_observation_hours,
         use_discharge_summary_for_history=config.agent_use_discharge_summary_for_history,
@@ -640,6 +641,7 @@ def run_experiment(
     patient_stay_ids_path: Optional[str] = None,
     num_workers: int = 1,
     resume_run: Optional[str] = None,
+    window_step_hours: Optional[float] = None,
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -651,6 +653,16 @@ def run_experiment(
         raise ValueError(f"num_workers must be >= 1, got {num_workers}")
 
     config = get_config()
+    if window_step_hours is None:
+        effective_window_step_hours = float(config.agent_window_step_hours)
+    else:
+        try:
+            effective_window_step_hours = float(window_step_hours)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid window_step_hours value: {window_step_hours}") from exc
+    if not math.isfinite(effective_window_step_hours) or effective_window_step_hours <= 0:
+        raise ValueError(f"window_step_hours must be a finite number > 0, got {effective_window_step_hours}")
+
     effective_llm_provider = str(llm_provider if llm_provider is not None else config.llm_provider).strip()
     if not effective_llm_provider:
         raise ValueError("LLM provider must be set in config.llm.provider or via --llm-provider.")
@@ -681,6 +693,7 @@ def run_experiment(
     print(f"LLM Provider: {effective_llm_provider}")
     print(f"LLM Model: {effective_llm_model}")
     print(f"LLM Max Tokens: {effective_llm_max_tokens}")
+    print(f"Window Step Hours: {effective_window_step_hours:g}")
     print(f"Num Workers: {num_workers}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -715,7 +728,7 @@ def run_experiment(
         "windowing": {
             "observation_hours": config.agent_observation_hours,
             "current_window_hours": config.agent_current_window_hours,
-            "window_step_hours": config.agent_window_step_hours,
+            "window_step_hours": effective_window_step_hours,
             "include_pre_icu_data": config.agent_include_pre_icu_data,
             "use_discharge_summary_for_history": config.agent_use_discharge_summary_for_history,
             "num_discharge_summaries": config.agent_num_discharge_summaries,
@@ -810,6 +823,7 @@ def run_experiment(
             patient_row=patient_row,
             parser=parser,
             config=config,
+            window_step_hours=effective_window_step_hours,
             llm_provider=effective_llm_provider,
             llm_model=effective_llm_model,
             enable_logging=enable_logging,
@@ -923,6 +937,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--window-step-hours",
+        type=float,
+        default=2,
+        help=(
+            "Optional sliding-window step size (hours) for memory creation. "
+            "If omitted, uses config agent_time_windows.window_step_hours."
+        ),
+    )
+    parser.add_argument(
         "--llm-provider",
         "--provider",
         dest="llm_provider",
@@ -952,6 +975,7 @@ def main() -> None:
         patient_stay_ids_path=args.patient_stay_ids,
         num_workers=args.num_workers,
         resume_run=args.resume_run,
+        window_step_hours=args.window_step_hours,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
     )

@@ -403,6 +403,7 @@ class MedEvoMemory:
     working_memory: List[WorkingWindow] = field(default_factory=list)
     critical_events: List[CriticalEvent] = field(default_factory=list)
     trajectory_memory: List[Dict[str, Any]] = field(default_factory=list)
+    all_window_summaries: List[Dict[str, Any]] = field(default_factory=list)
     insights: List[Insight] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -411,6 +412,7 @@ class MedEvoMemory:
             "working_memory": [item.to_dict() for item in self.working_memory],
             "critical_events": [item.to_dict() for item in self.critical_events],
             "trajectory_memory": self.trajectory_memory,
+            "all_window_summaries": self.all_window_summaries,
             "insights": [item.to_dict() for item in self.insights],
         }
 
@@ -1729,12 +1731,9 @@ class MedEvoAgent:
             if len(memory.critical_events) > self.max_critical_events:
                 memory.critical_events = memory.critical_events[-self.max_critical_events :]
 
-            memory.trajectory_memory.append(
-                {
-                    "type": "window_summary",
-                    **summary.to_dict(),
-                }
-            )
+            summary_item = {"type": "window_summary", **summary.to_dict()}
+            memory.all_window_summaries.append(deepcopy(summary_item))
+            memory.trajectory_memory.append(summary_item)
             memory.trajectory_memory = self._truncate_trajectory_memory(memory.trajectory_memory)
 
             recent_episode_summaries, recent_episode_critical = self._build_episode_context(memory)
