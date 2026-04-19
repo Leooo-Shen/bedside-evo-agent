@@ -61,6 +61,12 @@ class Config:
 
         return value
 
+    def require(self, key_path: str) -> Any:
+        value = self.get(key_path, None)
+        if value is None:
+            raise ValueError(f"Missing required config value: {key_path}")
+        return value
+
     # ========================================================================
     # Data Configuration
     # ========================================================================
@@ -373,57 +379,47 @@ class Config:
 
     @property
     def med_evo_max_working_windows(self) -> int:
-        """Maximum number of working windows provided to EventAgent."""
-        value = self.get("med_evo.max_working_windows", 3)
+        """Maximum raw working windows retained in MedEvo snapshots."""
+        value = self.require("med_evo.max_working_windows")
         try:
             return max(1, int(value))
-        except (TypeError, ValueError):
-            return 3
-
-    @property
-    def med_evo_max_critical_events(self) -> int:
-        """Maximum number of critical events kept in memory."""
-        value = self.get("med_evo.max_critical_events", 100)
-        try:
-            return max(1, int(value))
-        except (TypeError, ValueError):
-            return 100
-
-    @property
-    def med_evo_max_window_summaries(self) -> int:
-        """Maximum number of trajectory summaries retained (window summaries + episodes)."""
-        value = self.get("med_evo.max_window_summaries", 100)
-        try:
-            return max(1, int(value))
-        except (TypeError, ValueError):
-            return 100
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"med_evo.max_working_windows must be an integer >= 1, got {value}") from exc
 
     @property
     def med_evo_max_insights(self) -> int:
         """Maximum number of active insights retained in memory."""
-        value = self.get("med_evo.max_insights", 5)
+        value = self.require("med_evo.max_insights")
         try:
             return max(1, int(value))
-        except (TypeError, ValueError):
-            return 5
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"med_evo.max_insights must be an integer >= 1, got {value}") from exc
 
     @property
-    def med_evo_insight_every_n_windows(self) -> int:
-        """Run InsightAgent once every N non-empty windows (default 1 = every window)."""
-        value = self.get("med_evo.insight_every_n_windows", 1)
+    def med_evo_episode_block_windows(self) -> int:
+        """Number of parser windows per MedEvo episode block."""
+        value = self.require("med_evo.episode_block_windows")
         try:
             return max(1, int(value))
-        except (TypeError, ValueError):
-            return 1
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"med_evo.episode_block_windows must be an integer >= 1, got {value}") from exc
 
     @property
-    def med_evo_episode_every_n_windows(self) -> int:
-        """Run EpisodeAgent once every N non-empty windows (default 0 = disabled)."""
-        value = self.get("med_evo.episode_every_n_windows", 0)
+    def med_evo_insight_block_windows(self) -> int:
+        """Number of parser windows between MedEvo insight-agent runs."""
+        value = self.require("med_evo.insight_block_windows")
         try:
-            return max(0, int(value))
-        except (TypeError, ValueError):
-            return 0
+            return max(1, int(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"med_evo.insight_block_windows must be an integer >= 1, got {value}") from exc
+
+    @property
+    def med_evo_observation_config_path(self) -> str:
+        """Required JSON config path for MedEvo observation trend extraction."""
+        value = str(self.require("med_evo.observation_config_path")).strip()
+        if not value:
+            raise ValueError("med_evo.observation_config_path must be a non-empty string")
+        return value
 
     # ========================================================================
     # Utility Methods

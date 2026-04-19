@@ -561,15 +561,14 @@ def run_experiment(
         idx, patient_record = args
         patient_agent = MedEvoAgent(
             provider=config.llm_provider,
+            observation_config_path=config.med_evo_observation_config_path,
+            episode_block_windows=config.med_evo_episode_block_windows,
+            insight_block_windows=config.med_evo_insight_block_windows,
             model=config.llm_model,
             enable_logging=False,
             window_duration_hours=config.agent_current_window_hours,
             max_working_windows=config.med_evo_max_working_windows,
-            max_critical_events=config.med_evo_max_critical_events,
-            max_window_summaries=config.med_evo_max_window_summaries,
             max_insights=config.med_evo_max_insights,
-            insight_every_n_windows=config.med_evo_insight_every_n_windows,
-            episode_every_n_windows=config.med_evo_episode_every_n_windows,
         )
         return process_single_patient(
             patient_record=patient_record,

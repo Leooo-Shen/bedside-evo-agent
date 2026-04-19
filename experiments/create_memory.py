@@ -20,7 +20,6 @@ sys.path.insert(0, str(project_root))
 from agents.med_evo_agent import MedEvoAgent, MedEvoMemory, MedEvoMemoryDatabase
 from config.config import get_config
 from data_parser import MIMICDataParser
-from utils.event_format import format_event_lines
 from utils.llm_log_viewer import save_llm_calls_html
 from utils.patient_selection import select_balanced_patients
 
@@ -127,19 +126,37 @@ def create_med_evo_memory_snapshots(
 
 
 def infer_snapshot_window_index(snapshot: Dict[str, Any]) -> Optional[int]:
-    """Extract window_id from a MedEvo memory snapshot."""
-    working_memory = snapshot.get("working_memory")
-    if not isinstance(working_memory, list) or not working_memory:
+    """Extract window_id from an explicit MedEvo snapshot marker."""
+    window_index = snapshot.get("last_processed_window_index")
+    if window_index is None:
         return None
-
-    last_window = working_memory[-1]
-    if not isinstance(last_window, dict):
-        return None
-
     try:
-        return int(last_window.get("window_id"))
+        return int(window_index)
     except (TypeError, ValueError):
         return None
+
+
+def _format_observation_entry(entry: Dict[str, Any]) -> List[str]:
+    window_index = _safe_int(entry.get("window_index"), default=-1)
+    start_hour = _safe_float(entry.get("start_hour"), default=0.0)
+    end_hour = _safe_float(entry.get("end_hour"), default=start_hour)
+    lines = [f"### Window {window_index} (hour {start_hour:.1f}-{end_hour:.1f})"]
+
+    vital_trends = entry.get("vital_trends")
+    lines.append("Vital trends:")
+    if isinstance(vital_trends, dict) and vital_trends:
+        for vital_name in sorted(vital_trends):
+            stats = vital_trends.get(vital_name)
+            if not isinstance(stats, dict):
+                continue
+            lines.append(
+                f"- {vital_name}: mean={stats.get('mean')}, min={stats.get('min')}, "
+                f"max={stats.get('max')}, count={stats.get('count')}"
+            )
+    else:
+        lines.append("- None")
+
+    return lines
 
 
 def collect_windowed_snapshots(memory_snapshots: List[Dict[str, Any]]) -> List[Tuple[int, Dict[str, Any]]]:
@@ -178,7 +195,8 @@ def render_snapshot_to_text(snapshot: Dict[str, Any]) -> str:
     """Render a MedEvo memory snapshot dict into predictor context text."""
     patient_metadata = snapshot.get("patient_metadata", {})
     trajectory_memory = snapshot.get("trajectory_memory", [])
-    critical_events = snapshot.get("critical_events", [])
+    trend_memory = snapshot.get("trend_memory", [])
+    critical_events_memory = snapshot.get("critical_events_memory", [])
     insights = snapshot.get("insights", [])
     working_memory = snapshot.get("working_memory", [])
 
@@ -199,17 +217,11 @@ def render_snapshot_to_text(snapshot: Dict[str, Any]) -> str:
                 parts.append(f"- {item}")
                 continue
             item_type = item.get("type")
-            if item_type == "window_summary":
-                parts.append(
-                    f"- Window {item.get('window_id')} "
-                    f"(hour {_safe_float(item.get('start_hour')):.1f}-{_safe_float(item.get('end_hour')):.1f}): "
-                    f"{item.get('text', '')}"
-                )
-            elif item_type == "episode":
+            if item_type == "episode":
                 parts.append(
                     f"- Window {item.get('start_window')}-{item.get('end_window')} "
                     f"(hour {_safe_float(item.get('start_hour')):.1f}-{_safe_float(item.get('end_hour')):.1f}): "
-                    f"{item.get('episode_summary', item.get('text', ''))}"
+                    f"{item.get('episode_summary', '')}"
                 )
             else:
                 parts.append(f"- {item}")
@@ -217,14 +229,32 @@ def render_snapshot_to_text(snapshot: Dict[str, Any]) -> str:
         parts.append("- None")
 
     parts.append("")
-    parts.append("## Critical Events of the ICU Stay")
-    if isinstance(critical_events, list) and critical_events:
-        for item in critical_events:
+    parts.append("## Trend Memory")
+    if isinstance(trend_memory, list) and trend_memory:
+        for item in trend_memory:
             if isinstance(item, dict):
-                name_text = str(item.get("name_str") or "").strip()
-                parts.append(name_text if name_text else str(item))
+                parts.extend(_format_observation_entry(item))
+    else:
+        parts.append("- None")
+
+    parts.append("")
+    parts.append("## Critical Events Memory")
+    if isinstance(critical_events_memory, list) and critical_events_memory:
+        for item in critical_events_memory:
+            if not isinstance(item, dict):
+                continue
+            parts.append(
+                f"Window {item.get('start_window')}-{item.get('end_window')} "
+                f"(hour {_safe_float(item.get('start_hour')):.1f}-{_safe_float(item.get('end_hour')):.1f})"
+            )
+            critical_events = item.get("critical_events", [])
+            if isinstance(critical_events, list) and critical_events:
+                for event in critical_events:
+                    event_text = str(event).strip()
+                    if event_text:
+                        parts.append(event_text)
             else:
-                parts.append(str(item))
+                parts.append("- None")
     else:
         parts.append("- None")
 
@@ -254,8 +284,11 @@ def render_snapshot_to_text(snapshot: Dict[str, Any]) -> str:
             end_hour = _safe_float(current_window.get("end_hour"))
             parts.append(f"Window {current_window.get('window_id')} (Hour {start_hour:.1f}-{end_hour:.1f})")
             current_events = current_window.get("events", [])
-            if isinstance(current_events, list):
-                parts.extend(format_event_lines(current_events, empty_text="- (No events)"))
+            if isinstance(current_events, list) and current_events:
+                for event in current_events:
+                    event_text = str(event).strip()
+                    if event_text:
+                        parts.append(event_text)
             else:
                 parts.append("- (No events)")
         else:
@@ -272,6 +305,8 @@ def extract_snapshot_window_features(snapshot: Dict[str, Any]) -> Tuple[int, flo
     hours_since_admission = 0.0
     num_current_events = 0
 
+    window_index = _safe_int(snapshot.get("last_processed_window_index"), default=-1)
+    hours_since_admission = _safe_float(snapshot.get("last_processed_start_hour"), default=0.0)
     working_memory = snapshot.get("working_memory")
     if not isinstance(working_memory, list) or not working_memory:
         return window_index, hours_since_admission, num_current_events
@@ -280,8 +315,6 @@ def extract_snapshot_window_features(snapshot: Dict[str, Any]) -> Tuple[int, flo
     if not isinstance(current_window, dict):
         return window_index, hours_since_admission, num_current_events
 
-    window_index = _safe_int(current_window.get("window_id"), default=-1)
-    hours_since_admission = _safe_float(current_window.get("start_hour"), default=0.0)
     current_events = current_window.get("events", [])
     if isinstance(current_events, list):
         num_current_events = len(current_events)
@@ -290,17 +323,9 @@ def extract_snapshot_window_features(snapshot: Dict[str, Any]) -> Tuple[int, flo
 
 
 def extract_snapshot_hour_bounds(snapshot: Dict[str, Any]) -> Tuple[float, float]:
-    """Return (start_hour, end_hour) for a snapshot's current window."""
-    working_memory = snapshot.get("working_memory")
-    if not isinstance(working_memory, list) or not working_memory:
-        return 0.0, 0.0
-
-    current_window = working_memory[-1]
-    if not isinstance(current_window, dict):
-        return 0.0, 0.0
-
-    start_hour = _safe_float(current_window.get("start_hour"), default=0.0)
-    end_hour = _safe_float(current_window.get("end_hour"), default=start_hour)
+    """Return (start_hour, end_hour) from explicit snapshot markers."""
+    start_hour = _safe_float(snapshot.get("last_processed_start_hour"), default=0.0)
+    end_hour = _safe_float(snapshot.get("last_processed_end_hour"), default=start_hour)
     if end_hour < start_hour:
         end_hour = start_hour
     return start_hour, end_hour
@@ -560,15 +585,14 @@ def _process_single_patient_memory(
 
     agent = MedEvoAgent(
         provider=llm_provider,
+        observation_config_path=config.med_evo_observation_config_path,
+        episode_block_windows=config.med_evo_episode_block_windows,
+        insight_block_windows=config.med_evo_insight_block_windows,
         model=llm_model,
         enable_logging=enable_logging,
         window_duration_hours=config.agent_current_window_hours,
         max_working_windows=config.med_evo_max_working_windows,
-        max_critical_events=config.med_evo_max_critical_events,
-        max_window_summaries=config.med_evo_max_window_summaries,
         max_insights=config.med_evo_max_insights,
-        insight_every_n_windows=config.med_evo_insight_every_n_windows,
-        episode_every_n_windows=config.med_evo_episode_every_n_windows,
     )
     agent.clear_logs()
 
@@ -581,7 +605,7 @@ def _process_single_patient_memory(
 
     windowed_snapshots = collect_windowed_snapshots(memory_db.memory_snapshots)
     if not windowed_snapshots:
-        print("   WARNING: No non-empty memory snapshots generated, skipping...")
+        print("   WARNING: No memory snapshots generated, skipping...")
         return None
 
     patient_dir = results_dir / "patients" / f"{subject_id}_{icu_stay_id}"
@@ -609,9 +633,9 @@ def _process_single_patient_memory(
             "llm_model": getattr(agent.llm_client, "model", None),
             "pipeline_agents": [
                 {"name": "perception_agent", "used": True},
-                {"name": "event_agent", "used": True},
+                {"name": "observation_agent", "used": True},
                 {"name": "insight_agent", "used": True},
-                {"name": "episode_agent", "used": agent.episode_every_n_windows > 0},
+                {"name": "episode_agent", "used": True},
                 {"name": "survival_predictor", "used": False},
             ],
             "total_calls": len(agent.get_logs()),
@@ -743,11 +767,10 @@ def run_experiment(
         },
         "med_evo": {
             "max_working_windows": config.med_evo_max_working_windows,
-            "max_critical_events": config.med_evo_max_critical_events,
-            "max_window_summaries": config.med_evo_max_window_summaries,
             "max_insights": config.med_evo_max_insights,
-            "insight_every_n_windows": config.med_evo_insight_every_n_windows,
-            "episode_every_n_windows": config.med_evo_episode_every_n_windows,
+            "episode_block_windows": config.med_evo_episode_block_windows,
+            "insight_block_windows": config.med_evo_insight_block_windows,
+            "observation_config_path": config.med_evo_observation_config_path,
         },
     }
     if not resume_run or not (results_dir / RUN_CONFIG_FILENAME).exists():
@@ -878,7 +901,7 @@ def run_experiment(
     if failed_patients:
         print(f"Failed Patients: {len(failed_patients)}")
     print("\nMedEvo Pipeline Totals:")
-    print(f"  EventAgent Calls: {int(agent_stat_totals.get('total_event_calls', 0))}")
+    print(f"  ObservationAgent Runs: {int(agent_stat_totals.get('total_observation_runs', 0))}")
     print(f"  InsightAgent Calls: {int(agent_stat_totals.get('total_insight_calls', 0))}")
     print(f"  EpisodeAgent Calls: {int(agent_stat_totals.get('total_episode_calls', 0))}")
     print(f"  Grounding Rejections: {int(agent_stat_totals.get('total_grounding_rejections', 0))}")

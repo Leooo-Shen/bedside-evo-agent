@@ -122,13 +122,7 @@ def _default_output_root_from_patient_status_input(patient_status_input: Path) -
 
 
 def _infer_snapshot_window_index(snapshot: Dict[str, Any]) -> Optional[int]:
-    working_memory = snapshot.get("working_memory")
-    if not isinstance(working_memory, list) or not working_memory:
-        return None
-    current_window = working_memory[-1]
-    if not isinstance(current_window, dict):
-        return None
-    window_id = current_window.get("window_id")
+    window_id = snapshot.get("last_processed_window_index")
     if window_id is None:
         return None
     return int(window_id)
@@ -238,15 +232,18 @@ def _memory_depth_by_window(source_patient_dir: Path) -> Dict[int, int]:
         if not isinstance(snapshot, dict):
             raise ValueError(f"Invalid memory snapshot object in {source_patient_dir}")
         trajectory_memory = snapshot.get("trajectory_memory")
-        critical_events = snapshot.get("critical_events")
+        trend_memory = snapshot.get("trend_memory")
+        critical_events_memory = snapshot.get("critical_events_memory")
         insights = snapshot.get("insights")
         if not isinstance(trajectory_memory, list):
             trajectory_memory = []
-        if not isinstance(critical_events, list):
-            critical_events = []
+        if not isinstance(trend_memory, list):
+            trend_memory = []
+        if not isinstance(critical_events_memory, list):
+            critical_events_memory = []
         if not isinstance(insights, list):
             insights = []
-        depth = len(trajectory_memory) + len(critical_events) + len(insights)
+        depth = len(trajectory_memory) + len(trend_memory) + len(critical_events_memory) + len(insights)
         depths[int(window_index)] = int(depth)
     return depths
 

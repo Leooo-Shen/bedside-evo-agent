@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -30,7 +31,6 @@ from experiments.create_memory import (
 )
 from experiments.oracle.action_validity_common import ACTIONABLE_EVENT_CODES, normalize_action_label
 from prompts.predictor_prompts import get_recommendation_action_prompt
-from utils.event_format import format_event_lines
 from utils.json_parse import parse_json_dict_best_effort
 from utils.llm_errors import is_context_length_exceeded_error
 from utils.llm_log_viewer import save_llm_calls_html
@@ -46,6 +46,9 @@ SUPPORTED_CONTEXT_MODES = (
     CONTEXT_MODE_LOCAL_EVENTS_ONLY,
 )
 ORACLE_POSITIVE_ACTION_LABELS = frozenset({"best_practice", "acceptable"})
+EVENT_LINE_CODE_PATTERN = re.compile(
+    r"^\s*(?:\[[^\]]+\]\s+)?(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+)?([A-Z][A-Z0-9_]+)\b"
+)
 
 
 def _normalize_token_count(value: Any) -> int:
@@ -152,37 +155,41 @@ def _extract_current_window(snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
     return current_window
 
 
-def _event_code(event: Mapping[str, Any]) -> str:
-    return str(event.get("code") or "").strip().upper()
+def _event_code(event_line: str) -> str:
+    match = EVENT_LINE_CODE_PATTERN.match(event_line)
+    if match is None:
+        return ""
+    return str(match.group(1)).strip().upper()
 
 
 def _filter_non_action_events(
-    events: Sequence[Mapping[str, Any]],
+    events: Sequence[str],
     actionable_codes: Sequence[str],
-) -> Tuple[List[Dict[str, Any]], int]:
+) -> Tuple[List[str], int]:
     action_code_set = {str(code).strip().upper() for code in actionable_codes if str(code).strip()}
-    kept: List[Dict[str, Any]] = []
+    kept: List[str] = []
     masked_count = 0
     for event in events:
-        if not isinstance(event, Mapping):
+        event_line = str(event).strip()
+        if not event_line:
             continue
-        if _event_code(event) in action_code_set:
+        if _event_code(event_line) in action_code_set:
             masked_count += 1
             continue
-        kept.append(dict(event))
+        kept.append(event_line)
     return kept, masked_count
 
 
-def _window_events(window: Mapping[str, Any]) -> List[Dict[str, Any]]:
+def _window_events(window: Mapping[str, Any]) -> List[str]:
     events = window.get("events")
     if not isinstance(events, list):
         return []
-    return [dict(event) for event in events if isinstance(event, Mapping)]
+    return [str(event).strip() for event in events if str(event).strip()]
 
 
-def _render_flat_raw_events(events: Sequence[Mapping[str, Any]]) -> str:
-    event_rows = [dict(event) for event in events if isinstance(event, Mapping)]
-    return "\n".join(format_event_lines(event_rows, empty_text="(No events)"))
+def _render_flat_raw_events(events: Sequence[str]) -> str:
+    event_rows = [str(event).strip() for event in events if str(event).strip()]
+    return "\n".join(event_rows) if event_rows else "(No events)"
 
 
 def build_full_history_event_context(
@@ -354,7 +361,7 @@ def build_masked_recommendation_snapshot(
         current_events = []
 
     masked_events, masked_action_count = _filter_non_action_events(
-        [event for event in current_events if isinstance(event, Mapping)],
+        [str(event).strip() for event in current_events if str(event).strip()],
         actionable_codes=actionable_codes,
     )
 
@@ -365,8 +372,37 @@ def build_masked_recommendation_snapshot(
     merged_working_memory = copy.deepcopy(previous_working_memory)
     merged_working_memory.append(masked_window)
     context_snapshot["working_memory"] = merged_working_memory
+    context_snapshot["last_processed_window_index"] = current_window.get("window_id")
+    context_snapshot["last_processed_start_hour"] = current_window.get("start_hour")
+    context_snapshot["last_processed_end_hour"] = current_window.get("end_hour")
 
     return context_snapshot, masked_action_count, len(masked_events)
+
+
+def collect_union_ground_truth_action_events(
+    snapshot_by_window: Mapping[int, Mapping[str, Any]],
+    current_window_index: int,
+    future_window_count: int,
+    actionable_codes: Sequence[str],
+) -> Tuple[List[str], List[int]]:
+    if future_window_count < 0:
+        raise ValueError(f"future_window_count must be >= 0, got {future_window_count}")
+
+    action_code_set = {str(code).strip().upper() for code in actionable_codes if str(code).strip()}
+    events: List[str] = []
+    included_windows: List[int] = []
+    for offset in range(0, int(future_window_count) + 1):
+        window_index = int(current_window_index) + int(offset)
+        snapshot = snapshot_by_window.get(window_index)
+        if not isinstance(snapshot, Mapping):
+            continue
+        current_window = _extract_current_window(snapshot)
+        action_events = [event for event in _window_events(current_window) if _event_code(event) in action_code_set]
+        if not action_events:
+            continue
+        included_windows.append(window_index)
+        events.extend(action_events)
+    return events, included_windows
 
 
 def collect_union_ground_truth_actions(
@@ -950,15 +986,14 @@ def run_experiment(
         idx, patient_record = args
         patient_agent = MedEvoAgent(
             provider=config.llm_provider,
+            observation_config_path=config.med_evo_observation_config_path,
+            episode_block_windows=config.med_evo_episode_block_windows,
+            insight_block_windows=config.med_evo_insight_block_windows,
             model=config.llm_model,
             enable_logging=False,
             window_duration_hours=config.agent_current_window_hours,
             max_working_windows=config.med_evo_max_working_windows,
-            max_critical_events=config.med_evo_max_critical_events,
-            max_window_summaries=config.med_evo_max_window_summaries,
             max_insights=config.med_evo_max_insights,
-            insight_every_n_windows=config.med_evo_insight_every_n_windows,
-            episode_every_n_windows=config.med_evo_episode_every_n_windows,
         )
         return process_single_patient(
             patient_record=patient_record,

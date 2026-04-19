@@ -7,9 +7,10 @@ You will receive one of:
 (B) A structured Memory object with the following layers:
     - patient_metadata
     - working_memory: raw events from recent windows — current local status
-    - critical_events_memory: key change points in patient trajectory
-    - trajectory_memory: global progression since ICU admission
-    - insight_memory: patient-specific deviations from typical ICU trajectories
+    - trend_memory: per-window vital trend statistics
+    - critical_events_memory: episode-level critical events
+    - trajectory_memory: episode summaries
+    - insights: patient-specific deviations from typical ICU trajectories
 
 ## INSTRUCTIONS
 1. Assess the patient's overall clinical state, trajectory, and risk of in-ICU death.
@@ -29,7 +30,7 @@ Respond in JSON format only:
   "confidence": "Low" | "Moderate" | "High",
   "supporting_evidence": [
     {{
-      "source": "raw_event" | "critical_event" | "trajectory" | "insight" | "metadata",
+      "source": "raw_event" | "trend" | "trajectory" | "insight" | "metadata",
       "content": "Brief summary of the evidence",
       "significance": "Why this supports the prediction"
     }}
@@ -59,9 +60,10 @@ You will receive one of:
 (B) A structured Memory object with the following layers:
     - patient_metadata
     - working_memory: raw events from recent windows — current local status
-    - critical_events_memory: key change points in patient trajectory
-    - trajectory_memory: global progression since ICU admission
-    - insight_memory: patient-specific deviations from typical ICU trajectories
+    - trend_memory: per-window vital trend statistics
+    - critical_events_memory: episode-level critical events
+    - trajectory_memory: episode summaries
+    - insights: patient-specific deviations from typical ICU trajectories
 
 ## INSTRUCTIONS
 ### Task1. Overall Status Assessment
@@ -119,9 +121,10 @@ You will receive either one of:
 (B) A structured Memory object with the following layers:
     - patient_metadata
     - working_memory: raw events from recent windows — current local status
-    - critical_events_memory: key change points in patient trajectory
-    - trajectory_memory: global progression since ICU admission
-    - insight_memory: patient-specific deviations from typical ICU trajectories
+    - trend_memory: per-window vital trend statistics
+    - critical_events_memory: episode-level critical events
+    - trajectory_memory: episode summaries
+    - insights: patient-specific deviations from typical ICU trajectories
 
 ## INSTRUCTIONS
 ### Task1. Action Recommendation

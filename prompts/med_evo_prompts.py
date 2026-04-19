@@ -1,156 +1,153 @@
-"""Prompt templates for MedEvo event-grounded multi-agent pipeline."""
+"""Prompt for MedEvo observation-grounded multi-agent pipeline."""
 
 
-def get_event_agent_prompt() -> str:
-    return """You are an ICU EventAgent. You receive a time-ordered list of raw ICU events within a monitoring window.
-Your task is to carefully analyze events that are in CURRENT WINDOW OBSERVATION and identify the subset of critical events that represent meaningful changes in the patient's clinical course. Then, provide a concise summary of the patient's status grounded in the current observed events.
-You will also receive events from previous windows as context, but your analysis and summary should focus on the current window's events.
+def get_episode_agent_prompt() -> str:
+    return """You are an ICU assessment agent. You compress {k} consecutive 30-minute windows ({duration} hours total) into one episode summary and identify the block's critical events.
 
-## WHAT COUNTS AS A CRITICAL EVENT
-Extract a critical event if it represents:
-- New or worsening organ dysfunction regarding of respiratory, cardiovascular, renal, hepatic, and neurological
-- Initiation of a major intervention, such as intubation, vasopressor start, dialysis, or emergency procedure
-- A critical lab result indicating acute physiological derangement
-- A significant escalation or de-escalation in care that reflects a change in clinical trajectory
+## INPUT
 
-Ignore routine stable readings, scheduled medications without clinical context, and minor fluctuations within normal range.
-If no critical event is found, return `"critical_event_ids": []`.
+### Patient metadata
+{patient_metadata}
 
-## OUTPUT FORMAT
-Scope: `critical_event_ids` and `window_summary` must reference only events from CURRENT WINDOW OBSERVATION. 
-Return a single JSON object:
+### Prior episode summary (read-only context)
+Used only to distinguish new from continuing findings and to calibrate baseline. Do not cite from it.
+{prior_episode_summary_text}
+
+### Episode time range
+{episode_start_time} to {episode_end_time}
+
+### Windowed ICU data
+You receive:
+- Raw events for each window, formatted as `[<event_id>] <time> <event_name> <payload>`
+- One grouped `selected vital trends` section summarizing tracked vitals across the whole block
+- In the trend section, only windows with at least one value for that vital are shown, plus an overall summary across the block
+
+{episode_input}
+
+## TASK
+Produce (1) an episode summary and (2) a list of critical events.
+
+### Task 1: Episode summary (3–6 sentences)
+Narrate the block's clinical trajectory: where the patient started the block, what meaningfully happened, where they ended, and what remains unresolved. Focus on direction of travel and inflection points, not a window-by-window recap.
+- Use specific numeric values at inflection points; avoid adjective-only descriptions ("rising", "unstable") without numbers.
+- Include sustained abnormal states only when their persistence is the point (e.g., tachycardia held across the block despite intervention).
+- When the prior summary establishes a condition or intervention, frame current findings as continuation, escalation, or resolution, not new onset.
+- Stay descriptive and temporal. Do not assign diagnoses, syndromes, or mechanisms that are not explicitly in the input.
+- Refer to events by clinical name in prose. Event IDs appear only in `supporting_event_ids`.
+
+
+### Task 2: Critical events
+A critical event is a high-SNR inflection point in the patient's ICU trajectory: a moment that materially changes the clinical story. Reading only the critical events, a clinician should be able to reconstruct the shape of the block.
+
+Critical events typically fall into one of these categories:
+- New or worsening organ dysfunction (respiratory, cardiovascular, renal, hepatic, neurological).
+- Resolution or meaningful improvement of existing organ dysfunction.
+- Initiation of a major intervention (intubation, vasopressor start, dialysis, transfusion for active bleed, emergency procedure).
+- Significant escalation or de-escalation of care reflecting a change in trajectory.
+
+An event qualifies only if it is clinically meaningful on its own, changes how subsequent data should be read, and is corroborated by surrounding trend or events rather than an isolated outlier.
+Exclude routine readings, scheduled medications without clinical context, or noisy measurements.
+Err toward under-listing. If no event meets the bar, return an empty list.
+
+## OUTPUT
+
+Return only a valid JSON object, no prose before or after:
 {
-  "critical_event_ids": ["<event ID>", ...],
-  "window_summary": {
-    "text": "1-2 sentence summary of current patient status, grounded in the events observation",
-    "supporting_event_ids": ["<event ID>", ...]
-  }
+  "episode_summary": {
+    "time_range": "{episode_start_time} to {episode_end_time}",
+    "text": "<3–6 sentence trajectory summary>",
+    "supporting_event_ids": ["<event_id>", ...]
+  },
+  "critical_events": [
+    {
+      "event_id": "<event_id>",
+      "reason": "<why this event is an inflection point in the block's trajectory>"
+    }
+  ]
 }
-    
-## Working Context
-{{working_windows_text}}
 """
 
 
 def get_insight_agent_prompt() -> str:
-    return """You are a clinical insight agent specializing in identifying patient-specific deviations from population-level ICU norms.
+    return """You are a clinical insight agent. Your job is to identify how THIS patient deviates from the population-average ICU patient in similar circumstances, specifically in how they respond to illness and interventions, or how their physiology is trending relative to what the current illness and treatment would predict.
+
+You are generating patient-specific response profiles and trajectory deviations that would change how future data should be interpreted or how future decisions should be weighted.
 
 You will be given:
-- An observation of the current window, including critical events and a summary
-- The patient's existing hypothesis bank
-- Patient metadata including compressed pre-ICU history
-
-Your task is to update the hypothesis bank by reasoning about what makes THIS patient physiologically or clinically distinct: not to summarize events, but to detect signal that would matter for individualized prognosis or treatment.
-
+- The patient's existing hypothesis bank (all hypotheses, active and retired)
+- Patient metadata with compressed pre-ICU history, for background context only
+- The latest episode:
+  - Clinical trajectory summary
+  - Critical events, formatted as `<event_id> <time> <event_name> <payload>`
+  - Vital trend statistics
 
 ## EXISTING HYPOTHESES
 {hypothesis_bank}
 
----
-
 ## PATIENT METADATA
 {patient_metadata}
 
----
+## LATEST EPISODE SUMMARY
+{episode_summary}
 
-## OBSERVATIONS
-{window_summary}
+## LATEST EPISODE CRITICAL EVENTS
 {critical_events}
 
+## LATEST EPISODE VITAL TRENDS
+{vital_trends}
+
 ---
 
-## YOUR TASK
+## TASK 1 - Evidence for existing hypotheses
 
-Work through the following in order:
-
-TASK 1. Evidence for existing hypotheses
-For each active hypothesis, assess whether this window provides:
-- Supporting evidence: observations that reinforce the hypothesis
-- Counter evidence: observations that weaken or contradict it
-- No relevant signal: skip silently
+This is a matching task. Scan the episode for evidence bearing on each active hypothesis. Do not infer beyond what is stated.
+For each hypothesis where the episode provides relevant signal, report:
+- `supporting_evidence`: event IDs or `vital_trend` that reinforce it
+- `counter_evidence`: event IDs or `vital_trend` that weaken it
+Updates must cite at least one piece of evidence. No citation, no update. Skip hypotheses with no relevant signal.
 
 
-TASK 2. New hypothesis generation
+## TASK 2 - New hypothesis generation
 
-Identify whether this window reveals a patient-specific pattern not yet captured in any existing hypothesis. 
-Ask yourself:
-- Does this patient's response to a standard intervention deviate from expected?
-- Is there a trend that suggests an unusual physiological trajectory?
-- Does a combination of findings point toward an atypical clinical picture?
+This task requires reasoning. Before proposing a new hypothesis, mentally construct the population-average trajectory for a patient with this illness receiving these interventions, then compare to what you observe. Only flag a new hypothesis where this patient's pattern meaningfully departs from that reference.
+A valid new hypothesis must:
+- Describe an individualized response profile or trajectory deviation (not a diagnosis, not an event restatement)
+- Be grounded in evidence
+- Include an expected deviation from population-average response (e.g., "below-average," "slower than typical")
+- Be clinically actionable or prognostically relevant
 
-Raise a new hypothesis only if it is:
-- Specific to this patient (not a restatement of the general diagnosis)
-- Grounded in observed data from this or prior windows
-- Clinically actionable or prognostically relevant
+Over-generation is worse than under-generation. Generate at most 2 new hypotheses, if more candidates exist, report only the strongest.
+Do not flag obvious, trivial, or diagnosis-shaped claims. Empty list is acceptable and often correct. Empty list is acceptable and often correct.
 
-Avoid trivial or obvious statements. You can return an empty list if no new insights are warranted.
+## Grounding rules
+- Cite only event IDs that appear in the critical events block, or the token `vital_trend` for claims grounded in trend statistics.
+- Do not invent events, values, or clinical facts not present in the provided inputs.
+
+## Examples of valid new hypotheses
+Example A - individualized response profile:
+  "This patient shows diminished hemodynamic response to fluid resuscitation. Expect below-average MAP rise to standard fluid boluses."
+
+Example B - trajectory deviation:
+  "This patient's respiratory recovery is progressing slower than typical for their current ventilator settings and sedation level. Expect below-average improvement in oxygenation indices over the next shift."
 
 
 ## OUTPUT FORMAT
-Return a JSON object:
+Output only in JSON format:
 {
   "updated_insights": [
     {
-      "hypothesis_id": "<hypothesis_id>",
-      "supporting_evidence": ["<event_id>", ...], // [] if none
-      "counter_evidence": ["<event_id>", ...], // [] if none
+      "hypothesis_id": "<id>",
+      "supporting_evidence": ["<event_id>", ...],
+      "counter_evidence": ["<event_id>", ...]
     }
   ],
   "new_insights": [
     {
-      "hypothesis": "<short and testable clinical hypothesis>",
-      "supporting_evidence": ["<event_id>", ...], 
+      "hypothesis": "<patient-specific pattern + qualitative falsification criterion>",
+      "supporting_evidence": ["<event_id>", ...],
       "counter_evidence": ["<event_id>", ...],
-      "rationale": "why this is patient-specific"
+      "rationale": "why this is a patient-specific deviation from population average"
     }
-  ], // [] if no new insights
-}
-
-Omit a field entirely if there is nothing to report. Empty arrays are acceptable.
-"""
-
-
-def get_episode_agent_prompt() -> str:
-    return """You are an ICU episode compression agent.
-
-You will receive {k} consecutive 30-minute window summaries and their associated critical events,
-covering a contiguous {duration}-hour block of the ICU stay.
-Your task is to compress this block into one coherent episode summary that preserves
-clinically meaningful trajectory signal for downstream reasoning.
-
-## INPUT
-
-### Patient Metadata
-{patient_metadata}
-
-### Episode Time Range
-Start: {episode_start_time} | End: {episode_end_time}
-
-### Window Summaries
-{window_summaries}
-
-### Critical Events
-{critical_events}
-
-## TASK
-
-Produce a single episode summary (3–6 sentences) that:
-1. Describes the clinical trajectory across the {k}-window block — focus on *changes* and *trends*, not snapshot states.
-2. Preserves all high-acuity developments: deterioration signals, intervention responses, and unresolved concerns.
-3. Retains clinically significant stable states (e.g., sustained vasopressor dependence, persistent hypoxia) even if unchanged.
-4. Omits routine stable details that are unremarkable given the patient's baseline and context.
-5. Uses only information present in the provided window summaries and critical events — do not infer or extrapolate beyond them.
-6. For each factual claim in the summary, at least one supporting event ID must exist in `supporting_event_ids`.
-   If a claim is not traceable to any event, either drop it or rephrase to reflect the window summary only.
-
-## OUTPUT FORMAT
-
-Return only a valid JSON object with no additional text:
-{
-  "episode_summary": {
-    "time_range": "{episode_start_time} – {episode_end_time}",
-    "text": "<3–6 sentence trajectory summary>",
-    "supporting_event_ids": ["<event_id>", ...]
-  }
+  ]
 }
 """
