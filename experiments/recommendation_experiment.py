@@ -39,11 +39,13 @@ AGGREGATE_FILENAME = "aggregate_results.json"
 CONTEXT_MODE_MED_EVO_MEMORY = "med_evo_memory"
 CONTEXT_MODE_FULL_HISTORY_EVENTS = "full_history_events"
 CONTEXT_MODE_LOCAL_EVENTS_ONLY = "local_events_only"
+CONTEXT_MODE_ALL = "all"
 SUPPORTED_CONTEXT_MODES = (
     CONTEXT_MODE_MED_EVO_MEMORY,
     CONTEXT_MODE_FULL_HISTORY_EVENTS,
     CONTEXT_MODE_LOCAL_EVENTS_ONLY,
 )
+SUPPORTED_CONTEXT_MODE_CHOICES = SUPPORTED_CONTEXT_MODES + (CONTEXT_MODE_ALL,)
 ORACLE_POSITIVE_ACTION_LABELS = frozenset({"best_practice", "acceptable"})
 EVENT_LINE_CODE_PATTERN = re.compile(
     r"^\s*(?:\[[^\]]+\]\s+)?(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+)?([A-Z][A-Z0-9_]+)\b"
@@ -1056,6 +1058,31 @@ def run_experiment(
     patient_stay_ids_path: Optional[str],
     num_workers: int = 4,
 ) -> Dict[str, Any]:
+    requested_context_mode = str(context_mode).strip()
+    if requested_context_mode == CONTEXT_MODE_ALL:
+        mode_results: Dict[str, Any] = {}
+        for mode in SUPPORTED_CONTEXT_MODES:
+            print("\n" + "=" * 80)
+            print(f"RUNNING CONTEXT MODE: {mode}")
+            print("=" * 80)
+            mode_results[mode] = run_experiment(
+                memory_run=memory_run,
+                snapshot_stride=snapshot_stride,
+                top_k_actions=top_k_actions,
+                prediction_horizon_hours=prediction_horizon_hours,
+                context_mode=mode,
+                oracle_results_dir=oracle_results_dir,
+                verbose=verbose,
+                enable_logging=enable_logging,
+                patient_stay_ids_path=patient_stay_ids_path,
+                num_workers=num_workers,
+            )
+        return {
+            "context_mode": CONTEXT_MODE_ALL,
+            "executed_context_modes": list(SUPPORTED_CONTEXT_MODES),
+            "mode_results": mode_results,
+        }
+
     try:
         normalized_stride = int(snapshot_stride)
     except (TypeError, ValueError) as exc:
@@ -1320,8 +1347,11 @@ def main() -> None:
         "--context-mode",
         type=str,
         required=True,
-        choices=list(SUPPORTED_CONTEXT_MODES),
-        help=("Context construction mode: " "med_evo_memory | full_history_events | local_events_only."),
+        choices=list(SUPPORTED_CONTEXT_MODE_CHOICES),
+        help=(
+            "Context construction mode: "
+            "med_evo_memory | full_history_events | local_events_only | all."
+        ),
     )
     parser.add_argument(
         "--oracle-results-dir",

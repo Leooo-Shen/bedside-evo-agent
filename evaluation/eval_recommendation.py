@@ -43,6 +43,7 @@ BOOTSTRAP_SAMPLES = 1000
 BOOTSTRAP_SEED = 20260409
 FIXED_EVAL_K = 5
 HIT_MATCH_COUNT_THRESHOLD = 1
+ABSOLUTE_TIME_BIN_HOURS = 24.0
 _THREAD_LOCAL = threading.local()
 ORACLE_INTERVAL_DECIMALS = 6
 
@@ -1262,6 +1263,22 @@ def _write_recommendation_analysis_outputs(
     )
     prefix_curve_df.to_csv(output_dir / "plot2_prefix_cumulative_hit_precision_curve.csv", index=False)
 
+    absolute_hour_curve_df = _plot_absolute_hour_curve(
+        window_k_frame,
+        selected_k=selected_k,
+        output_path=output_dir / "plot4_absolute_hour_hit_precision_curve.png",
+    )
+    absolute_hour_curve_df.to_csv(output_dir / "plot4_absolute_hour_hit_precision_curve.csv", index=False)
+
+    absolute_hour_prefix_curve_df = _plot_absolute_hour_prefix_curve(
+        window_k_frame,
+        selected_k=selected_k,
+        output_path=output_dir / "plot5_absolute_hour_prefix_cumulative_hit_precision_curve.png",
+    )
+    absolute_hour_prefix_curve_df.to_csv(
+        output_dir / "plot5_absolute_hour_prefix_cumulative_hit_precision_curve.csv", index=False
+    )
+
     heatmap_long_df, heatmap_source_df = _plot_time_memory_heatmap(
         window_k_frame,
         selected_k=selected_k,
@@ -1315,6 +1332,8 @@ def _write_recommendation_analysis_outputs(
         "selected_k": int(selected_k),
         "relative_curve_df": relative_curve_df,
         "prefix_curve_df": prefix_curve_df,
+        "absolute_hour_curve_df": absolute_hour_curve_df,
+        "absolute_hour_prefix_curve_df": absolute_hour_prefix_curve_df,
         "window_k_frame": window_k_frame,
         "output_dir": output_dir,
         "prediction_root": prediction_root,
@@ -1653,6 +1672,198 @@ def _plot_prefix_curve(
     axes[1].set_ylabel(f"Cumulative Precision@{selected_k}")
     axes[1].set_title(f"Prefix Cumulative Precision@{selected_k}")
     axes[1].set_xlim(0, 100)
+    axes[1].set_ylim(0, 1)
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return mean_df
+
+
+def _absolute_hour_bin_frame(subset: pd.DataFrame) -> Tuple[pd.DataFrame, int, float]:
+    if "hours_since_admission" not in subset.columns:
+        raise ValueError("Absolute-hour plots require hours_since_admission column.")
+
+    frame = subset.copy()
+    frame["hours_since_admission"] = pd.to_numeric(frame["hours_since_admission"], errors="coerce")
+    frame = frame.dropna(subset=["hours_since_admission"]).copy()
+    if frame.empty:
+        raise ValueError("Absolute-hour plots require non-empty hours_since_admission values.")
+    if (frame["hours_since_admission"] < 0).any():
+        raise ValueError("Absolute-hour plots require non-negative hours_since_admission values.")
+
+    max_hour = float(frame["hours_since_admission"].max())
+    max_bin = int(math.floor(max_hour / float(ABSOLUTE_TIME_BIN_HOURS)))
+    max_edge = float((max_bin + 1) * float(ABSOLUTE_TIME_BIN_HOURS))
+    frame["absolute_hour_bin"] = np.floor(
+        frame["hours_since_admission"].to_numpy(dtype=float) / float(ABSOLUTE_TIME_BIN_HOURS)
+    ).astype(int)
+    return frame, max_bin, max_edge
+
+
+def _plot_absolute_hour_curve(
+    window_k_frame: pd.DataFrame,
+    *,
+    selected_k: int,
+    output_path: Path,
+) -> pd.DataFrame:
+    subset = window_k_frame[window_k_frame["k"] == int(selected_k)].copy()
+    if subset.empty:
+        raise ValueError(f"No rows available for selected_k={selected_k}")
+
+    subset, max_bin, max_edge = _absolute_hour_bin_frame(subset)
+
+    rows: List[Dict[str, Any]] = []
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    for hour_bin in range(max_bin + 1):
+        bin_rows = subset[subset["absolute_hour_bin"] == int(hour_bin)]
+        hit_values = bin_rows["hit_at_k"].astype(float).tolist()
+        precision_values = bin_rows["precision_at_k"].astype(float).tolist()
+        hit_ci_low, hit_ci_high = _bootstrap_mean_ci(hit_values, n_samples=BOOTSTRAP_SAMPLES, rng=rng)
+        precision_ci_low, precision_ci_high = _bootstrap_mean_ci(
+            precision_values,
+            n_samples=BOOTSTRAP_SAMPLES,
+            rng=rng,
+        )
+
+        rows.append(
+            {
+                "k": int(selected_k),
+                "absolute_hour_bin": int(hour_bin),
+                "hour_start": float(hour_bin * float(ABSOLUTE_TIME_BIN_HOURS)),
+                "hour_end": float((hour_bin + 1) * float(ABSOLUTE_TIME_BIN_HOURS)),
+                "hour_mid": float((hour_bin + 0.5) * float(ABSOLUTE_TIME_BIN_HOURS)),
+                "n_windows": int(len(bin_rows)),
+                "hit_at_k": float(np.mean(hit_values)) if hit_values else float("nan"),
+                "hit_ci_low": float(hit_ci_low),
+                "hit_ci_high": float(hit_ci_high),
+                "precision_at_k": float(np.mean(precision_values)) if precision_values else float("nan"),
+                "precision_ci_low": float(precision_ci_low),
+                "precision_ci_high": float(precision_ci_high),
+            }
+        )
+
+    plot_df = pd.DataFrame(rows).sort_values("absolute_hour_bin").reset_index(drop=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    x = plot_df["hour_mid"].to_numpy(dtype=float)
+
+    y_hit = plot_df["hit_at_k"].to_numpy(dtype=float)
+    low_hit = plot_df["hit_ci_low"].to_numpy(dtype=float)
+    high_hit = plot_df["hit_ci_high"].to_numpy(dtype=float)
+    axes[0].plot(x, y_hit, marker="o", linewidth=2.2, color="#1f77b4")
+    axes[0].fill_between(x, low_hit, high_hit, alpha=0.18, color="#1f77b4")
+    axes[0].set_xlabel("Hours Since ICU Admission")
+    axes[0].set_ylabel(f"Hit@{selected_k}")
+    axes[0].set_title(f"Absolute-Time Hit@{selected_k}")
+    axes[0].set_xlim(0, max_edge)
+    axes[0].set_ylim(0, 1)
+    axes[0].grid(alpha=0.3)
+
+    y_precision = plot_df["precision_at_k"].to_numpy(dtype=float)
+    low_precision = plot_df["precision_ci_low"].to_numpy(dtype=float)
+    high_precision = plot_df["precision_ci_high"].to_numpy(dtype=float)
+    axes[1].plot(x, y_precision, marker="o", linewidth=2.2, color="#ff7f0e")
+    axes[1].fill_between(x, low_precision, high_precision, alpha=0.18, color="#ff7f0e")
+    axes[1].set_xlabel("Hours Since ICU Admission")
+    axes[1].set_ylabel(f"Precision@{selected_k}")
+    axes[1].set_title(f"Absolute-Time Precision@{selected_k}")
+    axes[1].set_xlim(0, max_edge)
+    axes[1].set_ylim(0, 1)
+    axes[1].grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return plot_df
+
+
+def _plot_absolute_hour_prefix_curve(
+    window_k_frame: pd.DataFrame,
+    *,
+    selected_k: int,
+    output_path: Path,
+) -> pd.DataFrame:
+    subset = window_k_frame[window_k_frame["k"] == int(selected_k)].copy()
+    if subset.empty:
+        raise ValueError(f"No rows available for selected_k={selected_k}")
+
+    subset, max_bin, max_edge = _absolute_hour_bin_frame(subset)
+    subset = subset.sort_values(["patient_id", "hours_since_admission", "window_index"]).reset_index(drop=True)
+    subset["cum_hit_sum"] = subset.groupby("patient_id")["hit_at_k"].cumsum()
+    subset["cum_precision_sum"] = subset.groupby("patient_id")["precision_at_k"].cumsum()
+    subset["cum_count"] = subset.groupby("patient_id").cumcount() + 1
+    subset["prefix_hit_at_k"] = subset["cum_hit_sum"] / subset["cum_count"]
+    subset["prefix_precision_at_k"] = subset["cum_precision_sum"] / subset["cum_count"]
+
+    rows: List[Dict[str, Any]] = []
+    thresholds = [float(index * float(ABSOLUTE_TIME_BIN_HOURS)) for index in range(max_bin + 2)]
+    for threshold in thresholds:
+        patient_hit_values: List[float] = []
+        patient_precision_values: List[float] = []
+
+        for _, patient_df in subset.groupby("patient_id"):
+            valid = patient_df[patient_df["hours_since_admission"] <= float(threshold)]
+            if valid.empty:
+                continue
+            patient_hit_values.append(float(valid["prefix_hit_at_k"].iloc[-1]))
+            patient_precision_values.append(float(valid["prefix_precision_at_k"].iloc[-1]))
+
+        rows.append(
+            {
+                "k": int(selected_k),
+                "hours_since_admission": float(threshold),
+                "num_patients": int(len(patient_hit_values)),
+                "cohort_mean_prefix_hit_at_k": (
+                    float(np.mean(patient_hit_values)) if patient_hit_values else float("nan")
+                ),
+                "cohort_mean_prefix_precision_at_k": (
+                    float(np.mean(patient_precision_values)) if patient_precision_values else float("nan")
+                ),
+            }
+        )
+
+    mean_df = pd.DataFrame(rows)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    for _, patient_df in subset.groupby("patient_id"):
+        x = patient_df["hours_since_admission"].to_numpy(dtype=float)
+        hit_y = patient_df["prefix_hit_at_k"].to_numpy(dtype=float)
+        precision_y = patient_df["prefix_precision_at_k"].to_numpy(dtype=float)
+        axes[0].plot(x, hit_y, color="#1f77b4", alpha=0.18, linewidth=1.0)
+        axes[1].plot(x, precision_y, color="#ff7f0e", alpha=0.18, linewidth=1.0)
+
+    axes[0].plot(
+        mean_df["hours_since_admission"].to_numpy(dtype=float),
+        mean_df["cohort_mean_prefix_hit_at_k"].to_numpy(dtype=float),
+        color="#0b3c8c",
+        linewidth=3.0,
+        marker="o",
+        label=f"Cohort Mean Hit@{selected_k}",
+    )
+    axes[0].set_xlabel("Hours Since ICU Admission")
+    axes[0].set_ylabel(f"Cumulative Hit@{selected_k}")
+    axes[0].set_title(f"Absolute-Time Prefix Hit@{selected_k}")
+    axes[0].set_xlim(0, max_edge)
+    axes[0].set_ylim(0, 1)
+    axes[0].grid(alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(
+        mean_df["hours_since_admission"].to_numpy(dtype=float),
+        mean_df["cohort_mean_prefix_precision_at_k"].to_numpy(dtype=float),
+        color="#b85e00",
+        linewidth=3.0,
+        marker="o",
+        label=f"Cohort Mean Precision@{selected_k}",
+    )
+    axes[1].set_xlabel("Hours Since ICU Admission")
+    axes[1].set_ylabel(f"Cumulative Precision@{selected_k}")
+    axes[1].set_title(f"Absolute-Time Prefix Precision@{selected_k}")
+    axes[1].set_xlim(0, max_edge)
     axes[1].set_ylim(0, 1)
     axes[1].grid(alpha=0.3)
     axes[1].legend()
@@ -2196,6 +2407,125 @@ def _plot_prefix_curve_by_mode(
     return comparison_df
 
 
+def _plot_absolute_hour_curve_by_mode(
+    curve_by_mode: Mapping[str, pd.DataFrame],
+    *,
+    output_path: Path,
+) -> pd.DataFrame:
+    if not curve_by_mode:
+        raise ValueError("No mode curves provided for absolute-hour comparison plot.")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    rows: List[Dict[str, Any]] = []
+    max_hour = 0.0
+    for mode_label, curve_df in curve_by_mode.items():
+        if curve_df.empty:
+            continue
+        ordered = curve_df.sort_values("absolute_hour_bin").reset_index(drop=True)
+        x = ordered["hour_mid"].to_numpy(dtype=float)
+        y_hit = ordered["hit_at_k"].to_numpy(dtype=float)
+        y_precision = ordered["precision_at_k"].to_numpy(dtype=float)
+        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label))
+        axes[1].plot(x, y_precision, marker="o", linewidth=2.2, label=str(mode_label))
+        max_hour = max(max_hour, float(ordered["hour_end"].max()))
+        for _, row in ordered.iterrows():
+            rows.append(
+                {
+                    "mode": str(mode_label),
+                    "absolute_hour_bin": int(row["absolute_hour_bin"]),
+                    "hour_start": float(row["hour_start"]),
+                    "hour_end": float(row["hour_end"]),
+                    "hour_mid": float(row["hour_mid"]),
+                    "n_windows": int(row["n_windows"]),
+                    "hit_at_k": float(row["hit_at_k"]),
+                    "precision_at_k": float(row["precision_at_k"]),
+                }
+            )
+
+    axes[0].set_xlabel("Hours Since ICU Admission")
+    axes[0].set_ylabel(f"Hit@{FIXED_EVAL_K}")
+    axes[0].set_title(f"Absolute-Time Hit@{FIXED_EVAL_K} by Mode")
+    axes[0].set_xlim(0, max_hour)
+    axes[0].set_ylim(0, 1)
+    axes[0].grid(alpha=0.3)
+    axes[0].legend()
+
+    axes[1].set_xlabel("Hours Since ICU Admission")
+    axes[1].set_ylabel(f"Precision@{FIXED_EVAL_K}")
+    axes[1].set_title(f"Absolute-Time Precision@{FIXED_EVAL_K} by Mode")
+    axes[1].set_xlim(0, max_hour)
+    axes[1].set_ylim(0, 1)
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+    comparison_df = pd.DataFrame(rows)
+    if comparison_df.empty:
+        raise ValueError("No rows generated for absolute-hour mode comparison plot.")
+    return comparison_df
+
+
+def _plot_absolute_hour_prefix_curve_by_mode(
+    curve_by_mode: Mapping[str, pd.DataFrame],
+    *,
+    output_path: Path,
+) -> pd.DataFrame:
+    if not curve_by_mode:
+        raise ValueError("No mode curves provided for absolute-hour prefix comparison plot.")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    rows: List[Dict[str, Any]] = []
+    max_hour = 0.0
+    for mode_label, curve_df in curve_by_mode.items():
+        if curve_df.empty:
+            continue
+        ordered = curve_df.sort_values("hours_since_admission").reset_index(drop=True)
+        x = ordered["hours_since_admission"].to_numpy(dtype=float)
+        y_hit = ordered["cohort_mean_prefix_hit_at_k"].to_numpy(dtype=float)
+        y_precision = ordered["cohort_mean_prefix_precision_at_k"].to_numpy(dtype=float)
+        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label))
+        axes[1].plot(x, y_precision, marker="o", linewidth=2.2, label=str(mode_label))
+        max_hour = max(max_hour, float(ordered["hours_since_admission"].max()))
+        for _, row in ordered.iterrows():
+            rows.append(
+                {
+                    "mode": str(mode_label),
+                    "hours_since_admission": float(row["hours_since_admission"]),
+                    "num_patients": int(row["num_patients"]),
+                    "cohort_mean_prefix_hit_at_k": float(row["cohort_mean_prefix_hit_at_k"]),
+                    "cohort_mean_prefix_precision_at_k": float(row["cohort_mean_prefix_precision_at_k"]),
+                }
+            )
+
+    axes[0].set_xlabel("Hours Since ICU Admission")
+    axes[0].set_ylabel(f"Cumulative Hit@{FIXED_EVAL_K}")
+    axes[0].set_title(f"Absolute-Time Prefix Hit@{FIXED_EVAL_K} by Mode")
+    axes[0].set_xlim(0, max_hour)
+    axes[0].set_ylim(0, 1)
+    axes[0].grid(alpha=0.3)
+    axes[0].legend()
+
+    axes[1].set_xlabel("Hours Since ICU Admission")
+    axes[1].set_ylabel(f"Cumulative Precision@{FIXED_EVAL_K}")
+    axes[1].set_title(f"Absolute-Time Prefix Precision@{FIXED_EVAL_K} by Mode")
+    axes[1].set_xlim(0, max_hour)
+    axes[1].set_ylim(0, 1)
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+    comparison_df = pd.DataFrame(rows)
+    if comparison_df.empty:
+        raise ValueError("No rows generated for absolute-hour prefix mode comparison plot.")
+    return comparison_df
+
+
 def _evaluate_single_prediction_dir(
     *,
     prediction_root: Path,
@@ -2268,6 +2598,8 @@ def run_evaluation(
 
             relative_curves_by_mode: Dict[str, pd.DataFrame] = {}
             prefix_curves_by_mode: Dict[str, pd.DataFrame] = {}
+            absolute_hour_curves_by_mode: Dict[str, pd.DataFrame] = {}
+            absolute_hour_prefix_curves_by_mode: Dict[str, pd.DataFrame] = {}
             mode_results: Dict[str, Dict[str, Any]] = {}
             for mode in sorted(mode_dirs.keys()):
                 mode_output_dir = output_root / mode
@@ -2280,6 +2612,8 @@ def run_evaluation(
                 mode_label = f"{mode} (K={int(single_result['selected_k'])})"
                 relative_curves_by_mode[mode_label] = single_result["relative_curve_df"]
                 prefix_curves_by_mode[mode_label] = single_result["prefix_curve_df"]
+                absolute_hour_curves_by_mode[mode_label] = single_result["absolute_hour_curve_df"]
+                absolute_hour_prefix_curves_by_mode[mode_label] = single_result["absolute_hour_prefix_curve_df"]
                 mode_results[mode] = single_result
 
             if len(relative_curves_by_mode) > 1:
@@ -2298,6 +2632,25 @@ def run_evaluation(
                 )
                 combined_prefix_df.to_csv(
                     output_root / "plot2_prefix_cumulative_hit_precision_curve_by_mode.csv", index=False
+                )
+
+            if len(absolute_hour_curves_by_mode) > 1:
+                combined_absolute_hour_df = _plot_absolute_hour_curve_by_mode(
+                    absolute_hour_curves_by_mode,
+                    output_path=output_root / "plot4_absolute_hour_hit_precision_curve_by_mode.png",
+                )
+                combined_absolute_hour_df.to_csv(
+                    output_root / "plot4_absolute_hour_hit_precision_curve_by_mode.csv", index=False
+                )
+
+            if len(absolute_hour_prefix_curves_by_mode) > 1:
+                combined_absolute_hour_prefix_df = _plot_absolute_hour_prefix_curve_by_mode(
+                    absolute_hour_prefix_curves_by_mode,
+                    output_path=output_root / "plot5_absolute_hour_prefix_cumulative_hit_precision_curve_by_mode.png",
+                )
+                combined_absolute_hour_prefix_df.to_csv(
+                    output_root / "plot5_absolute_hour_prefix_cumulative_hit_precision_curve_by_mode.csv",
+                    index=False,
                 )
 
             patient_relative_count, patient_prefix_count = _plot_patient_mode_comparison_curves(
@@ -2332,6 +2685,8 @@ def run_evaluation(
 
         relative_curves_by_mode: Dict[str, pd.DataFrame] = {}
         prefix_curves_by_mode: Dict[str, pd.DataFrame] = {}
+        absolute_hour_curves_by_mode: Dict[str, pd.DataFrame] = {}
+        absolute_hour_prefix_curves_by_mode: Dict[str, pd.DataFrame] = {}
         mode_results: Dict[str, Dict[str, Any]] = {}
         for mode in sorted(mode_dirs.keys()):
             prediction_root = mode_dirs[mode]
@@ -2347,6 +2702,8 @@ def run_evaluation(
             mode_label = f"{mode} (K={int(single_result['selected_k'])})"
             relative_curves_by_mode[mode_label] = single_result["relative_curve_df"]
             prefix_curves_by_mode[mode_label] = single_result["prefix_curve_df"]
+            absolute_hour_curves_by_mode[mode_label] = single_result["absolute_hour_curve_df"]
+            absolute_hour_prefix_curves_by_mode[mode_label] = single_result["absolute_hour_prefix_curve_df"]
             mode_results[mode] = single_result
 
         if len(relative_curves_by_mode) > 1:
@@ -2365,6 +2722,25 @@ def run_evaluation(
             )
             combined_prefix_df.to_csv(
                 output_root / "plot2_prefix_cumulative_hit_precision_curve_by_mode.csv", index=False
+            )
+
+        if len(absolute_hour_curves_by_mode) > 1:
+            combined_absolute_hour_df = _plot_absolute_hour_curve_by_mode(
+                absolute_hour_curves_by_mode,
+                output_path=output_root / "plot4_absolute_hour_hit_precision_curve_by_mode.png",
+            )
+            combined_absolute_hour_df.to_csv(
+                output_root / "plot4_absolute_hour_hit_precision_curve_by_mode.csv", index=False
+            )
+
+        if len(absolute_hour_prefix_curves_by_mode) > 1:
+            combined_absolute_hour_prefix_df = _plot_absolute_hour_prefix_curve_by_mode(
+                absolute_hour_prefix_curves_by_mode,
+                output_path=output_root / "plot5_absolute_hour_prefix_cumulative_hit_precision_curve_by_mode.png",
+            )
+            combined_absolute_hour_prefix_df.to_csv(
+                output_root / "plot5_absolute_hour_prefix_cumulative_hit_precision_curve_by_mode.csv",
+                index=False,
             )
 
         patient_relative_count, patient_prefix_count = _plot_patient_mode_comparison_curves(

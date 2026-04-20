@@ -38,11 +38,13 @@ AGGREGATE_FILENAME = "aggregate_results.json"
 CONTEXT_MODE_MED_EVO_MEMORY = "med_evo_memory"
 CONTEXT_MODE_FULL_HISTORY_EVENTS = "full_history_events"
 CONTEXT_MODE_LOCAL_EVENTS_ONLY = "local_events_only"
+CONTEXT_MODE_ALL = "all"
 SUPPORTED_CONTEXT_MODES = (
     CONTEXT_MODE_MED_EVO_MEMORY,
     CONTEXT_MODE_FULL_HISTORY_EVENTS,
     CONTEXT_MODE_LOCAL_EVENTS_ONLY,
 )
+SUPPORTED_CONTEXT_MODE_CHOICES = SUPPORTED_CONTEXT_MODES + (CONTEXT_MODE_ALL,)
 
 
 def _normalize_token_count(value: Any) -> int:
@@ -351,6 +353,28 @@ def run_experiment(
     patient_stay_ids_path: Optional[str] = None,
     num_workers: int = 1,
 ) -> Dict[str, Any]:
+    requested_context_mode = str(context_mode).strip()
+    if requested_context_mode == CONTEXT_MODE_ALL:
+        mode_results: Dict[str, Any] = {}
+        for mode in SUPPORTED_CONTEXT_MODES:
+            print("\n" + "=" * 80)
+            print(f"RUNNING CONTEXT MODE: {mode}")
+            print("=" * 80)
+            mode_results[mode] = run_experiment(
+                memory_run=memory_run,
+                context_mode=mode,
+                snapshot_hour=snapshot_hour,
+                verbose=verbose,
+                enable_logging=enable_logging,
+                patient_stay_ids_path=patient_stay_ids_path,
+                num_workers=num_workers,
+            )
+        return {
+            "context_mode": CONTEXT_MODE_ALL,
+            "executed_context_modes": list(SUPPORTED_CONTEXT_MODES),
+            "mode_results": mode_results,
+        }
+
     normalized_snapshot_hour: Optional[float] = None
     if snapshot_hour is not None:
         try:
@@ -367,7 +391,7 @@ def run_experiment(
     if num_workers < 1:
         raise ValueError(f"num_workers must be >= 1, got {num_workers}")
 
-    normalized_context_mode = _normalize_context_mode(context_mode)
+    normalized_context_mode = _normalize_context_mode(requested_context_mode)
 
     config = get_config()
     memory_run_dir = resolve_memory_run_dir(memory_run)
@@ -573,8 +597,8 @@ def main() -> None:
         "--context-mode",
         type=str,
         required=True,
-        choices=list(SUPPORTED_CONTEXT_MODES),
-        help="Context construction mode: med_evo_memory | full_history_events | local_events_only.",
+        choices=list(SUPPORTED_CONTEXT_MODE_CHOICES),
+        help="Context construction mode: med_evo_memory | full_history_events | local_events_only | all.",
     )
 
     args = parser.parse_args()

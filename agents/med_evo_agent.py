@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from model.llms import LLMClient
 from prompts.med_evo_prompts import get_episode_agent_prompt, get_insight_agent_prompt
@@ -22,6 +22,7 @@ from utils.json_parse import parse_json_dict_or_raise
 
 PRE_ICU_COMPRESSION_STEP_TYPE = "med_evo_pre_icu_history_compressor"
 OBSERVATION_STEP_TYPE = "med_evo_observation_agent"
+MED_EVO_SCHEMA_MAX_ATTEMPTS = 4
 VITAL_CODE = "VITALS"
 OBSERVATION_REQUIRED_VITAL_SOURCES = {
     "heart_rate_bpm": {"Heart Rate, bpm", "Heart Rate"},
@@ -85,6 +86,159 @@ def _normalize_token_count(value: Any) -> int:
 
 def _parse_json_response(response: Any) -> Dict[str, Any]:
     return parse_json_dict_or_raise(response)
+
+
+def _validate_episode_output_schema(payload: Any) -> Tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "Top-level payload is not a JSON object."
+
+    summary_payload = payload.get("episode_summary", payload.get("episode"))
+    if not isinstance(summary_payload, dict):
+        return False, "Missing episode_summary object."
+
+    episode_text = _safe_text(summary_payload.get("text"))
+    if not episode_text:
+        episode_text = _safe_text(summary_payload.get("episode_summary"))
+    if not episode_text:
+        episode_text = _safe_text(payload.get("text"))
+    if not episode_text:
+        return False, "Missing episode summary text."
+
+    supporting_event_ids = summary_payload.get(
+        "supporting_event_ids",
+        summary_payload.get("supporting_evidence", payload.get("supporting_event_ids", [])),
+    )
+    if not isinstance(supporting_event_ids, list):
+        return False, "episode_summary.supporting_event_ids must be a list."
+
+    critical_events = payload.get("critical_events")
+    if not isinstance(critical_events, list):
+        return False, "critical_events must be a list."
+
+    for item in critical_events:
+        if not isinstance(item, dict):
+            return False, "Each critical_events item must be an object."
+        reason = _safe_text(item.get("reason"))
+        if not reason:
+            return False, "Each critical_events item must include reason."
+        supporting = item.get("supporting_event_ids", item.get("supporting_evidence", []))
+        if supporting is not None and not isinstance(supporting, list):
+            return False, "Each critical_events item must include list-valued supporting_event_ids."
+        event_text = _safe_text(item.get("event"))
+        if item.get("event_id") is None and not event_text and not supporting:
+            return False, "Each critical_events item must include event_id, event, or supporting_event_ids."
+
+    return True, ""
+
+
+def _validate_insight_output_schema(payload: Any) -> Tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "Top-level payload is not a JSON object."
+
+    insight_updates = payload.get("insight_updates")
+    updated_insights = payload.get("updated_insights")
+    if insight_updates is None and updated_insights is None:
+        return False, "Missing insight_updates or updated_insights list."
+
+    updates = insight_updates if insight_updates is not None else updated_insights
+    if not isinstance(updates, list):
+        return False, "insight_updates/updated_insights must be a list."
+
+    if insight_updates is not None and not isinstance(insight_updates, list):
+        return False, "insight_updates must be a list."
+    if updated_insights is not None and not isinstance(updated_insights, list):
+        return False, "updated_insights must be a list."
+
+    new_insights = payload.get("new_insights")
+    if not isinstance(new_insights, list):
+        return False, "new_insights must be a list."
+
+    for item in updates:
+        if not isinstance(item, dict):
+            return False, "Each insight_updates item must be an object."
+        raw_id = item.get("insight_id", item.get("hypothesis_id"))
+        if raw_id is None:
+            return False, "Each insight_updates item must include insight_id or hypothesis_id."
+
+    for item in new_insights:
+        if not isinstance(item, dict):
+            return False, "Each new_insights item must be an object."
+        if not _safe_text(item.get("hypothesis")):
+            return False, "Each new_insights item must include hypothesis."
+
+    return True, ""
+
+
+def _validate_pre_icu_compression_output_schema(payload: Any) -> Tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "Top-level payload is not a JSON object."
+    compressed = _safe_text(payload.get("compressed_pre_icu_history"))
+    if not compressed:
+        return False, "compressed_pre_icu_history missing in LLM response."
+    return True, ""
+
+
+def _chat_with_schema_validation(
+    *,
+    llm_client: LLMClient,
+    prompt: str,
+    schema_validator: Callable[[Any], Tuple[bool, str]],
+    max_attempts: int,
+) -> Tuple[Dict[str, Any], str, Dict[str, Any], Optional[str], int]:
+    attempts = max(1, int(max_attempts))
+    total_input_tokens = 0
+    total_output_tokens = 0
+    last_raw = ""
+    last_parsed: Dict[str, Any] = {}
+    errors: List[str] = []
+
+    for attempt_index in range(1, attempts + 1):
+        response = llm_client.chat(prompt=prompt, response_format="text")
+        usage = response.get("usage", {}) if isinstance(response.get("usage"), dict) else {}
+        total_input_tokens += _normalize_token_count(usage.get("input_tokens", 0))
+        total_output_tokens += _normalize_token_count(usage.get("output_tokens", 0))
+
+        raw = _safe_text(response.get("content"))
+        parse_error: Optional[str] = None
+        parsed: Dict[str, Any] = {}
+        for candidate in (response.get("parsed"), raw):
+            if candidate is None:
+                continue
+            try:
+                parsed = _parse_json_response(candidate)
+                parse_error = None
+                break
+            except Exception as exc:
+                parse_error = str(exc)
+
+        schema_ok = False
+        schema_error: Optional[str] = None
+        if parse_error is None:
+            schema_ok, schema_error = schema_validator(parsed)
+        else:
+            schema_error = parse_error
+
+        last_raw = raw
+        last_parsed = parsed if isinstance(parsed, dict) else {}
+        if schema_ok:
+            return (
+                last_parsed,
+                last_raw,
+                {"input_tokens": total_input_tokens, "output_tokens": total_output_tokens},
+                None,
+                attempt_index,
+            )
+
+        errors.append(schema_error or "Schema validation failed.")
+
+    error_text = " | ".join(errors)
+    return (
+        last_parsed,
+        last_raw,
+        {"input_tokens": total_input_tokens, "output_tokens": total_output_tokens},
+        f"Schema validation failed after {attempts} attempts: {error_text}",
+        attempts,
+    )
 
 
 def _normalize_int_list(value: Any) -> List[int]:
@@ -1181,21 +1335,14 @@ class EpisodeAgent:
             },
         )
 
-        response = self.llm_client.chat(prompt=prompt, response_format="text")
-        raw = response.get("content", "")
-        usage = response.get("usage", {})
-
-        parse_error: Optional[str] = None
-        parsed: Dict[str, Any] = {}
-        for candidate in (response.get("parsed"), raw):
-            if candidate is None:
-                continue
-            try:
-                parsed = _parse_json_response(candidate)
-                parse_error = None
-                break
-            except Exception as exc:
-                parse_error = str(exc)
+        parsed, raw, usage, parse_error, attempt_index = _chat_with_schema_validation(
+            llm_client=self.llm_client,
+            prompt=prompt,
+            schema_validator=_validate_episode_output_schema,
+            max_attempts=MED_EVO_SCHEMA_MAX_ATTEMPTS,
+        )
+        if parse_error is not None:
+            parse_error = f"{parse_error} | final_attempt={attempt_index}/{MED_EVO_SCHEMA_MAX_ATTEMPTS}"
 
         return parsed, raw, usage, prompt, parse_error
 
@@ -1247,21 +1394,14 @@ class InsightAgent:
             },
         )
 
-        response = self.llm_client.chat(prompt=prompt, response_format="text")
-        raw = response.get("content", "")
-        usage = response.get("usage", {})
-
-        parse_error: Optional[str] = None
-        parsed: Dict[str, Any] = {}
-        for candidate in (response.get("parsed"), raw):
-            if candidate is None:
-                continue
-            try:
-                parsed = _parse_json_response(candidate)
-                parse_error = None
-                break
-            except Exception as exc:
-                parse_error = str(exc)
+        parsed, raw, usage, parse_error, attempt_index = _chat_with_schema_validation(
+            llm_client=self.llm_client,
+            prompt=prompt,
+            schema_validator=_validate_insight_output_schema,
+            max_attempts=MED_EVO_SCHEMA_MAX_ATTEMPTS,
+        )
+        if parse_error is not None:
+            parse_error = f"{parse_error} | final_attempt={attempt_index}/{MED_EVO_SCHEMA_MAX_ATTEMPTS}"
 
         return parsed, raw, usage, prompt, parse_error
 
@@ -1489,25 +1629,15 @@ class MedEvoAgent:
             }
 
         prompt = format_pre_icu_compression_prompt(pre_icu_history)
-        response = self.llm_client.chat(prompt=prompt, response_format="text")
-        response_raw = _safe_text(response.get("content"))
-        response_usage = response.get("usage", {})
-
-        parse_error: Optional[str] = None
-        parsed: Dict[str, Any] = {}
-        for candidate in (response.get("parsed"), response_raw):
-            if candidate is None:
-                continue
-            try:
-                parsed = _parse_json_response(candidate)
-                parse_error = None
-                break
-            except Exception as exc:
-                parse_error = str(exc)
-
+        parsed, response_raw, response_usage, parse_error, attempt_index = _chat_with_schema_validation(
+            llm_client=self.llm_client,
+            prompt=prompt,
+            schema_validator=_validate_pre_icu_compression_output_schema,
+            max_attempts=MED_EVO_SCHEMA_MAX_ATTEMPTS,
+        )
         compressed_text = _safe_text(parsed.get("compressed_pre_icu_history"))
-        if not compressed_text and parse_error is None:
-            parse_error = "compressed_pre_icu_history missing in LLM response."
+        if parse_error is not None:
+            parse_error = f"{parse_error} | final_attempt={attempt_index}/{MED_EVO_SCHEMA_MAX_ATTEMPTS}"
 
         input_tokens = _normalize_token_count(response_usage.get("input_tokens", 0))
         output_tokens = _normalize_token_count(response_usage.get("output_tokens", 0))
