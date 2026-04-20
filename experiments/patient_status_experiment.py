@@ -1,11 +1,13 @@
 """Patient status prediction from precomputed MedEvo memory runs and event baselines."""
 
+from __future__ import annotations
+
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 # Add project root to Python path
 project_root = Path(__file__).parent.parent
@@ -23,8 +25,8 @@ from experiments.create_memory import (
     load_patient_memory_payload,
     render_snapshot_to_text,
     resolve_memory_run_dir,
-    select_snapshots_with_stride,
 )
+from experiments.oracle.common import extract_overall_label
 from prompts.predictor_prompts import get_patient_status_prediction_prompt
 from utils.event_format import format_event_lines
 from utils.json_parse import parse_json_dict_best_effort
@@ -42,6 +44,7 @@ SUPPORTED_CONTEXT_MODES = (
     CONTEXT_MODE_FULL_HISTORY_EVENTS,
     CONTEXT_MODE_LOCAL_EVENTS_ONLY,
 )
+ORACLE_INTERVAL_DECIMALS = 6
 
 
 def _normalize_token_count(value: Any) -> int:
@@ -101,6 +104,146 @@ def _sum_numeric_stats(items: List[Dict[str, Any]]) -> Dict[str, float]:
             if isinstance(value, (int, float)):
                 totals[key] = totals.get(key, 0.0) + float(value)
     return totals
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing file: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in {path}")
+    return payload
+
+
+def _interval_key(start_hour: float, end_hour: float) -> Tuple[float, float]:
+    return (round(float(start_hour), ORACLE_INTERVAL_DECIMALS), round(float(end_hour), ORACLE_INTERVAL_DECIMALS))
+
+
+def _interval_marker_id(interval_key: Tuple[float, float]) -> str:
+    return f"{interval_key[0]:.{ORACLE_INTERVAL_DECIMALS}f}|{interval_key[1]:.{ORACLE_INTERVAL_DECIMALS}f}"
+
+
+def _safe_optional_int(value: Any, *, field_name: str, source_path: Path) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {field_name}={value!r} in {source_path}") from exc
+
+
+def _snapshot_interval(snapshot: Mapping[str, Any], *, source_label: str) -> Tuple[float, float]:
+    start_raw = snapshot.get("last_processed_start_hour")
+    end_raw = snapshot.get("last_processed_end_hour")
+    try:
+        start_hour = float(start_raw)
+        end_hour = float(end_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Missing/invalid snapshot hour bounds in {source_label}: "
+            f"last_processed_start_hour={start_raw!r}, last_processed_end_hour={end_raw!r}"
+        ) from exc
+    if end_hour <= start_hour:
+        raise ValueError(f"Invalid snapshot hour bounds in {source_label}: start={start_hour}, end={end_hour}")
+    return start_hour, end_hour
+
+
+def _oracle_interval_from_row(row: Mapping[str, Any], oracle_prediction_path: Path) -> Tuple[float, float]:
+    metadata = row.get("window_metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"Missing window_metadata in row in {oracle_prediction_path}")
+    start_raw = metadata.get("hours_since_admission")
+    duration_raw = metadata.get("current_window_hours")
+    try:
+        start_hour = float(start_raw)
+        duration_hours = float(duration_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid oracle window hours in {oracle_prediction_path}: "
+            f"hours_since_admission={start_raw!r}, current_window_hours={duration_raw!r}"
+        ) from exc
+    if duration_hours <= 0:
+        raise ValueError(
+            f"Oracle current_window_hours must be > 0 in {oracle_prediction_path}, got {duration_hours!r}"
+        )
+    return start_hour, start_hour + duration_hours
+
+
+def _build_oracle_marker(
+    *,
+    row: Mapping[str, Any],
+    interval_key: Tuple[float, float],
+    oracle_prediction_path: Path,
+) -> Dict[str, Any]:
+    metadata = row.get("window_metadata")
+    metadata_payload = metadata if isinstance(metadata, Mapping) else {}
+    marker = {
+        "marker_id": _interval_marker_id(interval_key),
+        "interval_start_hour": float(interval_key[0]),
+        "interval_end_hour": float(interval_key[1]),
+        "window_index": _safe_optional_int(
+            row.get("window_index"),
+            field_name="window_index",
+            source_path=oracle_prediction_path,
+        ),
+        "source_window_index": _safe_optional_int(
+            row.get("source_window_index", metadata_payload.get("source_window_index")),
+            field_name="source_window_index",
+            source_path=oracle_prediction_path,
+        ),
+        "stride_source_window_index": _safe_optional_int(
+            row.get("stride_source_window_index", metadata_payload.get("stride_source_window_index")),
+            field_name="stride_source_window_index",
+            source_path=oracle_prediction_path,
+        ),
+    }
+    return marker
+
+
+def _load_oracle_status_labels_by_interval(
+    oracle_prediction_path: Path,
+) -> Tuple[Dict[Tuple[float, float], str], Set[Tuple[float, float]], Dict[Tuple[float, float], Dict[str, Any]]]:
+    payload = _read_json(oracle_prediction_path)
+    window_outputs = payload.get("window_outputs")
+    if not isinstance(window_outputs, list):
+        raise ValueError(f"Invalid window_outputs list in {oracle_prediction_path}")
+
+    labels_by_interval: Dict[Tuple[float, float], str] = {}
+    labeled_intervals: Set[Tuple[float, float]] = set()
+    markers_by_interval: Dict[Tuple[float, float], Dict[str, Any]] = {}
+    for row in window_outputs:
+        if not isinstance(row, Mapping):
+            raise ValueError(f"Invalid row in window_outputs in {oracle_prediction_path}")
+        interval_start, interval_end = _oracle_interval_from_row(
+            row=row, oracle_prediction_path=oracle_prediction_path
+        )
+        interval = _interval_key(interval_start, interval_end)
+        if interval in markers_by_interval:
+            raise ValueError(f"Duplicate oracle interval marker for interval={interval} in {oracle_prediction_path}")
+        marker = _build_oracle_marker(row=row, interval_key=interval, oracle_prediction_path=oracle_prediction_path)
+        markers_by_interval[interval] = marker
+
+        oracle_output = row.get("oracle_output")
+        if not isinstance(oracle_output, Mapping):
+            continue
+        label = normalize_status_label(extract_overall_label(oracle_output))
+        labels_by_interval[interval] = label
+        labeled_intervals.add(interval)
+
+    return labels_by_interval, labeled_intervals, markers_by_interval
+
+
+def _select_records_with_stride(records: List[Dict[str, Any]], stride: int) -> List[Dict[str, Any]]:
+    if not records:
+        return []
+    normalized_stride = int(stride)
+    if normalized_stride < 1:
+        raise ValueError(f"stride must be >= 1, got {normalized_stride}")
+    selected = [record for idx, record in enumerate(records) if idx % normalized_stride == 0]
+    if not selected or selected[-1] is not records[-1]:
+        selected.append(records[-1])
+    return selected
 
 
 def _extract_current_window(snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -186,6 +329,7 @@ def process_single_patient(
     agent: MedEvoAgent,
     snapshot_stride: int,
     context_mode: str,
+    oracle_results_dir: Path,
     memory_run_dir: Path,
     results_dir: Path,
     patient_idx: int,
@@ -221,19 +365,43 @@ def process_single_patient(
             print("   WARNING: No snapshots found in source memory, skipping...")
             return None
 
-        selected_snapshots = select_snapshots_with_stride(
-            windowed_snapshots=windowed_snapshots,
-            stride=snapshot_stride,
+        oracle_prediction_path = (
+            oracle_results_dir / "patients" / f"{subject_id}_{icu_stay_id}" / "oracle_predictions.json"
         )
+        (
+            oracle_labels_by_interval,
+            oracle_labeled_intervals,
+            oracle_markers_by_interval,
+        ) = _load_oracle_status_labels_by_interval(oracle_prediction_path)
+        snapshot_records: List[Dict[str, Any]] = []
+        for window_idx, snapshot in windowed_snapshots:
+            start_hour, end_hour = _snapshot_interval(
+                snapshot,
+                source_label=f"{source_patient_dir}/memory_database.json window_index={window_idx}",
+            )
+            snapshot_records.append(
+                {
+                    "window_index": int(window_idx),
+                    "snapshot": snapshot,
+                    "start_hour": float(start_hour),
+                    "end_hour": float(end_hour),
+                    "interval_key": _interval_key(start_hour, end_hour),
+                }
+            )
+        labeled_snapshot_records = [
+            record for record in snapshot_records if record["interval_key"] in oracle_labeled_intervals
+        ]
+        selected_snapshot_records = _select_records_with_stride(labeled_snapshot_records, snapshot_stride)
         snapshot_by_window = {int(window_idx): snapshot for window_idx, snapshot in windowed_snapshots}
-        if not selected_snapshots:
+        if not selected_snapshot_records:
             print("   WARNING: No selected snapshots found, skipping...")
             return None
 
         if verbose:
             print(
                 f"   Memory snapshots: total={len(windowed_snapshots)}, "
-                f"selected={len(selected_snapshots)}, stride={snapshot_stride}"
+                f"oracle_labeled={len(labeled_snapshot_records)}, "
+                f"selected={len(selected_snapshot_records)}, stride={snapshot_stride}"
             )
             print("   Status inference uses every selected snapshot.")
 
@@ -244,8 +412,26 @@ def process_single_patient(
         full_history_context_limit_reached = False
         full_history_context_limit_window_index: Optional[int] = None
         full_history_context_limit_message = ""
-        for sequence_idx, (selected_window_index, snapshot_for_status) in enumerate(selected_snapshots, start=1):
-            inferred_window_index, hours, num_current_events = extract_snapshot_window_features(snapshot_for_status)
+        for sequence_idx, selected_record in enumerate(selected_snapshot_records, start=1):
+            selected_window_index = int(selected_record["window_index"])
+            snapshot_for_status = selected_record["snapshot"]
+            current_start_hour = float(selected_record["start_hour"])
+            current_end_hour = float(selected_record["end_hour"])
+            current_interval_key = selected_record["interval_key"]
+            current_oracle_marker = oracle_markers_by_interval.get(current_interval_key)
+            if not isinstance(current_oracle_marker, Mapping):
+                raise ValueError(
+                    f"Missing oracle marker for current interval={current_interval_key} "
+                    f"for patient={subject_id}_{icu_stay_id}"
+                )
+            ground_truth_status_label = oracle_labels_by_interval.get(current_interval_key)
+            if ground_truth_status_label is None:
+                raise ValueError(
+                    f"Missing oracle status label for current interval={current_interval_key} "
+                    f"for patient={subject_id}_{icu_stay_id}"
+                )
+
+            inferred_window_index, _, num_current_events = extract_snapshot_window_features(snapshot_for_status)
             if inferred_window_index >= 0:
                 window_index = inferred_window_index
             else:
@@ -326,10 +512,16 @@ def process_single_patient(
                 {
                     "window_index": int(window_index),
                     "snapshot_sequence": int(sequence_idx),
-                    "hours_since_admission": float(hours),
+                    "hours_since_admission": float(current_start_hour),
+                    "window_start_hour": float(current_start_hour),
+                    "window_end_hour": float(current_end_hour),
+                    "window_duration_hours": float(current_end_hour - current_start_hour),
                     "num_current_events": int(num_current_events),
                     "snapshot_source": str(snapshot_source),
                     "context_mode": str(context_mode),
+                    "oracle_window_marker_id": str(current_oracle_marker.get("marker_id") or ""),
+                    "oracle_window_marker": dict(current_oracle_marker),
+                    "ground_truth_status_label": str(ground_truth_status_label),
                     "status_label": status_label,
                     "status_rationale": status_rationale,
                     "active_risks": active_risks,
@@ -343,7 +535,7 @@ def process_single_patient(
                     "timestamp": datetime.now().isoformat(),
                     "patient_id": f"{subject_id}_{icu_stay_id}",
                     "window_index": int(window_index),
-                    "hours_since_admission": float(hours),
+                    "hours_since_admission": float(current_start_hour),
                     "prompt": prompt,
                     "response": raw_response,
                     "parsed_response": parsed_prediction,
@@ -357,6 +549,7 @@ def process_single_patient(
                         "context_mode": str(context_mode),
                         "snapshot_sequence": int(sequence_idx),
                         "memory_run": str(memory_run_dir),
+                        "oracle_window_marker_id": str(current_oracle_marker.get("marker_id") or ""),
                         "prediction_error": prediction_error,
                     },
                 }
@@ -383,8 +576,13 @@ def process_single_patient(
             "memory_run": str(memory_run_dir),
             "source_patient_dir": str(source_patient_dir),
             "context_mode": str(context_mode),
+            "oracle_results_dir": str(oracle_results_dir),
             "num_memory_snapshots": len(windowed_snapshots),
+            "num_oracle_labeled_snapshots": len(labeled_snapshot_records),
+            "num_selected_snapshots_for_prediction": len(selected_snapshot_records),
             "snapshot_stride": snapshot_stride,
+            "window_alignment_mode": "oracle_interval_time_match",
+            "selection_mode": "oracle_labeled_window_time_match_then_stride",
             "status_distribution": status_distribution,
             "num_failed_status_predictions": int(num_failed_status_predictions),
             "status_predictions": status_predictions,
@@ -405,6 +603,8 @@ def process_single_patient(
             "memory_run": str(memory_run_dir),
             "context_mode": str(context_mode),
             "num_memory_snapshots": len(windowed_snapshots),
+            "num_oracle_labeled_snapshots": len(labeled_snapshot_records),
+            "num_selected_snapshots_for_prediction": len(selected_snapshot_records),
             "snapshot_stride": snapshot_stride,
             "final_status_label": (
                 status_predictions[-1]["status_label"] if status_predictions else "insufficient_data"
@@ -438,6 +638,8 @@ def process_single_patient(
             "actual_outcome": actual_outcome,
             "context_mode": str(context_mode),
             "num_memory_snapshots": len(windowed_snapshots),
+            "num_oracle_labeled_snapshots": len(labeled_snapshot_records),
+            "num_selected_snapshots_for_prediction": len(selected_snapshot_records),
             "snapshot_stride": snapshot_stride,
             "num_status_predictions": len(status_predictions),
             "status_distribution": status_distribution,
@@ -469,26 +671,35 @@ def run_experiment(
     memory_run: str,
     snapshot_stride: int = 1,
     context_mode: str = "",
+    oracle_results_dir: str = "",
     verbose: bool = True,
     enable_logging: bool = True,
     patient_stay_ids_path: Optional[str] = None,
     num_workers: int = 2,
 ) -> Dict[str, Any]:
     try:
-        snapshot_stride = max(1, int(snapshot_stride))
-    except (TypeError, ValueError):
-        snapshot_stride = 1
+        normalized_stride = int(snapshot_stride)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid snapshot_stride value: {snapshot_stride}") from exc
+    if normalized_stride < 1:
+        raise ValueError(f"snapshot_stride must be >= 1, got {normalized_stride}")
     try:
-        num_workers = int(num_workers)
+        normalized_num_workers = int(num_workers)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid num_workers value: {num_workers}") from exc
-    if num_workers < 1:
-        raise ValueError(f"num_workers must be >= 1, got {num_workers}")
+    if normalized_num_workers < 1:
+        raise ValueError(f"num_workers must be >= 1, got {normalized_num_workers}")
     normalized_context_mode = str(context_mode).strip()
     if normalized_context_mode not in SUPPORTED_CONTEXT_MODES:
         raise ValueError(
             f"Unsupported context_mode={context_mode}. " f"Supported modes: {', '.join(SUPPORTED_CONTEXT_MODES)}"
         )
+    normalized_oracle_results_dir = Path(str(oracle_results_dir))
+    if not normalized_oracle_results_dir.exists() or not normalized_oracle_results_dir.is_dir():
+        raise FileNotFoundError(f"Oracle results directory not found: {normalized_oracle_results_dir}")
+    oracle_patients_dir = normalized_oracle_results_dir / "patients"
+    if not oracle_patients_dir.exists() or not oracle_patients_dir.is_dir():
+        raise FileNotFoundError(f"Oracle patients directory not found: {oracle_patients_dir}")
 
     config = get_config()
     memory_run_dir = resolve_memory_run_dir(memory_run)
@@ -498,9 +709,10 @@ def run_experiment(
     print("PATIENT STATUS EXPERIMENT")
     print("=" * 80)
     print(f"Memory Run: {memory_run_dir}")
-    print(f"Snapshot Stride (k): {snapshot_stride}")
+    print(f"Snapshot Stride (k): {normalized_stride}")
     print(f"Context Mode: {normalized_context_mode}")
-    print(f"Num Workers: {num_workers}")
+    print(f"Oracle Results Dir: {normalized_oracle_results_dir}")
+    print(f"Num Workers: {normalized_num_workers}")
 
     results_dir = memory_run_dir / _results_dir_name_for_context_mode(normalized_context_mode)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -529,11 +741,14 @@ def run_experiment(
             "enable_logging": bool(enable_logging),
         },
         "execution": {
-            "num_workers": num_workers,
+            "num_workers": normalized_num_workers,
         },
         "status_prediction": {
-            "snapshot_stride": snapshot_stride,
+            "snapshot_stride": normalized_stride,
+            "selection_mode": "oracle_labeled_window_time_match_then_stride",
+            "window_alignment_mode": "oracle_interval_time_match",
             "context_mode": str(normalized_context_mode),
+            "oracle_results_dir": str(normalized_oracle_results_dir),
             "inference_scope": "every_selected_snapshot",
             "local_events_only_scope": (
                 "working_memory_last_window_only"
@@ -569,12 +784,14 @@ def run_experiment(
             window_duration_hours=config.agent_current_window_hours,
             max_working_windows=config.med_evo_max_working_windows,
             max_insights=config.med_evo_max_insights,
+            max_trajectory_entries=config.med_evo_max_trajectory_entries,
         )
         return process_single_patient(
             patient_record=patient_record,
             agent=patient_agent,
-            snapshot_stride=snapshot_stride,
+            snapshot_stride=normalized_stride,
             context_mode=normalized_context_mode,
+            oracle_results_dir=normalized_oracle_results_dir,
             memory_run_dir=memory_run_dir,
             results_dir=results_dir,
             patient_idx=idx,
@@ -583,7 +800,7 @@ def run_experiment(
             verbose=verbose,
         )
 
-    max_workers = min(num_workers, len(patient_data))
+    max_workers = min(normalized_num_workers, len(patient_data))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_patient_wrapper, item) for item in patient_data]
         for future in as_completed(futures):
@@ -598,6 +815,10 @@ def run_experiment(
     total_patients = len(all_results)
     total_window_predictions = sum(int(item.get("num_status_predictions", 0)) for item in all_results)
     total_failed_status_predictions = sum(int(item.get("num_failed_status_predictions", 0)) for item in all_results)
+    total_oracle_labeled_snapshots = sum(int(item.get("num_oracle_labeled_snapshots", 0)) for item in all_results)
+    total_selected_snapshots_for_prediction = sum(
+        int(item.get("num_selected_snapshots_for_prediction", 0)) for item in all_results
+    )
 
     status_distribution: Dict[str, int] = {}
     for item in all_results:
@@ -613,6 +834,8 @@ def run_experiment(
     print("AGGREGATE RESULTS")
     print("=" * 80)
     print(f"Total Patients: {total_patients}")
+    print(f"Total Oracle-Labeled Snapshots: {total_oracle_labeled_snapshots}")
+    print(f"Total Selected Snapshots for Prediction: {total_selected_snapshots_for_prediction}")
     print(f"Total Status Predictions: {total_window_predictions}")
     print(f"Failed Status Predictions: {total_failed_status_predictions}")
     print("\nStatus Distribution:")
@@ -628,12 +851,17 @@ def run_experiment(
         "experiment": "patient_status_experiment",
         "memory_run": str(memory_run_dir),
         "context_mode": str(normalized_context_mode),
-        "snapshot_stride": snapshot_stride,
-        "num_workers": num_workers,
+        "oracle_results_dir": str(normalized_oracle_results_dir),
+        "snapshot_stride": normalized_stride,
+        "window_alignment_mode": "oracle_interval_time_match",
+        "selection_mode": "oracle_labeled_window_time_match_then_stride",
+        "num_workers": normalized_num_workers,
         "local_events_only_scope": (
             "working_memory_last_window_only" if normalized_context_mode == CONTEXT_MODE_LOCAL_EVENTS_ONLY else None
         ),
         "total_patients": total_patients,
+        "total_oracle_labeled_snapshots": int(total_oracle_labeled_snapshots),
+        "total_selected_snapshots_for_prediction": int(total_selected_snapshots_for_prediction),
         "total_window_predictions": total_window_predictions,
         "total_failed_status_predictions": total_failed_status_predictions,
         "status_distribution": status_distribution,
@@ -667,7 +895,13 @@ def main() -> None:
         "--snapshot-stride",
         type=int,
         default=4,
-        help="Use every k-th memory snapshot for status prediction (default: 1).",
+        help="Use every k-th oracle-labeled, time-aligned memory snapshot for status prediction.",
+    )
+    parser.add_argument(
+        "--oracle-results-dir",
+        type=str,
+        required=True,
+        help="Path to oracle results directory containing patients/*/oracle_predictions.json.",
     )
     parser.add_argument(
         "--context-mode",
@@ -701,6 +935,7 @@ def main() -> None:
         memory_run=args.memory_run,
         snapshot_stride=args.snapshot_stride,
         context_mode=args.context_mode,
+        oracle_results_dir=args.oracle_results_dir,
         verbose=not args.quiet,
         enable_logging=not args.no_logging,
         patient_stay_ids_path=args.patient_stay_ids,

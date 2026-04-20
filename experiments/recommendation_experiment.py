@@ -10,7 +10,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -27,7 +27,6 @@ from experiments.create_memory import (
     load_patient_memory_payload,
     render_snapshot_to_text,
     resolve_memory_run_dir,
-    select_snapshots_with_stride,
 )
 from experiments.oracle.action_validity_common import ACTIONABLE_EVENT_CODES, normalize_action_label
 from prompts.predictor_prompts import get_recommendation_action_prompt
@@ -49,6 +48,8 @@ ORACLE_POSITIVE_ACTION_LABELS = frozenset({"best_practice", "acceptable"})
 EVENT_LINE_CODE_PATTERN = re.compile(
     r"^\s*(?:\[[^\]]+\]\s+)?(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+)?([A-Z][A-Z0-9_]+)\b"
 )
+ORACLE_INTERVAL_DECIMALS = 6
+ORACLE_TIME_MATCH_EPSILON = 1e-9
 
 
 def _normalize_token_count(value: Any) -> int:
@@ -256,42 +257,122 @@ def _read_json(path: Path) -> Dict[str, Any]:
     return payload
 
 
-def _resolve_oracle_window_index(row: Mapping[str, Any], oracle_prediction_path: Path) -> int:
+def _interval_key(start_hour: float, end_hour: float) -> Tuple[float, float]:
+    return (round(float(start_hour), ORACLE_INTERVAL_DECIMALS), round(float(end_hour), ORACLE_INTERVAL_DECIMALS))
+
+
+def _interval_marker_id(interval_key: Tuple[float, float]) -> str:
+    return f"{interval_key[0]:.{ORACLE_INTERVAL_DECIMALS}f}|{interval_key[1]:.{ORACLE_INTERVAL_DECIMALS}f}"
+
+
+def _safe_optional_int(value: Any, *, field_name: str, source_path: Path) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {field_name}={value!r} in {source_path}") from exc
+
+
+def _snapshot_interval(snapshot: Mapping[str, Any], *, source_label: str) -> Tuple[float, float]:
+    start_raw = snapshot.get("last_processed_start_hour")
+    end_raw = snapshot.get("last_processed_end_hour")
+    try:
+        start_hour = float(start_raw)
+        end_hour = float(end_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Missing/invalid snapshot hour bounds in {source_label}: "
+            f"last_processed_start_hour={start_raw!r}, last_processed_end_hour={end_raw!r}"
+        ) from exc
+    if end_hour <= start_hour:
+        raise ValueError(f"Invalid snapshot hour bounds in {source_label}: start={start_hour}, end={end_hour}")
+    return start_hour, end_hour
+
+
+def _oracle_interval_from_row(row: Mapping[str, Any], oracle_prediction_path: Path) -> Tuple[float, float]:
     metadata = row.get("window_metadata")
-    metadata_source_window_index = metadata.get("source_window_index") if isinstance(metadata, Mapping) else None
-    metadata_stride_source_window_index = (
-        metadata.get("stride_source_window_index") if isinstance(metadata, Mapping) else None
-    )
-    candidates = (
-        ("source_window_index", row.get("source_window_index")),
-        ("stride_source_window_index", row.get("stride_source_window_index")),
-        ("window_metadata.source_window_index", metadata_source_window_index),
-        ("window_metadata.stride_source_window_index", metadata_stride_source_window_index),
-        ("window_index", row.get("window_index")),
-    )
-    for field_name, value in candidates:
-        if value is None:
-            continue
-        try:
-            return int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Invalid {field_name}={value!r} in window_outputs row in {oracle_prediction_path}"
-            ) from exc
-    raise ValueError(f"Missing window index fields in window_outputs row in {oracle_prediction_path}")
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"Missing window_metadata in row in {oracle_prediction_path}")
+    start_raw = metadata.get("hours_since_admission")
+    duration_raw = metadata.get("current_window_hours")
+    try:
+        start_hour = float(start_raw)
+        duration_hours = float(duration_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid oracle window hours in {oracle_prediction_path}: "
+            f"hours_since_admission={start_raw!r}, current_window_hours={duration_raw!r}"
+        ) from exc
+    if duration_hours <= 0:
+        raise ValueError(
+            f"Oracle current_window_hours must be > 0 in {oracle_prediction_path}, got {duration_hours!r}"
+        )
+    return start_hour, start_hour + duration_hours
 
 
-def _load_oracle_positive_actions_by_window(oracle_prediction_path: Path) -> Dict[int, List[Dict[str, Any]]]:
+def _build_oracle_marker(
+    *,
+    row: Mapping[str, Any],
+    interval_key: Tuple[float, float],
+    oracle_prediction_path: Path,
+) -> Dict[str, Any]:
+    metadata = row.get("window_metadata")
+    metadata_payload = metadata if isinstance(metadata, Mapping) else {}
+    marker = {
+        "marker_id": _interval_marker_id(interval_key),
+        "interval_start_hour": float(interval_key[0]),
+        "interval_end_hour": float(interval_key[1]),
+        "window_index": _safe_optional_int(
+            row.get("window_index"),
+            field_name="window_index",
+            source_path=oracle_prediction_path,
+        ),
+        "source_window_index": _safe_optional_int(
+            row.get("source_window_index", metadata_payload.get("source_window_index")),
+            field_name="source_window_index",
+            source_path=oracle_prediction_path,
+        ),
+        "stride_source_window_index": _safe_optional_int(
+            row.get("stride_source_window_index", metadata_payload.get("stride_source_window_index")),
+            field_name="stride_source_window_index",
+            source_path=oracle_prediction_path,
+        ),
+    }
+    return marker
+
+
+def _load_oracle_targets_by_interval(
+    oracle_prediction_path: Path,
+) -> Tuple[
+    Dict[Tuple[float, float], List[Dict[str, Any]]],
+    Set[Tuple[float, float]],
+    Dict[Tuple[float, float], Dict[str, Any]],
+    List[Tuple[float, float]],
+]:
     payload = _read_json(oracle_prediction_path)
     window_outputs = payload.get("window_outputs")
     if not isinstance(window_outputs, list):
         raise ValueError(f"Invalid window_outputs list in {oracle_prediction_path}")
 
-    actions_by_window: Dict[int, List[Dict[str, Any]]] = {}
+    actions_by_interval: Dict[Tuple[float, float], List[Dict[str, Any]]] = {}
+    labeled_intervals: Set[Tuple[float, float]] = set()
+    markers_by_interval: Dict[Tuple[float, float], Dict[str, Any]] = {}
     for row in window_outputs:
         if not isinstance(row, Mapping):
             raise ValueError(f"Invalid row in window_outputs in {oracle_prediction_path}")
-        window_index = _resolve_oracle_window_index(row=row, oracle_prediction_path=oracle_prediction_path)
+        interval_start, interval_end = _oracle_interval_from_row(
+            row=row, oracle_prediction_path=oracle_prediction_path
+        )
+        interval_key = _interval_key(interval_start, interval_end)
+        if interval_key in markers_by_interval:
+            raise ValueError(
+                f"Duplicate oracle interval marker for interval={interval_key} in {oracle_prediction_path}"
+            )
+        marker = _build_oracle_marker(
+            row=row, interval_key=interval_key, oracle_prediction_path=oracle_prediction_path
+        )
+        markers_by_interval[interval_key] = marker
 
         oracle_output = row.get("oracle_output")
         if not isinstance(oracle_output, Mapping):
@@ -304,23 +385,22 @@ def _load_oracle_positive_actions_by_window(oracle_prediction_path: Path) -> Dic
             continue
         if not isinstance(evaluations, list):
             raise ValueError(
-                f"Invalid action_review.evaluations for source window={window_index} in {oracle_prediction_path}"
+                f"Invalid action_review.evaluations for interval={interval_key} in {oracle_prediction_path}"
             )
+        if evaluations:
+            labeled_intervals.add(interval_key)
 
         selected_actions: List[Dict[str, Any]] = []
         for evaluation in evaluations:
             if not isinstance(evaluation, Mapping):
-                raise ValueError(
-                    f"Invalid evaluation row for source window={window_index} in {oracle_prediction_path}"
-                )
+                raise ValueError(f"Invalid evaluation row for interval={interval_key} in {oracle_prediction_path}")
             label = normalize_action_label(evaluation.get("label"))
             if label not in ORACLE_POSITIVE_ACTION_LABELS:
                 continue
             action_name = str(evaluation.get("action_name") or "").strip()
             if not action_name:
                 raise ValueError(
-                    f"Missing action_name for source window={window_index} with label={label} "
-                    f"in {oracle_prediction_path}"
+                    f"Missing action_name for interval={interval_key} with label={label} in {oracle_prediction_path}"
                 )
             rationale = str(evaluation.get("rationale") or evaluation.get("reason") or "").strip()
             gt_text = f"{action_name}. {rationale}".strip() if rationale else action_name
@@ -331,19 +411,44 @@ def _load_oracle_positive_actions_by_window(oracle_prediction_path: Path) -> Dic
                     "gt_action_text": gt_text,
                     "oracle_label": label,
                     "oracle_action_id": str(evaluation.get("action_id") or "").strip(),
-                    "oracle_source_window_index": int(window_index),
+                    "oracle_interval_marker_id": str(marker["marker_id"]),
+                    "oracle_interval_start_hour": float(marker["interval_start_hour"]),
+                    "oracle_interval_end_hour": float(marker["interval_end_hour"]),
+                    "oracle_source_window_index": marker.get("source_window_index"),
+                    "oracle_stride_source_window_index": marker.get("stride_source_window_index"),
+                    "oracle_window_index": marker.get("window_index"),
                 }
             )
 
         if not selected_actions:
             continue
-        if window_index in actions_by_window:
+        if interval_key in actions_by_interval:
             raise ValueError(
-                f"Duplicate oracle action reviews for source window={window_index} in {oracle_prediction_path}"
+                f"Duplicate oracle action reviews for interval={interval_key} in {oracle_prediction_path}"
             )
-        actions_by_window[window_index] = selected_actions
+        actions_by_interval[interval_key] = selected_actions
 
-    return actions_by_window
+    ordered_intervals = sorted(markers_by_interval.keys(), key=lambda item: (float(item[0]), float(item[1])))
+    return actions_by_interval, labeled_intervals, markers_by_interval, ordered_intervals
+
+
+def _select_records_with_stride(records: List[Dict[str, Any]], stride: int) -> List[Dict[str, Any]]:
+    if not records:
+        return []
+    normalized_stride = max(1, int(stride))
+    selected = [record for idx, record in enumerate(records) if idx % normalized_stride == 0]
+    if not selected or selected[-1] is not records[-1]:
+        selected.append(records[-1])
+    return selected
+
+
+def _marker_best_window_index(marker: Mapping[str, Any]) -> Optional[int]:
+    for key in ("stride_source_window_index", "source_window_index", "window_index"):
+        value = marker.get(key)
+        if value is None:
+            continue
+        return int(value)
+    return None
 
 
 def build_masked_recommendation_snapshot(
@@ -405,27 +510,45 @@ def collect_union_ground_truth_action_events(
     return events, included_windows
 
 
-def collect_union_ground_truth_actions(
-    oracle_actions_by_window: Mapping[int, Sequence[Mapping[str, Any]]],
-    current_window_index: int,
-    future_window_count: int,
-) -> Tuple[List[Dict[str, Any]], List[int]]:
-    if future_window_count < 0:
-        raise ValueError(f"future_window_count must be >= 0, got {future_window_count}")
-
+def collect_union_ground_truth_actions_by_time(
+    *,
+    oracle_actions_by_interval: Mapping[Tuple[float, float], Sequence[Mapping[str, Any]]],
+    oracle_markers_by_interval: Mapping[Tuple[float, float], Mapping[str, Any]],
+    ordered_oracle_intervals: Sequence[Tuple[float, float]],
+    current_window_start_hour: float,
+    prediction_horizon_hours: float,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    try:
+        start_hour = float(current_window_start_hour)
+        horizon_hours = float(prediction_horizon_hours)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "current_window_start_hour and prediction_horizon_hours must be numeric "
+            f"(got {current_window_start_hour!r}, {prediction_horizon_hours!r})"
+        ) from exc
+    if horizon_hours <= 0:
+        raise ValueError(f"prediction_horizon_hours must be > 0, got {horizon_hours}")
+    horizon_end = start_hour + horizon_hours
     events: List[Dict[str, Any]] = []
-    included_windows: List[int] = []
-    for offset in range(0, int(future_window_count) + 1):
-        window_index = int(current_window_index) + int(offset)
-        window_events = oracle_actions_by_window.get(window_index)
-        if not isinstance(window_events, list):
+    included_markers: List[Dict[str, Any]] = []
+    for interval in ordered_oracle_intervals:
+        interval_start = float(interval[0])
+        if interval_start < start_hour - ORACLE_TIME_MATCH_EPSILON:
             continue
-        included_windows.append(window_index)
+        if interval_start > horizon_end + ORACLE_TIME_MATCH_EPSILON:
+            break
+        window_events = oracle_actions_by_interval.get(interval)
+        if not isinstance(window_events, Sequence) or not window_events:
+            continue
+        marker = oracle_markers_by_interval.get(interval)
+        if marker is None:
+            raise ValueError(f"Missing oracle marker for interval={interval}")
+        included_markers.append(dict(marker))
         for event in window_events:
             if not isinstance(event, Mapping):
                 continue
             events.append(dict(event))
-    return events, included_windows
+    return events, included_markers
 
 
 def infer_window_duration_hours(snapshot: Mapping[str, Any]) -> float:
@@ -511,21 +634,41 @@ def process_single_patient(
             print("   WARNING: No snapshots found in source memory, skipping...")
             return None
 
-        selected_snapshots = select_snapshots_with_stride(
-            windowed_snapshots=windowed_snapshots,
-            stride=snapshot_stride,
-        )
-
         snapshot_by_window = {int(window_idx): snapshot for window_idx, snapshot in windowed_snapshots}
         oracle_prediction_path = (
             oracle_results_dir / "patients" / f"{subject_id}_{icu_stay_id}" / "oracle_predictions.json"
         )
-        oracle_actions_by_window = _load_oracle_positive_actions_by_window(oracle_prediction_path)
+        (
+            oracle_actions_by_interval,
+            oracle_labeled_intervals,
+            oracle_markers_by_interval,
+            ordered_oracle_intervals,
+        ) = _load_oracle_targets_by_interval(oracle_prediction_path)
+        snapshot_records: List[Dict[str, Any]] = []
+        for window_idx, snapshot in windowed_snapshots:
+            start_hour, end_hour = _snapshot_interval(
+                snapshot,
+                source_label=f"{source_patient_dir}/memory_database.json window_index={window_idx}",
+            )
+            snapshot_records.append(
+                {
+                    "window_index": int(window_idx),
+                    "snapshot": snapshot,
+                    "start_hour": float(start_hour),
+                    "end_hour": float(end_hour),
+                    "interval_key": _interval_key(start_hour, end_hour),
+                }
+            )
+        labeled_snapshot_records = [
+            record for record in snapshot_records if record["interval_key"] in oracle_labeled_intervals
+        ]
+        selected_snapshot_records = _select_records_with_stride(labeled_snapshot_records, snapshot_stride)
 
         if verbose:
             print(
                 f"   Memory snapshots: total={len(windowed_snapshots)}, "
-                f"selected={len(selected_snapshots)}, stride={snapshot_stride}"
+                f"oracle_labeled={len(labeled_snapshot_records)}, "
+                f"selected={len(selected_snapshot_records)}, stride={snapshot_stride}"
             )
 
         recommendation_predictions: List[Dict[str, Any]] = []
@@ -539,10 +682,21 @@ def process_single_patient(
         full_history_context_limit_window_index: Optional[int] = None
         full_history_context_limit_message = ""
 
-        for sequence_idx, (selected_window_index, selected_snapshot) in enumerate(selected_snapshots, start=1):
+        for sequence_idx, selected_record in enumerate(selected_snapshot_records, start=1):
+            selected_window_index = int(selected_record["window_index"])
+            selected_snapshot = selected_record["snapshot"]
+            current_start_hour = float(selected_record["start_hour"])
+            current_end_hour = float(selected_record["end_hour"])
+            current_interval_key = selected_record["interval_key"]
             lookup_window_index = int(selected_window_index)
             if lookup_window_index <= 0:
                 continue
+            current_oracle_marker = oracle_markers_by_interval.get(current_interval_key)
+            if not isinstance(current_oracle_marker, Mapping):
+                raise ValueError(
+                    f"Missing oracle marker for current interval={current_interval_key} "
+                    f"for patient={subject_id}_{icu_stay_id}"
+                )
 
             skip_due_to_prior_context_limit = (
                 context_mode == CONTEXT_MODE_FULL_HISTORY_EVENTS and full_history_context_limit_reached
@@ -589,20 +743,27 @@ def process_single_patient(
             else:
                 raise ValueError(f"Unsupported context_mode={context_mode}")
 
-            inferred_window_index, hours, _ = extract_snapshot_window_features(selected_snapshot)
+            inferred_window_index, _, _ = extract_snapshot_window_features(selected_snapshot)
             window_index = int(lookup_window_index)
             if inferred_window_index >= 0:
                 window_index = inferred_window_index
 
-            window_duration_hours = infer_window_duration_hours(selected_snapshot)
+            window_duration_hours = float(current_end_hour - current_start_hour)
+            if window_duration_hours <= 0:
+                raise ValueError(
+                    f"Invalid snapshot interval for patient={subject_id}_{icu_stay_id} window={lookup_window_index}: "
+                    f"start={current_start_hour}, end={current_end_hour}"
+                )
             future_window_count = compute_future_window_count_for_horizon(
                 prediction_horizon_hours=prediction_horizon_hours,
                 window_duration_hours=window_duration_hours,
             )
-            ground_truth_events, included_horizon_windows = collect_union_ground_truth_actions(
-                oracle_actions_by_window=oracle_actions_by_window,
-                current_window_index=lookup_window_index,
-                future_window_count=future_window_count,
+            ground_truth_events, included_horizon_markers = collect_union_ground_truth_actions_by_time(
+                oracle_actions_by_interval=oracle_actions_by_interval,
+                oracle_markers_by_interval=oracle_markers_by_interval,
+                ordered_oracle_intervals=ordered_oracle_intervals,
+                current_window_start_hour=float(current_start_hour),
+                prediction_horizon_hours=float(prediction_horizon_hours),
             )
             if not ground_truth_events:
                 num_windows_skipped_no_ground_truth += 1
@@ -677,13 +838,23 @@ def process_single_patient(
                 confidence, rationale = _extract_recommendation_summary_fields(parsed_prediction, recommended_actions)
 
             total_masked_action_events += int(masked_action_count)
+            ground_truth_window_indices: List[int] = []
+            for marker in included_horizon_markers:
+                marker_index = _marker_best_window_index(marker)
+                if marker_index is None:
+                    continue
+                ground_truth_window_indices.append(int(marker_index))
 
             prediction_item = {
                 "window_index": int(window_index),
                 "snapshot_sequence": int(sequence_idx),
-                "hours_since_admission": float(hours),
+                "hours_since_admission": float(current_start_hour),
+                "window_start_hour": float(current_start_hour),
+                "window_end_hour": float(current_end_hour),
                 "snapshot_source": str(snapshot_source),
                 "context_mode": str(context_mode),
+                "oracle_window_marker_id": str(current_oracle_marker.get("marker_id") or ""),
+                "oracle_window_marker": dict(current_oracle_marker),
                 "num_masked_action_events": int(masked_action_count),
                 "num_non_action_events_in_context_window": int(non_action_events),
                 "num_ground_truth_action_events": int(len(ground_truth_events)),
@@ -691,7 +862,11 @@ def process_single_patient(
                 "top_k_actions": int(top_k_actions),
                 "window_duration_hours": float(window_duration_hours),
                 "num_future_windows_for_horizon": int(future_window_count),
-                "ground_truth_window_indices": [int(idx) for idx in included_horizon_windows],
+                "ground_truth_window_indices": ground_truth_window_indices,
+                "ground_truth_window_marker_ids": [
+                    str(marker.get("marker_id") or "") for marker in included_horizon_markers
+                ],
+                "ground_truth_window_markers": [dict(marker) for marker in included_horizon_markers],
                 "confidence": confidence,
                 "rationale": rationale,
                 "recommended_actions": recommended_actions,
@@ -709,7 +884,7 @@ def process_single_patient(
                     "timestamp": datetime.now().isoformat(),
                     "patient_id": f"{subject_id}_{icu_stay_id}",
                     "window_index": int(window_index),
-                    "hours_since_admission": float(hours),
+                    "hours_since_admission": float(current_start_hour),
                     "prompt": prompt,
                     "response": raw_response,
                     "parsed_response": parsed_prediction,
@@ -726,6 +901,7 @@ def process_single_patient(
                         "num_masked_action_events": int(masked_action_count),
                         "top_k_actions": int(top_k_actions),
                         "prediction_horizon_hours": float(prediction_horizon_hours),
+                        "oracle_window_marker_id": str(current_oracle_marker.get("marker_id") or ""),
                         "prediction_error": prediction_error,
                     },
                 }
@@ -774,7 +950,10 @@ def process_single_patient(
             "context_mode": str(context_mode),
             "oracle_results_dir": str(oracle_results_dir),
             "num_memory_snapshots": len(windowed_snapshots),
+            "num_oracle_labeled_snapshots": len(labeled_snapshot_records),
+            "num_selected_snapshots_for_prediction": len(selected_snapshot_records),
             "snapshot_stride": snapshot_stride,
+            "window_alignment_mode": "oracle_interval_time_match",
             "action_horizon": "current_plus_dynamic_future_windows",
             "prediction_horizon_hours": float(prediction_horizon_hours),
             "top_k_actions": int(top_k_actions),
@@ -799,6 +978,8 @@ def process_single_patient(
             "memory_run": str(memory_run_dir),
             "context_mode": str(context_mode),
             "num_memory_snapshots": len(windowed_snapshots),
+            "num_oracle_labeled_snapshots": len(labeled_snapshot_records),
+            "num_selected_snapshots_for_prediction": len(selected_snapshot_records),
             "snapshot_stride": snapshot_stride,
             "num_windows_predicted": patient_metrics["num_windows_predicted"],
             "num_failed_windows": patient_metrics["num_failed_windows"],
@@ -833,6 +1014,8 @@ def process_single_patient(
             "actual_outcome": actual_outcome,
             "context_mode": str(context_mode),
             "num_memory_snapshots": len(windowed_snapshots),
+            "num_oracle_labeled_snapshots": len(labeled_snapshot_records),
+            "num_selected_snapshots_for_prediction": len(selected_snapshot_records),
             "snapshot_stride": snapshot_stride,
             "num_windows_predicted": patient_metrics["num_windows_predicted"],
             "num_failed_windows": patient_metrics["num_failed_windows"],
@@ -951,6 +1134,8 @@ def run_experiment(
         },
         "recommendation_prediction": {
             "snapshot_stride": normalized_stride,
+            "selection_mode": "oracle_labeled_window_time_match_then_stride",
+            "window_alignment_mode": "oracle_interval_time_match",
             "top_k_actions": int(normalized_top_k_actions),
             "action_horizon": "current_plus_dynamic_future_windows",
             "prediction_horizon_hours": float(normalized_prediction_horizon_hours),
@@ -994,6 +1179,7 @@ def run_experiment(
             window_duration_hours=config.agent_current_window_hours,
             max_working_windows=config.med_evo_max_working_windows,
             max_insights=config.med_evo_max_insights,
+            max_trajectory_entries=config.med_evo_max_trajectory_entries,
         )
         return process_single_patient(
             patient_record=patient_record,
@@ -1027,6 +1213,10 @@ def run_experiment(
     total_patients = len(all_results)
     total_window_predictions = sum(int(item.get("num_windows_predicted", 0)) for item in all_results)
     total_failed_windows = sum(int(item.get("num_failed_windows", 0)) for item in all_results)
+    total_oracle_labeled_snapshots = sum(int(item.get("num_oracle_labeled_snapshots", 0)) for item in all_results)
+    total_selected_snapshots_for_prediction = sum(
+        int(item.get("num_selected_snapshots_for_prediction", 0)) for item in all_results
+    )
     total_recommendations = sum(int(item.get("num_recommendations", 0)) for item in all_results)
     total_red_flags = sum(int(item.get("num_red_flags", 0)) for item in all_results)
     total_ground_truth_action_events = sum(int(item.get("num_ground_truth_action_events", 0)) for item in all_results)
@@ -1041,6 +1231,8 @@ def run_experiment(
     print("AGGREGATE RESULTS")
     print("=" * 80)
     print(f"Total Patients: {total_patients}")
+    print(f"Total Oracle-Labeled Snapshots: {total_oracle_labeled_snapshots}")
+    print(f"Total Selected Snapshots for Prediction: {total_selected_snapshots_for_prediction}")
     print(f"Total Predicted Windows: {total_window_predictions}")
     print(f"Failed Predicted Windows: {total_failed_windows}")
     print(f"Total Recommendations: {total_recommendations}")
@@ -1060,6 +1252,8 @@ def run_experiment(
         "context_mode": str(normalized_context_mode),
         "oracle_results_dir": str(normalized_oracle_results_dir),
         "snapshot_stride": normalized_stride,
+        "window_alignment_mode": "oracle_interval_time_match",
+        "selection_mode": "oracle_labeled_window_time_match_then_stride",
         "num_workers": normalized_num_workers,
         "top_k_actions": int(normalized_top_k_actions),
         "action_horizon": "current_plus_dynamic_future_windows",
@@ -1069,6 +1263,8 @@ def run_experiment(
         ),
         "target_output": f"top_{int(normalized_top_k_actions)}",
         "total_patients": total_patients,
+        "total_oracle_labeled_snapshots": int(total_oracle_labeled_snapshots),
+        "total_selected_snapshots_for_prediction": int(total_selected_snapshots_for_prediction),
         "total_window_predictions": total_window_predictions,
         "total_failed_windows": total_failed_windows,
         "total_recommendations": total_recommendations,
@@ -1106,7 +1302,7 @@ def main() -> None:
         "--snapshot-stride",
         type=int,
         default=1,
-        help="Use every k-th memory snapshot for recommendation prediction.",
+        help="Use every k-th oracle-labeled, time-aligned memory snapshot for recommendation prediction.",
     )
     parser.add_argument(
         "--top-k-actions",
@@ -1136,7 +1332,7 @@ def main() -> None:
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=2,
+        default=8,
         help="Maximum number of parallel workers for patient processing (default: 2).",
     )
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")

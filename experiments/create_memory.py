@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
@@ -21,7 +22,6 @@ from agents.med_evo_agent import MedEvoAgent, MedEvoMemory, MedEvoMemoryDatabase
 from config.config import get_config
 from data_parser import MIMICDataParser
 from utils.llm_log_viewer import save_llm_calls_html
-from utils.patient_selection import select_balanced_patients
 
 PRE_ICU_REPORT_CODES = ["NOTE_DISCHARGESUMMARY"]
 RUN_CONFIG_FILENAME = "run_config.json"
@@ -140,7 +140,15 @@ def _format_observation_entry(entry: Dict[str, Any]) -> List[str]:
     window_index = _safe_int(entry.get("window_index"), default=-1)
     start_hour = _safe_float(entry.get("start_hour"), default=0.0)
     end_hour = _safe_float(entry.get("end_hour"), default=start_hour)
-    lines = [f"### Window {window_index} (hour {start_hour:.1f}-{end_hour:.1f})"]
+    trend_scope = str(entry.get("trend_scope") or "").strip().lower()
+    if trend_scope == "global":
+        start_window = _safe_int(entry.get("start_window"), default=window_index)
+        end_window = _safe_int(entry.get("end_window"), default=window_index)
+        lines = [f"### Global Trend (window {start_window}-{end_window}, hour {start_hour:.1f}-{end_hour:.1f})"]
+    elif trend_scope == "current_window":
+        lines = [f"### Current Window Trend (window {window_index}, hour {start_hour:.1f}-{end_hour:.1f})"]
+    else:
+        lines = [f"### Window {window_index} (hour {start_hour:.1f}-{end_hour:.1f})"]
 
     vital_trends = entry.get("vital_trends")
     lines.append("Vital trends:")
@@ -157,6 +165,139 @@ def _format_observation_entry(entry: Dict[str, Any]) -> List[str]:
         lines.append("- None")
 
     return lines
+
+
+def _to_optional_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_trend_memory_entries(trend_memory: Any) -> List[Dict[str, Any]]:
+    if not isinstance(trend_memory, list):
+        return []
+
+    entries = [dict(item) for item in trend_memory if isinstance(item, dict)]
+    if not entries:
+        return []
+
+    current_entry = copy.deepcopy(entries[-1])
+    current_entry["trend_scope"] = "current_window"
+
+    vital_aggregate: Dict[str, Dict[str, Any]] = {}
+    start_window: Optional[int] = None
+    end_window: Optional[int] = None
+    start_hour: Optional[float] = None
+    end_hour: Optional[float] = None
+    total_raw_event_count = 0
+
+    for entry in entries:
+        window_index = _safe_int(entry.get("window_index"), default=-1)
+        if window_index >= 0:
+            if start_window is None:
+                start_window = window_index
+                end_window = window_index
+            else:
+                start_window = min(start_window, window_index)
+                end_window = max(end_window, window_index)
+
+        entry_start_hour = _to_optional_float(entry.get("start_hour"))
+        if entry_start_hour is not None:
+            start_hour = entry_start_hour if start_hour is None else min(start_hour, entry_start_hour)
+
+        entry_end_hour = _to_optional_float(entry.get("end_hour"))
+        if entry_end_hour is not None:
+            end_hour = entry_end_hour if end_hour is None else max(end_hour, entry_end_hour)
+
+        total_raw_event_count += _safe_int(entry.get("raw_event_count"), default=0)
+
+        vital_trends = entry.get("vital_trends")
+        if not isinstance(vital_trends, dict):
+            continue
+        for vital_name, stats in vital_trends.items():
+            if not isinstance(stats, dict):
+                continue
+            count = _safe_int(stats.get("count"), default=0)
+            mean = _to_optional_float(stats.get("mean"))
+            min_value = _to_optional_float(stats.get("min"))
+            max_value = _to_optional_float(stats.get("max"))
+            if count <= 0 or mean is None:
+                continue
+
+            bucket = vital_aggregate.setdefault(
+                str(vital_name),
+                {
+                    "count": 0,
+                    "weighted_sum": 0.0,
+                    "min": None,
+                    "max": None,
+                },
+            )
+            bucket["count"] = int(bucket["count"]) + int(count)
+            bucket["weighted_sum"] = float(bucket["weighted_sum"]) + float(mean) * float(count)
+
+            existing_min = _to_optional_float(bucket.get("min"))
+            existing_max = _to_optional_float(bucket.get("max"))
+            if min_value is not None:
+                bucket["min"] = min_value if existing_min is None else min(existing_min, min_value)
+            if max_value is not None:
+                bucket["max"] = max_value if existing_max is None else max(existing_max, max_value)
+
+    global_vital_trends: Dict[str, Dict[str, Any]] = {}
+    for vital_name, stats in vital_aggregate.items():
+        count = _safe_int(stats.get("count"), default=0)
+        if count <= 0:
+            continue
+        weighted_sum = float(stats.get("weighted_sum", 0.0))
+        global_vital_trends[vital_name] = {
+            "mean": weighted_sum / float(count),
+            "min": _to_optional_float(stats.get("min")),
+            "max": _to_optional_float(stats.get("max")),
+            "count": count,
+        }
+
+    current_window_index = _safe_int(current_entry.get("window_index"), default=-1)
+    current_start_hour = _safe_float(current_entry.get("start_hour"), default=0.0)
+    current_end_hour = _safe_float(current_entry.get("end_hour"), default=current_start_hour)
+
+    global_entry = {
+        "trend_scope": "global",
+        "window_index": current_window_index,
+        "start_window": start_window if start_window is not None else current_window_index,
+        "end_window": end_window if end_window is not None else current_window_index,
+        "start_hour": start_hour if start_hour is not None else current_start_hour,
+        "end_hour": end_hour if end_hour is not None else current_end_hour,
+        "raw_event_count": int(total_raw_event_count),
+        "vital_trends": global_vital_trends,
+    }
+
+    return [current_entry, global_entry]
+
+
+def compact_trend_memory_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        raise ValueError("snapshot must be a dict")
+    compacted = dict(snapshot)
+    compacted["trend_memory"] = _compact_trend_memory_entries(snapshot.get("trend_memory"))
+    return compacted
+
+
+def compact_trend_memory_snapshots(memory_snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    compacted: List[Dict[str, Any]] = []
+    for snapshot in memory_snapshots:
+        if not isinstance(snapshot, dict):
+            continue
+        compacted.append(compact_trend_memory_snapshot(snapshot))
+    return compacted
+
+
+def compact_final_memory_trend_memory(final_memory: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(final_memory, dict):
+        raise ValueError("final_memory must be a dict")
+    compacted = dict(final_memory)
+    compacted["trend_memory"] = _compact_trend_memory_entries(final_memory.get("trend_memory"))
+    return compacted
 
 
 def collect_windowed_snapshots(memory_snapshots: List[Dict[str, Any]]) -> List[Tuple[int, Dict[str, Any]]]:
@@ -593,6 +734,7 @@ def _process_single_patient_memory(
         window_duration_hours=config.agent_current_window_hours,
         max_working_windows=config.med_evo_max_working_windows,
         max_insights=config.med_evo_max_insights,
+        max_trajectory_entries=config.med_evo_max_trajectory_entries,
     )
     agent.clear_logs()
 
@@ -602,6 +744,8 @@ def _process_single_patient_memory(
         patient_metadata=patient_metadata,
         verbose=verbose,
     )
+    memory_db.memory_snapshots = compact_trend_memory_snapshots(memory_db.memory_snapshots)
+    final_memory_payload = compact_final_memory_trend_memory(final_memory_state.to_dict())
 
     windowed_snapshots = collect_windowed_snapshots(memory_db.memory_snapshots)
     if not windowed_snapshots:
@@ -613,7 +757,7 @@ def _process_single_patient_memory(
 
     memory_db.save(str(patient_dir / "memory_database.json"))
     with open(patient_dir / "final_memory.json", "w") as f:
-        json.dump(final_memory_state.to_dict(), f, indent=2)
+        json.dump(final_memory_payload, f, indent=2)
 
     info_payload = {
         "subject_id": subject_id,
@@ -658,17 +802,17 @@ def _process_single_patient_memory(
 
 
 def run_experiment(
-    n_survived: int = 5,
-    n_died: int = 5,
+    patient_stay_ids_path: str,
     verbose: bool = True,
     enable_logging: bool = True,
-    patient_stay_ids_path: Optional[str] = None,
     num_workers: int = 1,
     resume_run: Optional[str] = None,
-    window_step_hours: Optional[float] = None,
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if not str(patient_stay_ids_path).strip():
+        raise ValueError("patient_stay_ids_path is required and must be non-empty.")
+
     try:
         num_workers = int(num_workers)
     except (TypeError, ValueError) as exc:
@@ -677,15 +821,17 @@ def run_experiment(
         raise ValueError(f"num_workers must be >= 1, got {num_workers}")
 
     config = get_config()
-    if window_step_hours is None:
-        effective_window_step_hours = float(config.agent_window_step_hours)
-    else:
-        try:
-            effective_window_step_hours = float(window_step_hours)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid window_step_hours value: {window_step_hours}") from exc
+    try:
+        effective_window_step_hours = float(config.agent_current_window_hours)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid config agent_time_windows.current_window_hours: {config.agent_current_window_hours}"
+        ) from exc
     if not math.isfinite(effective_window_step_hours) or effective_window_step_hours <= 0:
-        raise ValueError(f"window_step_hours must be a finite number > 0, got {effective_window_step_hours}")
+        raise ValueError(
+            "agent_time_windows.current_window_hours must be a finite number > 0, "
+            f"got {effective_window_step_hours}"
+        )
 
     effective_llm_provider = str(llm_provider if llm_provider is not None else config.llm_provider).strip()
     if not effective_llm_provider:
@@ -735,8 +881,7 @@ def run_experiment(
         "generated_at": datetime.now().isoformat(),
         "experiment": "create_memory_med_evo",
         "cohort_request": {
-            "n_survived": int(n_survived),
-            "n_died": int(n_died),
+            "patient_stay_ids_path": str(patient_stay_ids_path),
         },
         "logging": {
             "enable_logging": bool(enable_logging),
@@ -768,6 +913,7 @@ def run_experiment(
         "med_evo": {
             "max_working_windows": config.med_evo_max_working_windows,
             "max_insights": config.med_evo_max_insights,
+            "max_trajectory_entries": config.med_evo_max_trajectory_entries,
             "episode_block_windows": config.med_evo_episode_block_windows,
             "insight_block_windows": config.med_evo_insight_block_windows,
             "observation_config_path": config.med_evo_observation_config_path,
@@ -783,38 +929,30 @@ def run_experiment(
     )
     parser.load_data()
 
-    if patient_stay_ids_path:
-        print("\n2. Loading fixed patient-stay cohort...")
-        requested_ids_df = _load_patient_stay_ids_csv(patient_stay_ids_path)
-        selected_patients = _select_patients_by_stay_ids(parser.icu_stay_df, requested_ids_df)
-        selected_patients = selected_patients.sort_values(["subject_id", "icu_stay_id"]).reset_index(drop=True)
+    print("\n2. Loading fixed patient-stay cohort...")
+    requested_ids_df = _load_patient_stay_ids_csv(patient_stay_ids_path)
+    selected_patients = _select_patients_by_stay_ids(parser.icu_stay_df, requested_ids_df)
+    selected_patients = selected_patients.sort_values(["subject_id", "icu_stay_id"]).reset_index(drop=True)
 
-        selected_key_set = {
-            (int(row.subject_id), int(row.icu_stay_id))
-            for row in selected_patients[["subject_id", "icu_stay_id"]].itertuples(index=False)
-        }
-        requested_key_set = {
-            (int(row.subject_id), int(row.icu_stay_id))
-            for row in requested_ids_df[["subject_id", "icu_stay_id"]].itertuples(index=False)
-        }
-        missing_keys = sorted(requested_key_set - selected_key_set)
+    selected_key_set = {
+        (int(row.subject_id), int(row.icu_stay_id))
+        for row in selected_patients[["subject_id", "icu_stay_id"]].itertuples(index=False)
+    }
+    requested_key_set = {
+        (int(row.subject_id), int(row.icu_stay_id))
+        for row in requested_ids_df[["subject_id", "icu_stay_id"]].itertuples(index=False)
+    }
+    missing_keys = sorted(requested_key_set - selected_key_set)
 
-        print(f"   Patient-stay IDs file: {patient_stay_ids_path}")
-        print(f"   Requested ICU stays: {len(requested_key_set)}")
-        print(f"   Matched ICU stays: {len(selected_patients)}")
+    print(f"   Patient-stay IDs file: {patient_stay_ids_path}")
+    print(f"   Requested ICU stays: {len(requested_key_set)}")
+    print(f"   Matched ICU stays: {len(selected_patients)}")
 
-        if missing_keys:
-            preview = ", ".join(f"{sid}_{stay}" for sid, stay in missing_keys[:5])
-            raise RuntimeError(
-                "Some requested patient-stay IDs are missing from current parser cohort. "
-                f"Missing={len(missing_keys)}; first 5: {preview}"
-            )
-    else:
-        print("\n2. Selecting balanced patient cohort...")
-        selected_patients = select_balanced_patients(
-            parser.icu_stay_df,
-            n_survived=n_survived,
-            n_died=n_died,
+    if missing_keys:
+        preview = ", ".join(f"{sid}_{stay}" for sid, stay in missing_keys[:5])
+        raise RuntimeError(
+            "Some requested patient-stay IDs are missing from current parser cohort. "
+            f"Missing={len(missing_keys)}; first 5: {preview}"
         )
 
     completed_keys = _collect_completed_patient_keys(results_dir) if resume_run else set()
@@ -931,8 +1069,6 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Create MedEvo memory snapshots")
-    parser.add_argument("--n-survived", type=int, default=1, help="Number of survived patients")
-    parser.add_argument("--n-died", type=int, default=0, help="Number of died patients")
     parser.add_argument(
         "--num-workers",
         type=int,
@@ -944,10 +1080,10 @@ def main() -> None:
     parser.add_argument(
         "--patient-stay-ids",
         type=str,
-        default=None,
+        required=True,
         help=(
-            "Optional CSV with columns subject_id,icu_stay_id. "
-            "If provided, run this exact ICU-stay list instead of random sampling."
+            "CSV with columns subject_id,icu_stay_id. "
+            "Runs exactly this ICU-stay list."
         ),
     )
     parser.add_argument(
@@ -957,15 +1093,6 @@ def main() -> None:
         help=(
             "Optional existing memory run directory to resume in-place. "
             "Completed patient folders are skipped automatically."
-        ),
-    )
-    parser.add_argument(
-        "--window-step-hours",
-        type=float,
-        default=2,
-        help=(
-            "Optional sliding-window step size (hours) for memory creation. "
-            "If omitted, uses config agent_time_windows.window_step_hours."
         ),
     )
     parser.add_argument(
@@ -991,14 +1118,11 @@ def main() -> None:
     print(f"{'='*80}\n")
 
     run_experiment(
-        n_survived=args.n_survived,
-        n_died=args.n_died,
         verbose=not args.quiet,
         enable_logging=not args.no_logging,
         patient_stay_ids_path=args.patient_stay_ids,
         num_workers=args.num_workers,
         resume_run=args.resume_run,
-        window_step_hours=args.window_step_hours,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
     )

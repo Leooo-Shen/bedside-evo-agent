@@ -10,7 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
@@ -38,6 +38,7 @@ GT_FILENAMES = (
 LLM_PROVIDER = "google"
 LLM_MODEL = "qwen/qwen3-235b-a22b-instruct-2507-maas"
 LLM_MAX_TOKENS = 12800
+ORACLE_INTERVAL_DECIMALS = 6
 
 _THREAD_LOCAL = threading.local()
 
@@ -90,6 +91,20 @@ def _json_dump(path: Path, payload: Any) -> None:
         json.dump(_safe_json_value(payload), f, indent=2, ensure_ascii=False)
 
 
+def _parse_json_list_cell(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if value is None or pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    parsed = json.loads(text)
+    if not isinstance(parsed, list):
+        raise ValueError(f"Expected JSON list cell, got: {text[:100]}")
+    return parsed
+
+
 def _find_first_existing_file(directory: Path, filenames: Sequence[str]) -> Optional[Path]:
     for filename in filenames:
         candidate = directory / str(filename)
@@ -135,6 +150,30 @@ def _discover_mode_dirs(path: Path) -> Dict[str, Path]:
         if candidate.exists() and candidate.is_dir() and _has_prediction_files(candidate):
             discovered[str(mode)] = candidate
     return discovered
+
+
+def _has_eval_outputs(path: Path) -> bool:
+    return (path / "window_level_windows.csv").exists()
+
+
+def _discover_eval_mode_dirs(path: Path) -> Dict[str, Path]:
+    discovered: Dict[str, Path] = {}
+    for mode in KNOWN_MODES:
+        candidate = path / mode
+        if candidate.exists() and candidate.is_dir() and _has_eval_outputs(candidate):
+            discovered[str(mode)] = candidate
+    return discovered
+
+
+def _ensure_reuse_eval_dir(path: Path) -> Path:
+    if not path.exists() or not path.is_dir():
+        raise FileNotFoundError(f"Reuse eval directory not found: {path}")
+    if _has_eval_outputs(path) or _discover_eval_mode_dirs(path):
+        return path
+    raise FileNotFoundError(
+        f"No window_level_windows.csv found under {path}. "
+        "Expected either <dir>/window_level_windows.csv or <dir>/<mode>/window_level_windows.csv."
+    )
 
 
 def _ensure_gt_dir(path: Path) -> Path:
@@ -301,11 +340,105 @@ def _extract_window_rows_from_prediction_payload(payload: Mapping[str, Any], sou
         window_index = int(window_raw)
         if window_index < 0:
             raise ValueError(f"Negative window_index={window_index} in {source_path}")
-        rows.append(dict(row))
+        normalized_row = dict(row)
+        normalized_row["window_index"] = int(window_index)
+        rows.append(normalized_row)
     return rows
 
 
-def _load_gt_problems_by_window(gt_file: Path) -> Dict[int, List[str]]:
+def _extract_icu_stay_id(payload: Mapping[str, Any], source_path: Path) -> int:
+    icu_stay_id_raw = payload.get("icu_stay_id")
+    if icu_stay_id_raw is None:
+        raise ValueError(f"Missing icu_stay_id in {source_path}")
+    icu_stay_id = int(icu_stay_id_raw)
+    if icu_stay_id <= 0:
+        raise ValueError(f"Invalid icu_stay_id={icu_stay_id} in {source_path}")
+    return icu_stay_id
+
+
+def _interval_key(start_hour: float, end_hour: float) -> Tuple[float, float]:
+    return (round(float(start_hour), ORACLE_INTERVAL_DECIMALS), round(float(end_hour), ORACLE_INTERVAL_DECIMALS))
+
+
+def _interval_marker_id(interval_key: Tuple[float, float]) -> str:
+    return f"{interval_key[0]:.{ORACLE_INTERVAL_DECIMALS}f}|{interval_key[1]:.{ORACLE_INTERVAL_DECIMALS}f}"
+
+
+def _parse_window_interval(
+    *,
+    hours_since_admission: Any,
+    current_window_hours: Any,
+    source_path: Path,
+    context_label: str,
+) -> Tuple[float, float]:
+    try:
+        start_hour = float(hours_since_admission)
+        duration_hours = float(current_window_hours)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid hour fields in {source_path} ({context_label}): "
+            f"hours_since_admission={hours_since_admission!r}, current_window_hours={current_window_hours!r}"
+        ) from exc
+    if duration_hours <= 0:
+        raise ValueError(
+            f"current_window_hours must be > 0 in {source_path} ({context_label}), got {duration_hours!r}"
+        )
+    return start_hour, start_hour + duration_hours
+
+
+def _resolve_gt_window_interval(row: Mapping[str, Any], gt_file: Path) -> Tuple[float, float]:
+    metadata = row.get("window_metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"Missing window_metadata in row in {gt_file}")
+    start_hour, end_hour = _parse_window_interval(
+        hours_since_admission=metadata.get("hours_since_admission"),
+        current_window_hours=metadata.get("current_window_hours"),
+        source_path=gt_file,
+        context_label="gt_window",
+    )
+    return _interval_key(start_hour, end_hour)
+
+
+def _resolve_prediction_interval(item: Mapping[str, Any], source_path: Path) -> Tuple[float, float]:
+    marker = item.get("oracle_window_marker")
+    if isinstance(marker, Mapping):
+        start_raw = marker.get("interval_start_hour")
+        end_raw = marker.get("interval_end_hour")
+        if start_raw is not None and end_raw is not None:
+            try:
+                return _interval_key(float(start_raw), float(end_raw))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid oracle_window_marker in {source_path}: {marker}") from exc
+
+    start_raw = item.get("window_start_hour")
+    end_raw = item.get("window_end_hour")
+    if start_raw is not None and end_raw is not None:
+        try:
+            return _interval_key(float(start_raw), float(end_raw))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid window_start_hour/window_end_hour in prediction row in {source_path}: "
+                f"{start_raw!r}, {end_raw!r}"
+            ) from exc
+
+    hours_raw = item.get("hours_since_admission")
+    duration_raw = item.get("window_duration_hours")
+    if hours_raw is not None and duration_raw is not None:
+        start_hour, end_hour = _parse_window_interval(
+            hours_since_admission=hours_raw,
+            current_window_hours=duration_raw,
+            source_path=source_path,
+            context_label="prediction_window",
+        )
+        return _interval_key(start_hour, end_hour)
+
+    raise ValueError(
+        f"Missing oracle_window_marker/window_start_hour/window_end_hour/window_duration_hours in prediction row in "
+        f"{source_path}"
+    )
+
+
+def _load_gt_window_rows(gt_file: Path) -> List[Mapping[str, Any]]:
     payload = _load_json(gt_file)
     window_rows: List[Mapping[str, Any]] = []
 
@@ -322,19 +455,64 @@ def _load_gt_problems_by_window(gt_file: Path) -> Dict[int, List[str]]:
     if not window_rows:
         raise ValueError(f"Missing GT window rows in {gt_file}")
 
-    by_window: Dict[int, List[str]] = {}
-    for row in window_rows:
-        source_window_raw = row.get("source_window_index")
-        window_raw = source_window_raw if source_window_raw is not None else row.get("window_index")
-        if window_raw is None:
-            continue
-        window_index = int(window_raw)
-        if window_index < 0:
-            continue
-        problems = _extract_gt_problems_from_window_row(row)
-        by_window[int(window_index)] = problems
+    return window_rows
 
-    return by_window
+
+def _load_gt_problems_by_interval(gt_file: Path) -> Dict[Tuple[float, float], List[str]]:
+    window_rows = _load_gt_window_rows(gt_file)
+
+    by_interval: Dict[Tuple[float, float], List[str]] = {}
+    for row in window_rows:
+        interval_key = _resolve_gt_window_interval(row=row, gt_file=gt_file)
+        if interval_key in by_interval:
+            raise ValueError(f"Duplicate GT interval={interval_key} in {gt_file}")
+        problems = _extract_gt_problems_from_window_row(row)
+        by_interval[interval_key] = problems
+
+    return by_interval
+
+
+def _load_gt_window_intervals(gt_file: Path) -> Set[Tuple[float, float]]:
+    window_rows = _load_gt_window_rows(gt_file)
+    intervals: Set[Tuple[float, float]] = set()
+    for row in window_rows:
+        intervals.add(_resolve_gt_window_interval(row=row, gt_file=gt_file))
+    return intervals
+
+
+def _match_prediction_gt_intervals_by_stay(
+    *,
+    prediction_windows_by_stay: Dict[int, Set[Tuple[float, float]]],
+    gt_windows_by_stay: Dict[int, Set[Tuple[float, float]]],
+) -> Dict[str, Any]:
+    matched_windows_by_stay: Dict[int, Set[Tuple[float, float]]] = {}
+    skipped_prediction_stays_missing_gt = 0
+    skipped_prediction_windows_missing_gt = 0
+    matched_windows = 0
+
+    for icu_stay_id, prediction_intervals in prediction_windows_by_stay.items():
+        gt_intervals = gt_windows_by_stay.get(int(icu_stay_id))
+        if gt_intervals is None:
+            skipped_prediction_stays_missing_gt += 1
+            skipped_prediction_windows_missing_gt += int(len(prediction_intervals))
+            continue
+        shared_intervals = prediction_intervals.intersection(gt_intervals)
+        skipped_prediction_windows_missing_gt += int(len(prediction_intervals) - len(shared_intervals))
+        if shared_intervals:
+            matched_windows_by_stay[int(icu_stay_id)] = set(shared_intervals)
+            matched_windows += int(len(shared_intervals))
+
+    return {
+        "matched_windows_by_stay": matched_windows_by_stay,
+        "prediction_stays": int(len(prediction_windows_by_stay)),
+        "gt_stays": int(len(gt_windows_by_stay)),
+        "matched_stays": int(len(matched_windows_by_stay)),
+        "prediction_windows": int(sum(len(v) for v in prediction_windows_by_stay.values())),
+        "gt_windows": int(sum(len(v) for v in gt_windows_by_stay.values())),
+        "matched_windows": int(matched_windows),
+        "skipped_prediction_stays_missing_gt": int(skipped_prediction_stays_missing_gt),
+        "skipped_prediction_windows_missing_gt": int(skipped_prediction_windows_missing_gt),
+    }
 
 
 def _build_problem_matching_prompt(
@@ -509,6 +687,9 @@ def _build_rows_from_match(
         "subject_id": int(task["subject_id"]),
         "icu_stay_id": int(task["icu_stay_id"]),
         "window_index": int(task["window_index"]),
+        "oracle_window_marker_id": str(task["oracle_window_marker_id"]),
+        "oracle_interval_start_hour": float(task["oracle_interval_start_hour"]),
+        "oracle_interval_end_hour": float(task["oracle_interval_end_hour"]),
         "num_predicted_problems": int(num_pred),
         "num_gt_problems": int(num_gt),
         "num_matched_predictions": int(num_matched_pred),
@@ -540,6 +721,9 @@ def _build_rows_from_match(
                 "subject_id": int(task["subject_id"]),
                 "icu_stay_id": int(task["icu_stay_id"]),
                 "window_index": int(task["window_index"]),
+                "oracle_window_marker_id": str(task["oracle_window_marker_id"]),
+                "oracle_interval_start_hour": float(task["oracle_interval_start_hour"]),
+                "oracle_interval_end_hour": float(task["oracle_interval_end_hour"]),
                 "prediction_index": int(pred_idx),
                 "predicted_problem": str(pred_text),
                 "is_matched": int(pred_idx in matched_pred_set),
@@ -555,18 +739,10 @@ def _load_window_and_prediction_rows(
     prediction_dir: Path,
     *,
     gt_dir: Path,
-    window_stride: Optional[int],
     num_workers: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     if int(num_workers) < 1:
         raise ValueError(f"num_workers must be >= 1, got {num_workers}")
-    normalized_window_stride: Optional[int]
-    if window_stride is None:
-        normalized_window_stride = None
-    else:
-        normalized_window_stride = int(window_stride)
-        if normalized_window_stride < 1:
-            raise ValueError(f"window_stride must be >= 1 when provided, got {window_stride}")
 
     prediction_files: List[Path] = []
     for patient_dir in sorted((prediction_dir / "patients").glob("*")):
@@ -578,33 +754,79 @@ def _load_window_and_prediction_rows(
     if not prediction_files:
         raise FileNotFoundError(f"No prediction files found under {prediction_dir / 'patients'}")
 
-    tasks: List[Dict[str, Any]] = []
-    skipped_missing_gt_patients = 0
-    skipped_no_gt_windows = 0
+    prediction_records: List[Dict[str, Any]] = []
+    prediction_windows_by_stay: Dict[int, Set[Tuple[float, float]]] = {}
     for pred_path in prediction_files:
         payload = _load_json(pred_path)
-        patient_id = pred_path.parent.name
-        gt_file = _find_first_existing_file(gt_dir / "patients" / patient_id, GT_FILENAMES)
-        if gt_file is None:
-            skipped_missing_gt_patients += 1
+        icu_stay_id = _extract_icu_stay_id(payload, pred_path)
+        prediction_rows = _extract_window_rows_from_prediction_payload(payload, source_path=pred_path)
+        prediction_intervals: Set[Tuple[float, float]] = set()
+        for row in prediction_rows:
+            prediction_intervals.add(_resolve_prediction_interval(item=row, source_path=pred_path))
+        existing_windows = prediction_windows_by_stay.get(int(icu_stay_id))
+        if existing_windows is not None:
+            raise ValueError(f"Duplicate prediction entries for icu_stay_id={icu_stay_id} in {prediction_dir}")
+        prediction_windows_by_stay[int(icu_stay_id)] = set(prediction_intervals)
+        prediction_records.append(
+            {
+                "pred_path": pred_path,
+                "payload": payload,
+                "icu_stay_id": int(icu_stay_id),
+                "prediction_rows": prediction_rows,
+            }
+        )
+
+    gt_by_stay: Dict[int, Dict[Tuple[float, float], List[str]]] = {}
+    gt_windows_by_stay: Dict[int, Set[Tuple[float, float]]] = {}
+    for patient_dir in sorted((gt_dir / "patients").glob("*")):
+        if not patient_dir.is_dir():
             continue
-        gt_by_window = _load_gt_problems_by_window(gt_file)
+        gt_file = _find_first_existing_file(patient_dir, GT_FILENAMES)
+        if gt_file is None:
+            continue
+        gt_payload = _load_json(gt_file)
+        icu_stay_id = _extract_icu_stay_id(gt_payload, gt_file)
+        gt_by_interval = _load_gt_problems_by_interval(gt_file)
+        if int(icu_stay_id) in gt_by_stay:
+            raise ValueError(f"Duplicate GT entries for icu_stay_id={icu_stay_id} in {gt_dir}")
+        gt_by_stay[int(icu_stay_id)] = gt_by_interval
+        gt_windows_by_stay[int(icu_stay_id)] = _load_gt_window_intervals(gt_file)
+
+    window_match_stats = _match_prediction_gt_intervals_by_stay(
+        prediction_windows_by_stay=prediction_windows_by_stay,
+        gt_windows_by_stay=gt_windows_by_stay,
+    )
+    matched_windows_by_stay = window_match_stats["matched_windows_by_stay"]
+
+    tasks: List[Dict[str, Any]] = []
+    skipped_missing_gt_stays = int(window_match_stats["skipped_prediction_stays_missing_gt"])
+    skipped_unmatched_prediction_windows = int(window_match_stats["skipped_prediction_windows_missing_gt"])
+    skipped_no_gt_windows = 0
+    for record in prediction_records:
+        pred_path = record["pred_path"]
+        payload = record["payload"]
+        patient_id = pred_path.parent.name
+        icu_stay_id = int(record["icu_stay_id"])
+        matched_windows = matched_windows_by_stay.get(int(icu_stay_id))
+        if matched_windows is None:
+            continue
+        gt_by_interval = gt_by_stay.get(int(icu_stay_id))
+        if gt_by_interval is None:
+            continue
 
         subject_id_raw = payload.get("subject_id")
-        icu_stay_id_raw = payload.get("icu_stay_id")
-        if subject_id_raw is None or icu_stay_id_raw is None:
-            raise ValueError(f"Missing subject_id/icu_stay_id in {pred_path}")
+        if subject_id_raw is None:
+            raise ValueError(f"Missing subject_id in {pred_path}")
         subject_id = int(subject_id_raw)
-        icu_stay_id = int(icu_stay_id_raw)
 
-        prediction_rows = _extract_window_rows_from_prediction_payload(payload, source_path=pred_path)
+        prediction_rows = record["prediction_rows"]
         for row in prediction_rows:
             window_index = int(row.get("window_index"))
-            if normalized_window_stride is not None and normalized_window_stride > 1:
-                if int(window_index) % int(normalized_window_stride) != 0:
-                    continue
+            interval_key = _resolve_prediction_interval(item=row, source_path=pred_path)
+            if interval_key not in matched_windows:
+                continue
 
-            gt_problems = gt_by_window.get(window_index, [])
+            gt_problems = gt_by_interval.get(interval_key, [])
             if not gt_problems:
                 skipped_no_gt_windows += 1
                 continue
@@ -615,6 +837,9 @@ def _load_window_and_prediction_rows(
                     "subject_id": int(subject_id),
                     "icu_stay_id": int(icu_stay_id),
                     "window_index": int(window_index),
+                    "oracle_window_marker_id": _interval_marker_id(interval_key),
+                    "oracle_interval_start_hour": float(interval_key[0]),
+                    "oracle_interval_end_hour": float(interval_key[1]),
                     "predicted_problems": list(predicted_problems),
                     "gt_problems": list(gt_problems),
                 }
@@ -628,7 +853,15 @@ def _load_window_and_prediction_rows(
         f"Loaded active-problem windows: patients={len(prediction_files)}, windows={total_tasks}, "
         f"workers={int(num_workers)}"
     )
-    print(f"Skipped patients with missing GT files: {skipped_missing_gt_patients}")
+    print(
+        "Window matching summary: "
+        f"prediction_stays={window_match_stats['prediction_stays']}, "
+        f"gt_stays={window_match_stats['gt_stays']}, "
+        f"matched_stays={window_match_stats['matched_stays']}, "
+        f"matched_windows={window_match_stats['matched_windows']}"
+    )
+    print(f"Skipped prediction stays with missing GT: {skipped_missing_gt_stays}")
+    print(f"Skipped prediction windows not matched in GT: {skipped_unmatched_prediction_windows}")
     print(f"Skipped windows with empty GT active problems: {skipped_no_gt_windows}")
 
     window_rows: List[Dict[str, Any]] = []
@@ -681,7 +914,18 @@ def _load_window_and_prediction_rows(
         "input_tokens": int(total_input_tokens),
         "output_tokens": int(total_output_tokens),
         "total_tokens": int(total_input_tokens + total_output_tokens),
-        "skipped_missing_gt_patients": int(skipped_missing_gt_patients),
+        "window_match_stats": {
+            "prediction_stays": int(window_match_stats["prediction_stays"]),
+            "gt_stays": int(window_match_stats["gt_stays"]),
+            "matched_stays": int(window_match_stats["matched_stays"]),
+            "prediction_windows": int(window_match_stats["prediction_windows"]),
+            "gt_windows": int(window_match_stats["gt_windows"]),
+            "matched_windows": int(window_match_stats["matched_windows"]),
+            "skipped_prediction_stays_missing_gt": int(window_match_stats["skipped_prediction_stays_missing_gt"]),
+            "skipped_prediction_windows_missing_gt": int(window_match_stats["skipped_prediction_windows_missing_gt"]),
+        },
+        "skipped_missing_gt_stays": int(skipped_missing_gt_stays),
+        "skipped_unmatched_prediction_windows": int(skipped_unmatched_prediction_windows),
         "skipped_no_gt_windows": int(skipped_no_gt_windows),
     }
     return window_frame, prediction_frame, usage
@@ -726,28 +970,58 @@ def _compute_metrics(window_frame: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def _evaluate_single_prediction_dir(
-    *,
-    prediction_root: Path,
-    gt_root: Path,
-    output_dir: Path,
-    window_stride: Optional[int],
-    num_workers: int,
-) -> Dict[str, Any]:
-    window_frame, prediction_frame, matcher_usage = _load_window_and_prediction_rows(
-        prediction_dir=prediction_root,
-        gt_dir=gt_root,
-        window_stride=int(window_stride) if window_stride is not None else None,
-        num_workers=int(num_workers),
-    )
+def _load_reused_active_problem_frames(reuse_eval_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    window_path = reuse_eval_dir / "window_level_windows.csv"
+    if not window_path.exists():
+        raise FileNotFoundError(f"Missing reused matcher window file: {window_path}")
+    window_frame = pd.read_csv(window_path)
+    if window_frame.empty:
+        raise ValueError(f"Reused matcher window file is empty: {window_path}")
 
+    list_columns = ("matched_prediction_indices", "matched_gt_indices", "matched_pairs")
+    for column in list_columns:
+        if column not in window_frame.columns:
+            window_frame[column] = [[] for _ in range(len(window_frame))]
+        else:
+            window_frame[column] = window_frame[column].map(_parse_json_list_cell)
+
+    prediction_path = reuse_eval_dir / "window_level_predictions.csv"
+    prediction_frame = pd.read_csv(prediction_path) if prediction_path.exists() else pd.DataFrame()
+
+    metrics_path = reuse_eval_dir / "metrics.json"
+    metrics_payload = _load_json(metrics_path) if metrics_path.exists() else {}
+    matcher_usage = metrics_payload.get("matcher_usage")
+    if not isinstance(matcher_usage, dict):
+        matcher_usage = {
+            "matcher_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "window_match_stats": {},
+        }
+    matcher_usage = dict(matcher_usage)
+    matcher_usage["reused_from"] = str(reuse_eval_dir)
+    return window_frame, prediction_frame, matcher_usage
+
+
+def _write_active_problem_analysis_outputs(
+    *,
+    window_frame: pd.DataFrame,
+    prediction_frame: pd.DataFrame,
+    matcher_usage: Dict[str, Any],
+    prediction_root: Optional[Path],
+    gt_root: Optional[Path],
+    output_dir: Path,
+    reuse_eval_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
     metrics = _compute_metrics(window_frame)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     payload = {
         "generated_at": datetime.now().isoformat(),
-        "prediction_dir": str(prediction_root),
-        "gt_dir": str(gt_root),
+        "prediction_dir": str(prediction_root) if prediction_root is not None else None,
+        "gt_dir": str(gt_root) if gt_root is not None else None,
+        "reuse_eval_dir": str(reuse_eval_dir) if reuse_eval_dir is not None else None,
         "llm_provider": LLM_PROVIDER,
         "llm_model": LLM_MODEL,
         "llm_max_tokens": int(LLM_MAX_TOKENS),
@@ -775,7 +1049,7 @@ def _evaluate_single_prediction_dir(
     )
     print(
         f"LLM matcher: provider={LLM_PROVIDER}, model={LLM_MODEL}, "
-        f"calls={matcher_usage['matcher_calls']}, tokens={matcher_usage['total_tokens']}"
+        f"calls={int(matcher_usage.get('matcher_calls', 0))}, tokens={int(matcher_usage.get('total_tokens', 0))}"
     )
 
     return {
@@ -784,14 +1058,82 @@ def _evaluate_single_prediction_dir(
     }
 
 
+def _evaluate_single_prediction_dir(
+    *,
+    prediction_root: Path,
+    gt_root: Path,
+    output_dir: Path,
+    num_workers: int,
+) -> Dict[str, Any]:
+    window_frame, prediction_frame, matcher_usage = _load_window_and_prediction_rows(
+        prediction_dir=prediction_root,
+        gt_dir=gt_root,
+        num_workers=int(num_workers),
+    )
+    return _write_active_problem_analysis_outputs(
+        window_frame=window_frame,
+        prediction_frame=prediction_frame,
+        matcher_usage=matcher_usage,
+        prediction_root=prediction_root,
+        gt_root=gt_root,
+        output_dir=output_dir,
+    )
+
+
+def _evaluate_reused_eval_dir(
+    *,
+    reuse_eval_dir: Path,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    print(f"Reuse eval directory: {reuse_eval_dir}")
+    window_frame, prediction_frame, matcher_usage = _load_reused_active_problem_frames(reuse_eval_dir)
+    return _write_active_problem_analysis_outputs(
+        window_frame=window_frame,
+        prediction_frame=prediction_frame,
+        matcher_usage=matcher_usage,
+        prediction_root=None,
+        gt_root=None,
+        output_dir=output_dir,
+        reuse_eval_dir=reuse_eval_dir,
+    )
+
+
 def run_evaluation(
     *,
-    prediction_dir: Path,
-    gt_dir: Path,
+    prediction_dir: Optional[Path],
+    gt_dir: Optional[Path],
     output_dir: Optional[Path],
-    window_stride: Optional[int],
     num_workers: int,
+    reuse_eval_dir: Optional[Path] = None,
 ) -> None:
+    if reuse_eval_dir is not None:
+        reuse_root = _ensure_reuse_eval_dir(reuse_eval_dir)
+        mode_dirs = _discover_eval_mode_dirs(reuse_root)
+        base_output_root = output_dir if output_dir is not None else reuse_root
+
+        if mode_dirs:
+            base_output_root.mkdir(parents=True, exist_ok=True)
+            print("Detected reused prediction modes: " + ", ".join(sorted(mode_dirs.keys())) + f" under {reuse_root}")
+            for mode in sorted(mode_dirs.keys()):
+                print("")
+                print(f"=== Reusing matched results for mode: {mode} ===")
+                _evaluate_reused_eval_dir(
+                    reuse_eval_dir=mode_dirs[mode],
+                    output_dir=base_output_root / mode,
+                )
+            print("")
+            print(f"Saved reused multi-mode active-problem evaluation outputs to: {base_output_root}")
+            return
+
+        final_output_dir = base_output_root
+        _evaluate_reused_eval_dir(reuse_eval_dir=reuse_root, output_dir=final_output_dir)
+        return
+
+    if prediction_dir is None:
+        raise ValueError("--prediction-dir is required unless --reuse-eval-dir is provided.")
+    if gt_dir is None:
+        raise ValueError("--gt-dir is required unless --reuse-eval-dir is provided.")
+
     prediction_root = _ensure_prediction_dir(prediction_dir)
     gt_root = _ensure_gt_dir(gt_dir)
 
@@ -808,7 +1150,6 @@ def run_evaluation(
                 prediction_root=mode_dirs[mode],
                 gt_root=gt_root,
                 output_dir=base_output_root / mode,
-                window_stride=int(window_stride) if window_stride is not None else None,
                 num_workers=int(num_workers),
             )
         print("")
@@ -822,7 +1163,6 @@ def run_evaluation(
         prediction_root=prediction_root,
         gt_root=gt_root,
         output_dir=final_output_dir,
-        window_stride=int(window_stride) if window_stride is not None else None,
         num_workers=int(num_workers),
     )
 
@@ -832,13 +1172,13 @@ def main() -> None:
     parser.add_argument(
         "--prediction-dir",
         type=str,
-        required=True,
+        default=None,
         help="Prediction directory containing patients/* prediction JSON files.",
     )
     parser.add_argument(
         "--gt-dir",
         type=str,
-        required=True,
+        default=None,
         help="GT directory containing patients/* GT JSON files.",
     )
     parser.add_argument(
@@ -854,19 +1194,22 @@ def main() -> None:
         help="Number of parallel workers for window-level matching.",
     )
     parser.add_argument(
-        "--window-stride",
-        type=int,
+        "--reuse-eval-dir",
+        type=str,
         default=None,
-        help="Evaluate every n-th window by window_index modulo n. If omitted, evaluate all windows.",
+        help=(
+            "Existing evaluation output directory containing window_level_windows.csv. "
+            "If provided, skips matcher inference and recomputes metrics from saved matcher results."
+        ),
     )
     args = parser.parse_args()
 
     run_evaluation(
-        prediction_dir=Path(args.prediction_dir),
-        gt_dir=Path(args.gt_dir),
+        prediction_dir=Path(args.prediction_dir) if args.prediction_dir else None,
+        gt_dir=Path(args.gt_dir) if args.gt_dir else None,
         output_dir=Path(args.output_dir) if args.output_dir else None,
-        window_stride=int(args.window_stride) if args.window_stride is not None else None,
         num_workers=int(args.num_workers),
+        reuse_eval_dir=Path(args.reuse_eval_dir) if args.reuse_eval_dir else None,
     )
 
 

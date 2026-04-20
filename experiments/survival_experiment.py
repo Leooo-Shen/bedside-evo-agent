@@ -449,6 +449,7 @@ def run_experiment(
             window_duration_hours=config.agent_current_window_hours,
             max_working_windows=config.med_evo_max_working_windows,
             max_insights=config.med_evo_max_insights,
+            max_trajectory_entries=config.med_evo_max_trajectory_entries,
         )
         return process_single_patient(
             patient_record=patient_record,

@@ -6,17 +6,17 @@ def get_episode_agent_prompt() -> str:
 
 ## INPUT
 
-### Patient metadata
+### PATIENT METADATA (read-only context)
 {patient_metadata}
 
-### Prior episode summary (read-only context)
+### PRIOR EPISODE SUMMARY (read-only context)
 Used only to distinguish new from continuing findings and to calibrate baseline. Do not cite from it.
 {prior_episode_summary_text}
 
-### Episode time range
+### EPISODE TIME RANGE
 {episode_start_time} to {episode_end_time}
 
-### Windowed ICU data
+### WINDOWED ICU DATA
 You receive:
 - Raw events for each window, formatted as `[<event_id>] <time> <event_name> <payload>`
 - One grouped `selected vital trends` section summarizing tracked vitals across the whole block
@@ -27,7 +27,7 @@ You receive:
 ## TASK
 Produce (1) an episode summary and (2) a list of critical events.
 
-### Task 1: Episode summary (3–6 sentences)
+### Task 1: EPISODE SUMMARY (3–6 sentences)
 Narrate the block's clinical trajectory: where the patient started the block, what meaningfully happened, where they ended, and what remains unresolved. Focus on direction of travel and inflection points, not a window-by-window recap.
 - Use specific numeric values at inflection points; avoid adjective-only descriptions ("rising", "unstable") without numbers.
 - Include sustained abnormal states only when their persistence is the point (e.g., tachycardia held across the block despite intervention).
@@ -36,13 +36,14 @@ Narrate the block's clinical trajectory: where the patient started the block, wh
 - Refer to events by clinical name in prose. Event IDs appear only in `supporting_event_ids`.
 
 
-### Task 2: Critical events
+### Task 2: CRITICAL EVENTS
 A critical event is a high-SNR inflection point in the patient's ICU trajectory: a moment that materially changes the clinical story. Reading only the critical events, a clinician should be able to reconstruct the shape of the block.
 
 Critical events typically fall into one of these categories:
 - New or worsening organ dysfunction (respiratory, cardiovascular, renal, hepatic, neurological).
 - Resolution or meaningful improvement of existing organ dysfunction.
 - Initiation of a major intervention (intubation, vasopressor start, dialysis, transfusion for active bleed, emergency procedure).
+- Diagnosis scores, such as GCS, RASS, or SOFA scores. 
 - Significant escalation or de-escalation of care reflecting a change in trajectory.
 
 An event qualifies only if it is clinically meaningful on its own, changes how subsequent data should be read, and is corroborated by surrounding trend or events rather than an isolated outlier.

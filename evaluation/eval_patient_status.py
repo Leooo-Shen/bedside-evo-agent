@@ -1,4 +1,4 @@
-"""Evaluate patient-status predictions against Oracle labels."""
+"""Evaluate patient-status predictions against GT labels."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,6 +26,7 @@ NUM_TIME_BINS = 10
 MEMORY_DEPTH_NUM_BINS = 6
 BOOTSTRAP_SAMPLES = 1000
 BOOTSTRAP_SEED = 20260409
+ORACLE_INTERVAL_DECIMALS = 6
 KNOWN_PATIENT_STATUS_MODES = (
     "memory",
     "full_history_events",
@@ -42,6 +43,10 @@ class WindowLabel:
     label: str
     hours_since_admission: float
     num_windows: int
+    window_order: int
+    interval_start_hour: float
+    interval_end_hour: float
+    marker_id: str
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -52,6 +57,16 @@ def _load_json(path: Path) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object in {path}")
     return payload
+
+
+def _extract_icu_stay_id(payload: Dict[str, Any], source_path: Path) -> int:
+    icu_stay_id_raw = payload.get("icu_stay_id")
+    if icu_stay_id_raw is None:
+        raise ValueError(f"Missing icu_stay_id in {source_path}")
+    icu_stay_id = int(icu_stay_id_raw)
+    if icu_stay_id <= 0:
+        raise ValueError(f"Invalid icu_stay_id={icu_stay_id} in {source_path}")
+    return icu_stay_id
 
 
 def _has_patient_status_predictions(path: Path) -> bool:
@@ -86,12 +101,12 @@ def _discover_patient_status_mode_dirs(path: Path) -> Dict[str, Path]:
     return discovered
 
 
-def _ensure_oracle_dir(path: Path) -> Path:
+def _ensure_gt_dir(path: Path) -> Path:
     if not path.exists() or not path.is_dir():
-        raise FileNotFoundError(f"Oracle directory not found: {path}")
+        raise FileNotFoundError(f"GT directory not found: {path}")
     patients_dir = path / "patients"
     if not patients_dir.exists():
-        raise FileNotFoundError(f"Missing patients directory under oracle path: {path}")
+        raise FileNotFoundError(f"Missing patients directory under GT path: {path}")
     if not list(patients_dir.glob("*/oracle_predictions.json")):
         raise FileNotFoundError(f"No oracle_predictions.json files found under {patients_dir}")
     return path
@@ -163,65 +178,141 @@ def _bootstrap_mean_ci(values: Sequence[float], *, n_samples: int, rng: np.rando
     return low, high
 
 
-def _window_indices_from_oracle_outputs(window_outputs: List[Dict[str, Any]], pred_path: Path) -> List[int]:
-    indices: List[int] = []
-    for position, item in enumerate(window_outputs):
-        if not isinstance(item, dict):
-            raise ValueError(f"Invalid window output row at position={position} in {pred_path}")
-        value = item.get("window_index")
-        if not isinstance(value, int):
-            raise ValueError(f"Missing integer window_index at position={position} in {pred_path}")
-        window_index = int(value)
-        if window_index < 0:
-            raise ValueError(f"Negative window_index={window_index} at position={position} in {pred_path}")
-        indices.append(window_index)
+def _interval_key(start_hour: float, end_hour: float) -> Tuple[float, float]:
+    return (round(float(start_hour), ORACLE_INTERVAL_DECIMALS), round(float(end_hour), ORACLE_INTERVAL_DECIMALS))
 
-    unique_sorted = sorted(set(indices))
-    expected = list(range(len(window_outputs)))
-    if unique_sorted != expected:
+
+def _interval_marker_id(interval_key: Tuple[float, float]) -> str:
+    return f"{interval_key[0]:.{ORACLE_INTERVAL_DECIMALS}f}|{interval_key[1]:.{ORACLE_INTERVAL_DECIMALS}f}"
+
+
+def _parse_window_interval(
+    *,
+    hours_since_admission: Any,
+    current_window_hours: Any,
+    source_path: Path,
+    context_label: str,
+) -> Tuple[float, float]:
+    try:
+        start_hour = float(hours_since_admission)
+        duration_hours = float(current_window_hours)
+    except (TypeError, ValueError) as exc:
         raise ValueError(
-            "Oracle window_index must be strict 0-based contiguous [0..N-1]. "
-            f"Found={unique_sorted[:12]} in {pred_path}. "
-            "Convert the Oracle run to 0-based first."
+            f"Invalid hour fields in {source_path} ({context_label}): "
+            f"hours_since_admission={hours_since_admission!r}, current_window_hours={current_window_hours!r}"
+        ) from exc
+    if duration_hours <= 0:
+        raise ValueError(
+            f"current_window_hours must be > 0 in {source_path} ({context_label}), got {duration_hours!r}"
         )
-    return indices
+    return start_hour, start_hour + duration_hours
 
 
-def _load_oracle_labels(oracle_dir: Path) -> Dict[str, Dict[int, WindowLabel]]:
-    labels_by_patient: Dict[str, Dict[int, WindowLabel]] = {}
-    for pred_path in sorted((oracle_dir / "patients").glob("*/oracle_predictions.json")):
-        patient_id = pred_path.parent.name
+def _resolve_gt_window_interval(
+    row: Mapping[str, Any],
+    gt_prediction_path: Path,
+) -> Tuple[float, float]:
+    metadata = row.get("window_metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"Missing window_metadata in row in {gt_prediction_path}")
+    start_hour, end_hour = _parse_window_interval(
+        hours_since_admission=metadata.get("hours_since_admission"),
+        current_window_hours=metadata.get("current_window_hours"),
+        source_path=gt_prediction_path,
+        context_label="gt_window",
+    )
+    return _interval_key(start_hour, end_hour)
+
+
+def _resolve_prediction_interval(item: Mapping[str, Any], source_path: Path) -> Tuple[float, float]:
+    marker = item.get("oracle_window_marker")
+    if isinstance(marker, Mapping):
+        start_raw = marker.get("interval_start_hour")
+        end_raw = marker.get("interval_end_hour")
+        if start_raw is not None and end_raw is not None:
+            try:
+                return _interval_key(float(start_raw), float(end_raw))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid oracle_window_marker in {source_path}: {marker}") from exc
+    start_raw = item.get("window_start_hour")
+    end_raw = item.get("window_end_hour")
+    if start_raw is not None and end_raw is not None:
+        try:
+            return _interval_key(float(start_raw), float(end_raw))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid window_start_hour/window_end_hour in prediction row in {source_path}: "
+                f"{start_raw!r}, {end_raw!r}"
+            ) from exc
+    hours_raw = item.get("hours_since_admission")
+    duration_raw = item.get("window_duration_hours")
+    if hours_raw is not None and duration_raw is not None:
+        start_hour, end_hour = _parse_window_interval(
+            hours_since_admission=hours_raw,
+            current_window_hours=duration_raw,
+            source_path=source_path,
+            context_label="prediction_window",
+        )
+        return _interval_key(start_hour, end_hour)
+    raise ValueError(
+        f"Missing oracle_window_marker/window_start_hour/window_end_hour/window_duration_hours in prediction row in "
+        f"{source_path}"
+    )
+
+
+def _marker_best_window_index(marker: Mapping[str, Any]) -> Optional[int]:
+    for key in ("stride_source_window_index", "source_window_index", "window_index"):
+        value = marker.get(key)
+        if value is None:
+            continue
+        return int(value)
+    return None
+
+
+def _load_gt_labels_by_stay(
+    gt_dir: Path,
+) -> Tuple[Dict[int, Dict[Tuple[float, float], WindowLabel]], Dict[int, Set[Tuple[float, float]]]]:
+    labels_by_stay: Dict[int, Dict[Tuple[float, float], WindowLabel]] = {}
+    windows_by_stay: Dict[int, Set[Tuple[float, float]]] = {}
+    for pred_path in sorted((gt_dir / "patients").glob("*/oracle_predictions.json")):
         payload = _load_json(pred_path)
+        icu_stay_id = _extract_icu_stay_id(payload, pred_path)
+        if int(icu_stay_id) in labels_by_stay:
+            raise ValueError(f"Duplicate GT entries for icu_stay_id={icu_stay_id} in {gt_dir}")
         window_outputs = payload.get("window_outputs")
         if not isinstance(window_outputs, list) or not window_outputs:
             raise ValueError(f"Missing or empty window_outputs in {pred_path}")
 
-        indices = _window_indices_from_oracle_outputs(window_outputs, pred_path)
-        total_windows = len(indices)
-        patient_labels: Dict[int, WindowLabel] = {}
-        for output, window_index in zip(window_outputs, indices):
-            if not isinstance(output, dict):
+        labels_by_interval: Dict[Tuple[float, float], str] = {}
+        for output in window_outputs:
+            if not isinstance(output, Mapping):
                 raise ValueError(f"Invalid window output row in {pred_path}")
+            interval_key = _resolve_gt_window_interval(output, pred_path)
+            if interval_key in labels_by_interval:
+                raise ValueError(f"Duplicate GT interval={interval_key} in {pred_path}")
             oracle_output = output.get("oracle_output")
-            if not isinstance(oracle_output, dict):
-                raise ValueError(f"Missing oracle_output in {pred_path} for patient {patient_id}")
-            label = normalize_status_label(extract_overall_label(oracle_output))
-            metadata = output.get("window_metadata")
-            hours = 0.0
-            if isinstance(metadata, dict):
-                try:
-                    hours = float(metadata.get("hours_since_admission") or 0.0)
-                except (TypeError, ValueError):
-                    hours = 0.0
-            patient_labels[int(window_index)] = WindowLabel(
-                label=label,
-                hours_since_admission=hours,
-                num_windows=total_windows,
+            if not isinstance(oracle_output, Mapping):
+                raise ValueError(f"Missing oracle_output in {pred_path} for icu_stay_id={icu_stay_id}")
+            labels_by_interval[interval_key] = normalize_status_label(extract_overall_label(oracle_output))
+
+        ordered_intervals = sorted(labels_by_interval.keys(), key=lambda interval: (float(interval[0]), float(interval[1])))
+        total_windows = len(ordered_intervals)
+        stay_labels: Dict[Tuple[float, float], WindowLabel] = {}
+        for order, interval in enumerate(ordered_intervals):
+            stay_labels[interval] = WindowLabel(
+                label=str(labels_by_interval[interval]),
+                hours_since_admission=float(interval[0]),
+                num_windows=int(total_windows),
+                window_order=int(order),
+                interval_start_hour=float(interval[0]),
+                interval_end_hour=float(interval[1]),
+                marker_id=_interval_marker_id(interval),
             )
-        labels_by_patient[patient_id] = patient_labels
-    if not labels_by_patient:
-        raise ValueError(f"No oracle labels loaded from {oracle_dir}")
-    return labels_by_patient
+        labels_by_stay[int(icu_stay_id)] = stay_labels
+        windows_by_stay[int(icu_stay_id)] = set(ordered_intervals)
+    if not labels_by_stay:
+        raise ValueError(f"No GT labels loaded from {gt_dir}")
+    return labels_by_stay, windows_by_stay
 
 
 def _memory_depth_by_window(source_patient_dir: Path) -> Dict[int, int]:
@@ -248,9 +339,32 @@ def _memory_depth_by_window(source_patient_dir: Path) -> Dict[int, int]:
     return depths
 
 
+def _collect_prediction_windows_by_stay(prediction_dir: Path) -> Dict[int, Set[Tuple[float, float]]]:
+    prediction_files = sorted((prediction_dir / "patients").glob("*/patient_status_predictions.json"))
+    if not prediction_files:
+        raise FileNotFoundError(f"No patient_status_predictions.json files found under {prediction_dir / 'patients'}")
+    windows_by_stay: Dict[int, Set[Tuple[float, float]]] = {}
+    for pred_path in prediction_files:
+        payload = _load_json(pred_path)
+        icu_stay_id = _extract_icu_stay_id(payload, pred_path)
+        if int(icu_stay_id) in windows_by_stay:
+            raise ValueError(f"Duplicate prediction entries for icu_stay_id={icu_stay_id} in {prediction_dir}")
+        status_predictions = payload.get("status_predictions")
+        if not isinstance(status_predictions, list):
+            raise ValueError(f"Missing status_predictions list in {pred_path}")
+        prediction_intervals: Set[Tuple[float, float]] = set()
+        for item in status_predictions:
+            if not isinstance(item, Mapping):
+                raise ValueError(f"Invalid status prediction row in {pred_path}")
+            prediction_intervals.add(_resolve_prediction_interval(item=item, source_path=pred_path))
+        windows_by_stay[int(icu_stay_id)] = prediction_intervals
+    return windows_by_stay
+
+
 def _load_prediction_rows(
     prediction_dir: Path,
-    oracle_labels: Dict[str, Dict[int, WindowLabel]],
+    gt_labels_by_stay: Dict[int, Dict[Tuple[float, float], WindowLabel]],
+    matched_windows_by_stay: Dict[int, Set[Tuple[float, float]]],
     system_name: str,
     include_memory_depth: bool,
 ) -> pd.DataFrame:
@@ -263,18 +377,20 @@ def _load_prediction_rows(
         payload = _load_json(pred_path)
         patient_id = pred_path.parent.name
         subject_id_raw = payload.get("subject_id")
-        icu_stay_id_raw = payload.get("icu_stay_id")
-        if subject_id_raw is None or icu_stay_id_raw is None:
-            raise ValueError(f"Missing subject_id/icu_stay_id in {pred_path}")
+        if subject_id_raw is None:
+            raise ValueError(f"Missing subject_id in {pred_path}")
+        icu_stay_id = _extract_icu_stay_id(payload, pred_path)
+        matched_windows = matched_windows_by_stay.get(int(icu_stay_id))
+        if matched_windows is None:
+            continue
         subject_id = int(subject_id_raw)
-        icu_stay_id = int(icu_stay_id_raw)
 
         status_predictions = payload.get("status_predictions")
         if not isinstance(status_predictions, list):
             raise ValueError(f"Missing status_predictions list in {pred_path}")
 
-        oracle_map = oracle_labels.get(patient_id)
-        if oracle_map is None:
+        gt_map = gt_labels_by_stay.get(int(icu_stay_id))
+        if gt_map is None:
             continue
 
         memory_depth_map: Dict[int, int] = {}
@@ -285,27 +401,48 @@ def _load_prediction_rows(
             memory_depth_map = _memory_depth_by_window(Path(str(source_patient_dir_raw)))
 
         for item in status_predictions:
-            if not isinstance(item, dict):
+            if not isinstance(item, Mapping):
                 raise ValueError(f"Invalid status prediction row in {pred_path}")
-            if "window_index" not in item:
-                raise ValueError(f"Missing window_index in status prediction row in {pred_path}")
-            window_index = int(item.get("window_index"))
-            if window_index < 0:
-                raise ValueError(f"Negative agent window_index={window_index} in {pred_path}")
-            oracle_row = oracle_map.get(window_index)
-            if oracle_row is None:
+            interval_key = _resolve_prediction_interval(item=item, source_path=pred_path)
+            if interval_key not in matched_windows:
                 continue
+            gt_row = gt_map.get(interval_key)
+            if gt_row is None:
+                continue
+            window_raw = item.get("window_index")
+            if window_raw is None:
+                window_index = int(gt_row.window_order)
+            else:
+                window_index = int(window_raw)
+                if window_index < 0:
+                    raise ValueError(f"Negative agent window_index={window_index} in {pred_path}")
 
             pred_label = normalize_status_label(item.get("status_label"))
-            true_label = oracle_row.label
-            num_windows = int(oracle_row.num_windows)
+            true_label = gt_row.label
+            num_windows = int(gt_row.num_windows)
             if num_windows > 1:
-                relative_time = float(window_index) / float(num_windows - 1)
+                relative_time = float(gt_row.window_order) / float(num_windows - 1)
             else:
                 relative_time = 0.0
             relative_time = min(max(relative_time, 0.0), 1.0)
             time_bin = assign_normalized_time_bin(relative_time, num_bins=NUM_TIME_BINS)
-            memory_depth = memory_depth_map.get(window_index)
+            hours_raw = item.get("hours_since_admission")
+            if hours_raw is None:
+                hours_since_admission = float(gt_row.interval_start_hour)
+            else:
+                hours_since_admission = float(hours_raw)
+            marker = item.get("oracle_window_marker")
+            depth_lookup_window_index = int(window_index)
+            if isinstance(marker, Mapping):
+                marker_window_index = _marker_best_window_index(marker)
+                if marker_window_index is not None:
+                    depth_lookup_window_index = int(marker_window_index)
+            memory_depth = memory_depth_map.get(depth_lookup_window_index)
+            window_start_hour = float(item.get("window_start_hour") or gt_row.interval_start_hour)
+            window_end_hour = float(item.get("window_end_hour") or gt_row.interval_end_hour)
+            marker_id = str(item.get("oracle_window_marker_id") or gt_row.marker_id).strip()
+            if not marker_id:
+                marker_id = str(gt_row.marker_id)
 
             rows.append(
                 {
@@ -314,10 +451,16 @@ def _load_prediction_rows(
                     "subject_id": subject_id,
                     "icu_stay_id": icu_stay_id,
                     "window_index": window_index,
+                    "gt_window_order": int(gt_row.window_order),
                     "num_windows": num_windows,
                     "relative_time": relative_time,
                     "time_bin": time_bin,
-                    "hours_since_admission": float(item.get("hours_since_admission") or 0.0),
+                    "hours_since_admission": float(hours_since_admission),
+                    "window_start_hour": float(window_start_hour),
+                    "window_end_hour": float(window_end_hour),
+                    "oracle_window_marker_id": marker_id,
+                    "oracle_interval_start_hour": float(gt_row.interval_start_hour),
+                    "oracle_interval_end_hour": float(gt_row.interval_end_hour),
                     "pred_label": pred_label,
                     "true_label": true_label,
                     "is_correct": int(pred_label == true_label),
@@ -329,7 +472,7 @@ def _load_prediction_rows(
     if frame.empty:
         raise ValueError(
             f"No matched prediction windows for system='{system_name}'. "
-            "Check overlap between prediction windows and oracle windows."
+            "Check overlap between prediction windows and GT windows."
         )
     return frame
 
@@ -665,24 +808,72 @@ def _save_metrics(
         json.dump(payload, f, indent=2)
 
 
+def _match_prediction_gt_intervals_by_stay(
+    *,
+    prediction_windows_by_stay: Dict[int, Set[Tuple[float, float]]],
+    gt_windows_by_stay: Dict[int, Set[Tuple[float, float]]],
+) -> Tuple[Dict[int, Set[Tuple[float, float]]], Dict[str, int]]:
+    matched_windows_by_stay: Dict[int, Set[Tuple[float, float]]] = {}
+    skipped_missing_gt_stays = 0
+    skipped_unmatched_prediction_windows = 0
+    matched_windows_total = 0
+    for icu_stay_id, prediction_intervals in prediction_windows_by_stay.items():
+        gt_intervals = gt_windows_by_stay.get(int(icu_stay_id))
+        if gt_intervals is None:
+            skipped_missing_gt_stays += 1
+            skipped_unmatched_prediction_windows += int(len(prediction_intervals))
+            continue
+        shared_intervals = prediction_intervals.intersection(gt_intervals)
+        skipped_unmatched_prediction_windows += int(len(prediction_intervals) - len(shared_intervals))
+        if shared_intervals:
+            matched_windows_by_stay[int(icu_stay_id)] = set(shared_intervals)
+            matched_windows_total += int(len(shared_intervals))
+    stats = {
+        "prediction_stays": int(len(prediction_windows_by_stay)),
+        "gt_stays": int(len(gt_windows_by_stay)),
+        "matched_stays": int(len(matched_windows_by_stay)),
+        "prediction_windows": int(sum(len(v) for v in prediction_windows_by_stay.values())),
+        "gt_windows": int(sum(len(v) for v in gt_windows_by_stay.values())),
+        "matched_windows": int(matched_windows_total),
+        "skipped_prediction_stays_missing_gt": int(skipped_missing_gt_stays),
+        "skipped_prediction_windows_missing_gt": int(skipped_unmatched_prediction_windows),
+    }
+    return matched_windows_by_stay, stats
+
+
 def _evaluate_single_prediction_dir(
     *,
     prediction_dir: Path,
-    oracle_labels: Dict[str, Dict[int, WindowLabel]],
+    gt_labels_by_stay: Dict[int, Dict[Tuple[float, float], WindowLabel]],
+    gt_windows_by_stay: Dict[int, Set[Tuple[float, float]]],
     output_dir: Path,
     baseline_root: Optional[Path],
 ) -> Dict[str, Any]:
+    med_evo_prediction_windows_by_stay = _collect_prediction_windows_by_stay(prediction_dir)
+    med_evo_matched_windows_by_stay, med_evo_window_match_stats = _match_prediction_gt_intervals_by_stay(
+        prediction_windows_by_stay=med_evo_prediction_windows_by_stay,
+        gt_windows_by_stay=gt_windows_by_stay,
+    )
     med_evo_frame = _load_prediction_rows(
         prediction_dir=prediction_dir,
-        oracle_labels=oracle_labels,
+        gt_labels_by_stay=gt_labels_by_stay,
+        matched_windows_by_stay=med_evo_matched_windows_by_stay,
         system_name="MedEvo",
         include_memory_depth=True,
     )
+
     baseline_frame: Optional[pd.DataFrame] = None
+    baseline_window_match_stats: Optional[Dict[str, int]] = None
     if baseline_root is not None:
+        baseline_prediction_windows_by_stay = _collect_prediction_windows_by_stay(baseline_root)
+        baseline_matched_windows_by_stay, baseline_window_match_stats = _match_prediction_gt_intervals_by_stay(
+            prediction_windows_by_stay=baseline_prediction_windows_by_stay,
+            gt_windows_by_stay=gt_windows_by_stay,
+        )
         baseline_frame = _load_prediction_rows(
             prediction_dir=baseline_root,
-            oracle_labels=oracle_labels,
+            gt_labels_by_stay=gt_labels_by_stay,
+            matched_windows_by_stay=baseline_matched_windows_by_stay,
             system_name="Baseline",
             include_memory_depth=False,
         )
@@ -735,10 +926,23 @@ def _evaluate_single_prediction_dir(
         f"  MedEvo macro={med_evo_metrics['macro_acc']:.4f} "
         f"(patients={med_evo_metrics['num_patients']}, windows={med_evo_metrics['num_windows']})"
     )
+    print(
+        f"  MedEvo window matching: stays={med_evo_window_match_stats['matched_stays']}/"
+        f"{med_evo_window_match_stats['prediction_stays']}, "
+        f"windows={med_evo_window_match_stats['matched_windows']}/"
+        f"{med_evo_window_match_stats['prediction_windows']}"
+    )
     if baseline_metrics is not None:
         print(
             f"  Baseline macro={baseline_metrics['macro_acc']:.4f} "
             f"(patients={baseline_metrics['num_patients']}, windows={baseline_metrics['num_windows']})"
+        )
+    if baseline_window_match_stats is not None:
+        print(
+            f"  Baseline window matching: stays={baseline_window_match_stats['matched_stays']}/"
+            f"{baseline_window_match_stats['prediction_stays']}, "
+            f"windows={baseline_window_match_stats['matched_windows']}/"
+            f"{baseline_window_match_stats['prediction_windows']}"
         )
 
     return {
@@ -751,12 +955,12 @@ def _evaluate_single_prediction_dir(
 def run_evaluation(
     *,
     med_evo_dir: Path,
-    oracle_dir: Path,
+    gt_dir: Path,
     output_dir: Optional[Path],
     baseline_dir: Optional[Path],
 ) -> None:
-    oracle_root = _ensure_oracle_dir(oracle_dir)
-    oracle_labels = _load_oracle_labels(oracle_root)
+    gt_root = _ensure_gt_dir(gt_dir)
+    gt_labels_by_stay, gt_windows_by_stay = _load_gt_labels_by_stay(gt_root)
 
     mode_root_candidates: List[Path] = [med_evo_dir]
     for root_name in PATIENT_STATUS_ROOT_NAMES:
@@ -803,7 +1007,8 @@ def run_evaluation(
             print(f"=== Evaluating mode: {mode} ===")
             mode_result = _evaluate_single_prediction_dir(
                 prediction_dir=mode_prediction_dir,
-                oracle_labels=oracle_labels,
+                gt_labels_by_stay=gt_labels_by_stay,
+                gt_windows_by_stay=gt_windows_by_stay,
                 output_dir=mode_output_dir,
                 baseline_root=None,
             )
@@ -835,14 +1040,15 @@ def run_evaluation(
     final_output_dir = output_dir if output_dir is not None else _default_output_dir_from_med_evo_root(med_evo_root)
     _evaluate_single_prediction_dir(
         prediction_dir=med_evo_root,
-        oracle_labels=oracle_labels,
+        gt_labels_by_stay=gt_labels_by_stay,
+        gt_windows_by_stay=gt_windows_by_stay,
         output_dir=final_output_dir,
         baseline_root=baseline_root,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate patient-status predictions against Oracle labels.")
+    parser = argparse.ArgumentParser(description="Evaluate patient-status predictions against GT labels.")
     parser.add_argument(
         "--med-evo-dir",
         type=str,
@@ -854,10 +1060,10 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--oracle-dir",
+        "--gt-dir",
         type=str,
         required=True,
-        help="Oracle output directory containing patients/*/oracle_predictions.json.",
+        help="GT directory containing patients/*/oracle_predictions.json.",
     )
     parser.add_argument(
         "--output-dir",
@@ -879,7 +1085,7 @@ def main() -> None:
 
     run_evaluation(
         med_evo_dir=Path(args.med_evo_dir),
-        oracle_dir=Path(args.oracle_dir),
+        gt_dir=Path(args.gt_dir),
         output_dir=Path(args.output_dir) if args.output_dir else None,
         baseline_dir=Path(args.baseline_dir) if args.baseline_dir else None,
     )

@@ -396,6 +396,15 @@ class Config:
             raise ValueError(f"med_evo.max_insights must be an integer >= 1, got {value}") from exc
 
     @property
+    def med_evo_max_trajectory_entries(self) -> int:
+        """Maximum number of episode-level trajectory entries retained in memory."""
+        value = self.require("med_evo.max_trajectory_entries")
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"med_evo.max_trajectory_entries must be an integer >= 1, got {value}") from exc
+
+    @property
     def med_evo_episode_block_windows(self) -> int:
         """Number of parser windows per MedEvo episode block."""
         value = self.require("med_evo.episode_block_windows")

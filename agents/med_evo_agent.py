@@ -627,10 +627,7 @@ def _format_prior_episode_summary_text(trajectory_memory: List[Dict[str, Any]]) 
             lines.append(f"Window {start_window}-{end_window}: {summary}")
             continue
 
-        lines.append(
-            f"Window {start_window}-{end_window} "
-            f"(hour {start_hour:.1f}-{end_hour:.1f}): {summary}"
-        )
+        lines.append(f"Window {start_window}-{end_window} " f"(hour {start_hour:.1f}-{end_hour:.1f}): {summary}")
 
     return "\n".join(lines) if lines else "None"
 
@@ -1026,7 +1023,6 @@ class ObservationAgent:
                 raise ValueError(f"trend_vitals[{canonical_name}] is missing required sources: {missing_sources_text}")
 
     def _compile_config(self, payload: Dict[str, Any]) -> None:
-        self.window_minutes = float(payload["window_minutes"])
         self.vital_sanity_ranges = {
             key: (float(value[0]), float(value[1])) for key, value in payload["vital_sanity_ranges"].items()
         }
@@ -1044,40 +1040,6 @@ class ObservationAgent:
 
         self.trend_vital_names = list(dict.fromkeys(trend_vital_names))
 
-    @staticmethod
-    def _parse_window_datetime(value: Any, field_name: str) -> datetime:
-        if value is None:
-            raise ValueError(f"Window payload missing {field_name}")
-        if hasattr(value, "to_pydatetime"):
-            value = value.to_pydatetime()
-        if isinstance(value, datetime):
-            return value
-        timestamp_text = _safe_text(value)
-        if not timestamp_text:
-            raise ValueError(f"Window payload missing {field_name}")
-        if timestamp_text.endswith("Z"):
-            timestamp_text = f"{timestamp_text[:-1]}+00:00"
-        try:
-            return datetime.fromisoformat(timestamp_text)
-        except ValueError as exc:
-            raise ValueError(f"Window payload {field_name} must be ISO-8601 parseable, got: {value}") from exc
-
-    def _validate_window_duration(self, window_data: Dict[str, Any]) -> None:
-        window_start = self._parse_window_datetime(window_data.get("current_window_start"), "current_window_start")
-        window_end = self._parse_window_datetime(window_data.get("current_window_end"), "current_window_end")
-        try:
-            duration_minutes = (window_end - window_start).total_seconds() / 60.0
-        except TypeError as exc:
-            raise ValueError(
-                "current_window_start and current_window_end must both be timezone-aware or both timezone-naive"
-            ) from exc
-        if duration_minutes <= 0:
-            raise ValueError(f"Window duration must be positive minutes, got {duration_minutes:g}")
-        if abs(duration_minutes - self.window_minutes) > 0.05:
-            raise ValueError(
-                f"Window duration mismatch: expected {self.window_minutes:g} minutes, got {duration_minutes:g} minutes"
-            )
-
     def _warn_once(self, *, seen: set[str], key: str, message: str, values: Tuple[Any, ...]) -> None:
         if key in seen:
             return
@@ -1094,12 +1056,12 @@ class ObservationAgent:
     def _ingest_vital_event(self, *, code_specifics: str, numeric_value: float) -> Optional[Tuple[str, float]]:
         trend_name = self.trend_vital_by_source.get(code_specifics)
         if trend_name is None:
-            self._warn_once(
-                seen=self._unmapped_vital_sources_logged,
-                key=code_specifics or "<empty>",
-                message="Unmapped vital code_specifics dropped: %s",
-                values=(code_specifics,),
-            )
+            # self._warn_once(
+            #     seen=self._unmapped_vital_sources_logged,
+            #     key=code_specifics or "<empty>",
+            #     message="Unmapped vital code_specifics dropped: %s",
+            #     values=(code_specifics,),
+            # )
             return None
 
         normalized_value = self._normalize_ingested_vital_value(
@@ -1139,7 +1101,6 @@ class ObservationAgent:
         return output
 
     def analyze(self, window_data: Dict[str, Any]) -> Dict[str, Any]:
-        self._validate_window_duration(window_data)
         current_events = window_data.get("current_events")
         if not isinstance(current_events, list):
             raise ValueError("Window payload must include current_events as a list")
@@ -1358,6 +1319,7 @@ class MedEvoAgent:
         window_duration_hours: float = 0.5,
         max_working_windows: int = 3,
         max_insights: int = 5,
+        max_trajectory_entries: Optional[int] = None,
     ):
         self.llm_client = LLMClient(
             provider=provider,
@@ -1370,6 +1332,9 @@ class MedEvoAgent:
         self.window_duration_hours = window_duration_hours
         self.max_working_windows = max(1, int(max_working_windows))
         self.max_insights = max(1, int(max_insights))
+        if max_trajectory_entries is None:
+            raise ValueError("max_trajectory_entries must be provided")
+        self.max_trajectory_entries = max(1, int(max_trajectory_entries))
         self.episode_block_windows = max(1, int(episode_block_windows))
         self.insight_block_windows = max(1, int(insight_block_windows))
         self.observation_config_path = _safe_text(observation_config_path)
@@ -1398,6 +1363,7 @@ class MedEvoAgent:
         self.total_pre_icu_compression_tokens = 0
         self.total_grounding_rejections = 0
         self.total_insights_pruned = 0
+        self.total_trajectory_entries_pruned = 0
 
         self._current_patient_id = ""
         self._event_id_to_window: Dict[int, int] = {}
@@ -1434,8 +1400,10 @@ class MedEvoAgent:
             "total_pre_icu_compression_tokens": self.total_pre_icu_compression_tokens,
             "total_grounding_rejections": self.total_grounding_rejections,
             "total_insights_pruned": self.total_insights_pruned,
+            "total_trajectory_entries_pruned": self.total_trajectory_entries_pruned,
             "episode_block_windows": self.episode_block_windows,
             "insight_block_windows": self.insight_block_windows,
+            "max_trajectory_entries": self.max_trajectory_entries,
             "observation_config_path": self.observation_config_path,
             "total_llm_calls": len(self.call_logs) if self.enable_logging else 0,
         }
@@ -2045,6 +2013,21 @@ class MedEvoAgent:
         memory.last_processed_start_hour = entry.start_hour
         memory.last_processed_end_hour = entry.end_hour
 
+    def _prune_episode_level_memory(self, memory: MedEvoMemory) -> None:
+        if len(memory.trajectory_memory) <= self.max_trajectory_entries:
+            return
+
+        prune_count = len(memory.trajectory_memory) - self.max_trajectory_entries
+        self.total_trajectory_entries_pruned += prune_count
+        memory.trajectory_memory = memory.trajectory_memory[prune_count:]
+
+        if prune_count <= 0:
+            return
+        if prune_count >= len(memory.critical_events_memory):
+            memory.critical_events_memory = []
+            return
+        memory.critical_events_memory = memory.critical_events_memory[prune_count:]
+
     def create_memory_snapshots(
         self,
         windows: List[Dict[str, Any]],
@@ -2136,6 +2119,7 @@ class MedEvoAgent:
                 latest_episode_trend_block = deepcopy(trend_block)
                 memory.trajectory_memory.append(grounded_episode.to_dict())
                 memory.critical_events_memory.append(grounded_critical_events)
+                self._prune_episode_level_memory(memory)
 
                 self._log_call(
                     step_type="episode_agent",
@@ -2199,7 +2183,7 @@ class MedEvoAgent:
                 print(
                     f"trends={len(memory.trend_memory)} "
                     f"episodes={len(memory.trajectory_memory)} "
-                    f"critical_blocks={len(memory.critical_events_memory)} "
+                    f"critical_events={len(memory.critical_events_memory)} "
                     f"insights={len(memory.insights)}"
                 )
 

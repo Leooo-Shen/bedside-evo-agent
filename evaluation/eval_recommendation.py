@@ -10,7 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -44,6 +44,7 @@ BOOTSTRAP_SEED = 20260409
 FIXED_EVAL_K = 5
 HIT_MATCH_COUNT_THRESHOLD = 1
 _THREAD_LOCAL = threading.local()
+ORACLE_INTERVAL_DECIMALS = 6
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -94,6 +95,20 @@ def _json_dump(path: Path, payload: Any) -> None:
         json.dump(_safe_json_value(payload), f, indent=2, ensure_ascii=False)
 
 
+def _parse_json_list_cell(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if value is None or pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    parsed = json.loads(text)
+    if not isinstance(parsed, list):
+        raise ValueError(f"Expected JSON list cell, got: {text[:100]}")
+    return parsed
+
+
 def _ensure_predictions_dir(path: Path) -> Path:
     if not path.exists() or not path.is_dir():
         raise FileNotFoundError(f"Prediction directory not found: {path}")
@@ -114,12 +129,12 @@ def _ensure_predictions_dir(path: Path) -> Path:
     )
 
 
-def _ensure_oracle_results_dir(path: Path) -> Path:
+def _ensure_gt_dir(path: Path) -> Path:
     if not path.exists() or not path.is_dir():
-        raise FileNotFoundError(f"Oracle directory not found: {path}")
+        raise FileNotFoundError(f"GT directory not found: {path}")
     patients_dir = path / "patients"
     if not patients_dir.exists() or not patients_dir.is_dir():
-        raise FileNotFoundError(f"Oracle patients directory not found: {patients_dir}")
+        raise FileNotFoundError(f"GT patients directory not found: {patients_dir}")
     matches = list(patients_dir.glob("*/oracle_predictions.json"))
     if not matches:
         raise FileNotFoundError(f"No oracle_predictions.json files found under {patients_dir}")
@@ -140,6 +155,30 @@ def _discover_recommendation_mode_dirs(path: Path) -> Dict[str, Path]:
         if candidate.exists() and candidate.is_dir() and _has_recommendation_predictions(candidate):
             discovered[str(mode)] = candidate
     return discovered
+
+
+def _has_recommendation_eval_outputs(path: Path) -> bool:
+    return (path / "window_level_windows.csv").exists()
+
+
+def _discover_recommendation_eval_mode_dirs(path: Path) -> Dict[str, Path]:
+    discovered: Dict[str, Path] = {}
+    for mode in KNOWN_RECOMMENDATION_MODES:
+        candidate = path / mode
+        if candidate.exists() and candidate.is_dir() and _has_recommendation_eval_outputs(candidate):
+            discovered[str(mode)] = candidate
+    return discovered
+
+
+def _ensure_recommendation_eval_dir(path: Path) -> Path:
+    if not path.exists() or not path.is_dir():
+        raise FileNotFoundError(f"Reuse eval directory not found: {path}")
+    if _has_recommendation_eval_outputs(path) or _discover_recommendation_eval_mode_dirs(path):
+        return path
+    raise FileNotFoundError(
+        f"No window_level_windows.csv found under {path}. "
+        "Expected either <dir>/window_level_windows.csv or <dir>/<mode>/window_level_windows.csv."
+    )
 
 
 def _default_output_dir_from_recommendation_root(recommendation_root: Path) -> Path:
@@ -226,45 +265,77 @@ def _ground_truth_action_text(item: Mapping[str, Any]) -> str:
     return event_to_action_text(item)
 
 
-def _resolve_oracle_window_index(row: Mapping[str, Any], oracle_prediction_path: Path) -> int:
+def _extract_icu_stay_id(payload: Mapping[str, Any], source_path: Path) -> int:
+    icu_stay_id_raw = payload.get("icu_stay_id")
+    if icu_stay_id_raw is None:
+        raise ValueError(f"Missing icu_stay_id in {source_path}")
+    icu_stay_id = int(icu_stay_id_raw)
+    if icu_stay_id <= 0:
+        raise ValueError(f"Invalid icu_stay_id={icu_stay_id} in {source_path}")
+    return icu_stay_id
+
+
+def _interval_key(start_hour: float, end_hour: float) -> Tuple[float, float]:
+    return (round(float(start_hour), ORACLE_INTERVAL_DECIMALS), round(float(end_hour), ORACLE_INTERVAL_DECIMALS))
+
+
+def _interval_marker_id(interval_key: Tuple[float, float]) -> str:
+    return f"{interval_key[0]:.{ORACLE_INTERVAL_DECIMALS}f}|{interval_key[1]:.{ORACLE_INTERVAL_DECIMALS}f}"
+
+
+def _parse_window_interval(
+    *,
+    hours_since_admission: Any,
+    current_window_hours: Any,
+    source_path: Path,
+    context_label: str,
+) -> Tuple[float, float]:
+    try:
+        start_hour = float(hours_since_admission)
+        duration_hours = float(current_window_hours)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid hour fields in {source_path} ({context_label}): "
+            f"hours_since_admission={hours_since_admission!r}, current_window_hours={current_window_hours!r}"
+        ) from exc
+    if duration_hours <= 0:
+        raise ValueError(
+            f"current_window_hours must be > 0 in {source_path} ({context_label}), got {duration_hours!r}"
+        )
+    return start_hour, start_hour + duration_hours
+
+
+def _resolve_gt_window_interval(
+    row: Mapping[str, Any],
+    gt_prediction_path: Path,
+) -> Tuple[float, float]:
     metadata = row.get("window_metadata")
-    metadata_source_window_index = metadata.get("source_window_index") if isinstance(metadata, Mapping) else None
-    metadata_stride_source_window_index = (
-        metadata.get("stride_source_window_index") if isinstance(metadata, Mapping) else None
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"Missing window_metadata in row in {gt_prediction_path}")
+    start_hour, end_hour = _parse_window_interval(
+        hours_since_admission=metadata.get("hours_since_admission"),
+        current_window_hours=metadata.get("current_window_hours"),
+        source_path=gt_prediction_path,
+        context_label="gt_window",
     )
-    candidates = (
-        ("source_window_index", row.get("source_window_index")),
-        ("stride_source_window_index", row.get("stride_source_window_index")),
-        ("window_metadata.source_window_index", metadata_source_window_index),
-        ("window_metadata.stride_source_window_index", metadata_stride_source_window_index),
-        ("window_index", row.get("window_index")),
-    )
-    for field_name, value in candidates:
-        if value is None:
-            continue
-        try:
-            return int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Invalid {field_name}={value!r} in window_outputs row in {oracle_prediction_path}"
-            ) from exc
-    raise ValueError(f"Missing window index fields in window_outputs row in {oracle_prediction_path}")
+    return _interval_key(start_hour, end_hour)
 
 
-def _load_oracle_targets_by_window(
-    oracle_prediction_path: Path,
-) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[int, List[Dict[str, Any]]]]:
-    payload = _load_json(oracle_prediction_path)
+def _load_gt_targets_by_interval(
+    gt_prediction_path: Path,
+) -> Tuple[Dict[Tuple[float, float], List[Dict[str, Any]]], Dict[Tuple[float, float], List[Dict[str, Any]]]]:
+    payload = _load_json(gt_prediction_path)
     window_outputs = payload.get("window_outputs")
     if not isinstance(window_outputs, list):
-        raise ValueError(f"Invalid window_outputs list in {oracle_prediction_path}")
+        raise ValueError(f"Invalid window_outputs list in {gt_prediction_path}")
 
-    actions_by_window: Dict[int, List[Dict[str, Any]]] = {}
-    red_flags_by_window: Dict[int, List[Dict[str, Any]]] = {}
+    actions_by_interval: Dict[Tuple[float, float], List[Dict[str, Any]]] = {}
+    red_flags_by_interval: Dict[Tuple[float, float], List[Dict[str, Any]]] = {}
     for row in window_outputs:
         if not isinstance(row, Mapping):
-            raise ValueError(f"Invalid row in window_outputs in {oracle_prediction_path}")
-        window_index = _resolve_oracle_window_index(row=row, oracle_prediction_path=oracle_prediction_path)
+            raise ValueError(f"Invalid row in window_outputs in {gt_prediction_path}")
+        interval_key = _resolve_gt_window_interval(row=row, gt_prediction_path=gt_prediction_path)
+        marker_id = _interval_marker_id(interval_key)
 
         oracle_output = row.get("oracle_output")
         if not isinstance(oracle_output, Mapping):
@@ -274,15 +345,13 @@ def _load_oracle_targets_by_window(
             continue
         evaluations = action_review.get("evaluations")
         if evaluations is not None and not isinstance(evaluations, list):
-            raise ValueError(
-                f"Invalid action_review.evaluations for window={window_index} in {oracle_prediction_path}"
-            )
+            raise ValueError(f"Invalid action_review.evaluations for interval={marker_id} in {gt_prediction_path}")
         selected_actions: List[Dict[str, Any]] = []
         if evaluations is not None:
             for evaluation in evaluations:
                 if not isinstance(evaluation, Mapping):
                     raise ValueError(
-                        f"Invalid evaluation row for window={window_index} in {oracle_prediction_path}: {evaluation}"
+                        f"Invalid evaluation row for interval={marker_id} in {gt_prediction_path}: {evaluation}"
                     )
                 label = normalize_action_label(evaluation.get("label"))
                 if label not in ORACLE_POSITIVE_LABELS:
@@ -290,7 +359,7 @@ def _load_oracle_targets_by_window(
                 action_name = str(evaluation.get("action_name") or "").strip()
                 if not action_name:
                     raise ValueError(
-                        f"Missing action_name for window={window_index} with label={label} in {oracle_prediction_path}"
+                        f"Missing action_name for interval={marker_id} with label={label} in {gt_prediction_path}"
                     )
                 rationale = str(evaluation.get("rationale") or evaluation.get("reason") or "").strip()
                 gt_text = f"{action_name}. {rationale}".strip() if rationale else action_name
@@ -301,30 +370,33 @@ def _load_oracle_targets_by_window(
                         "gt_action_text": gt_text,
                         "oracle_label": label,
                         "oracle_action_id": str(evaluation.get("action_id") or "").strip(),
+                        "oracle_interval_marker_id": marker_id,
+                        "oracle_interval_start_hour": float(interval_key[0]),
+                        "oracle_interval_end_hour": float(interval_key[1]),
                     }
                 )
 
         if selected_actions:
-            if window_index in actions_by_window:
+            if interval_key in actions_by_interval:
                 raise ValueError(
-                    f"Duplicate oracle action reviews for source window={window_index} in {oracle_prediction_path}"
+                    f"Duplicate oracle action reviews for interval={marker_id} in {gt_prediction_path}"
                 )
-            actions_by_window[window_index] = selected_actions
+            actions_by_interval[interval_key] = selected_actions
 
         red_flags = action_review.get("red_flags")
         if red_flags is not None and not isinstance(red_flags, list):
-            raise ValueError(f"Invalid action_review.red_flags for window={window_index} in {oracle_prediction_path}")
+            raise ValueError(f"Invalid action_review.red_flags for interval={marker_id} in {gt_prediction_path}")
         selected_red_flags: List[Dict[str, Any]] = []
         if red_flags is not None:
             for red_flag in red_flags:
                 if not isinstance(red_flag, Mapping):
                     raise ValueError(
-                        f"Invalid red_flag row for window={window_index} in {oracle_prediction_path}: {red_flag}"
+                        f"Invalid red_flag row for interval={marker_id} in {gt_prediction_path}: {red_flag}"
                     )
                 contraindicated_action = str(red_flag.get("contraindicated_action") or "").strip()
                 if not contraindicated_action:
                     raise ValueError(
-                        f"Missing contraindicated_action for window={window_index} in {oracle_prediction_path}"
+                        f"Missing contraindicated_action for interval={marker_id} in {gt_prediction_path}"
                     )
                 reason = str(red_flag.get("reason") or "").strip()
                 gt_text = f"{contraindicated_action}. {reason}".strip() if reason else contraindicated_action
@@ -333,17 +405,69 @@ def _load_oracle_targets_by_window(
                         "contraindicated_action": contraindicated_action,
                         "reason": reason,
                         "gt_action_text": gt_text,
+                        "oracle_interval_marker_id": marker_id,
+                        "oracle_interval_start_hour": float(interval_key[0]),
+                        "oracle_interval_end_hour": float(interval_key[1]),
                     }
                 )
 
         if selected_red_flags:
-            if window_index in red_flags_by_window:
+            if interval_key in red_flags_by_interval:
                 raise ValueError(
-                    f"Duplicate oracle red_flags for source window={window_index} in {oracle_prediction_path}"
+                    f"Duplicate oracle red_flags for interval={marker_id} in {gt_prediction_path}"
                 )
-            red_flags_by_window[window_index] = selected_red_flags
+            red_flags_by_interval[interval_key] = selected_red_flags
 
-    return actions_by_window, red_flags_by_window
+    return actions_by_interval, red_flags_by_interval
+
+
+def _load_gt_window_intervals(gt_prediction_path: Path) -> Set[Tuple[float, float]]:
+    payload = _load_json(gt_prediction_path)
+    window_outputs = payload.get("window_outputs")
+    if not isinstance(window_outputs, list):
+        raise ValueError(f"Invalid window_outputs list in {gt_prediction_path}")
+    intervals: Set[Tuple[float, float]] = set()
+    for row in window_outputs:
+        if not isinstance(row, Mapping):
+            raise ValueError(f"Invalid row in window_outputs in {gt_prediction_path}")
+        intervals.add(_resolve_gt_window_interval(row=row, gt_prediction_path=gt_prediction_path))
+    return intervals
+
+
+def _resolve_prediction_interval(item: Mapping[str, Any], source_path: Path) -> Tuple[float, float]:
+    marker = item.get("oracle_window_marker")
+    if isinstance(marker, Mapping):
+        start_raw = marker.get("interval_start_hour")
+        end_raw = marker.get("interval_end_hour")
+        if start_raw is not None and end_raw is not None:
+            try:
+                return _interval_key(float(start_raw), float(end_raw))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid oracle_window_marker in {source_path}: {marker}") from exc
+    start_raw = item.get("window_start_hour")
+    end_raw = item.get("window_end_hour")
+    if start_raw is not None and end_raw is not None:
+        try:
+            return _interval_key(float(start_raw), float(end_raw))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid window_start_hour/window_end_hour in prediction row in {source_path}: "
+                f"{start_raw!r}, {end_raw!r}"
+            ) from exc
+    hours_raw = item.get("hours_since_admission")
+    duration_raw = item.get("window_duration_hours")
+    if hours_raw is not None and duration_raw is not None:
+        start_hour, end_hour = _parse_window_interval(
+            hours_since_admission=hours_raw,
+            current_window_hours=duration_raw,
+            source_path=source_path,
+            context_label="prediction_window",
+        )
+        return _interval_key(start_hour, end_hour)
+    raise ValueError(
+        f"Missing oracle_window_marker/window_start_hour/window_end_hour/window_duration_hours in prediction row in "
+        f"{source_path}"
+    )
 
 
 def _build_window_matching_prompt(
@@ -638,6 +762,9 @@ def _build_rows_from_match(
         "subject_id": int(task["subject_id"]),
         "icu_stay_id": int(task["icu_stay_id"]),
         "window_index": int(task["window_index"]),
+        "oracle_window_marker_id": str(task["oracle_window_marker_id"]),
+        "oracle_interval_start_hour": float(task["oracle_interval_start_hour"]),
+        "oracle_interval_end_hour": float(task["oracle_interval_end_hour"]),
         "num_windows": int(task["num_windows"]),
         "relative_time": float(task["relative_time"]),
         "time_bin": int(task["time_bin"]),
@@ -674,6 +801,9 @@ def _build_rows_from_match(
                 "subject_id": int(task["subject_id"]),
                 "icu_stay_id": int(task["icu_stay_id"]),
                 "window_index": int(task["window_index"]),
+                "oracle_window_marker_id": str(task["oracle_window_marker_id"]),
+                "oracle_interval_start_hour": float(task["oracle_interval_start_hour"]),
+                "oracle_interval_end_hour": float(task["oracle_interval_end_hour"]),
                 "prediction_index": int(prediction_index),
                 "is_matched": int(prediction_index in recommended_match_set),
                 "is_matched_recommended": int(prediction_index in recommended_match_set),
@@ -716,44 +846,108 @@ def _build_rows_from_match(
 def _load_window_and_prediction_rows(
     prediction_dir: Path,
     *,
-    oracle_results_dir: Path,
-    window_stride: Optional[int],
+    gt_dir: Path,
     num_workers: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     if int(num_workers) < 1:
         raise ValueError(f"num_workers must be >= 1, got {num_workers}")
-    normalized_window_stride: Optional[int]
-    if window_stride is None:
-        normalized_window_stride = None
-    else:
-        normalized_window_stride = int(window_stride)
-        if normalized_window_stride < 1:
-            raise ValueError(f"window_stride must be >= 1 when provided, got {window_stride}")
     backend = MATCHER_BACKEND_LLM
 
     prediction_files = sorted((prediction_dir / "patients").glob("*/recommendation_predictions.json"))
     if not prediction_files:
         raise FileNotFoundError(f"No recommendation_predictions.json files found under {prediction_dir / 'patients'}")
 
-    tasks: List[Dict[str, Any]] = []
-    skipped_no_oracle_gt_windows = 0
-    windows_without_oracle_red_flags = 0
-    skipped_missing_oracle_patients = 0
+    prediction_records: List[Dict[str, Any]] = []
+    prediction_intervals_by_stay: Dict[int, Set[Tuple[float, float]]] = {}
     for pred_path in prediction_files:
         payload = _load_json(pred_path)
-        patient_id = pred_path.parent.name
-        oracle_prediction_path = oracle_results_dir / "patients" / patient_id / "oracle_predictions.json"
-        if not oracle_prediction_path.exists():
-            skipped_missing_oracle_patients += 1
+        predictions = payload.get("recommendation_predictions")
+        if not isinstance(predictions, list):
+            raise ValueError(f"Missing recommendation_predictions list in {pred_path}")
+        icu_stay_id = _extract_icu_stay_id(payload, pred_path)
+        prediction_intervals: Set[Tuple[float, float]] = set()
+        for item in predictions:
+            if not isinstance(item, Mapping):
+                raise ValueError(f"Invalid prediction row in {pred_path}")
+            prediction_intervals.add(_resolve_prediction_interval(item=item, source_path=pred_path))
+        if int(icu_stay_id) in prediction_intervals_by_stay:
+            raise ValueError(f"Duplicate prediction entries for icu_stay_id={icu_stay_id} in {prediction_dir}")
+        prediction_intervals_by_stay[int(icu_stay_id)] = set(prediction_intervals)
+        prediction_records.append(
+            {
+                "pred_path": pred_path,
+                "payload": payload,
+                "predictions": predictions,
+                "icu_stay_id": int(icu_stay_id),
+            }
+        )
+
+    gt_actions_by_stay: Dict[int, Dict[Tuple[float, float], List[Dict[str, Any]]]] = {}
+    gt_red_flags_by_stay: Dict[int, Dict[Tuple[float, float], List[Dict[str, Any]]]] = {}
+    gt_intervals_by_stay: Dict[int, Set[Tuple[float, float]]] = {}
+    for gt_prediction_path in sorted((gt_dir / "patients").glob("*/oracle_predictions.json")):
+        gt_payload = _load_json(gt_prediction_path)
+        icu_stay_id = _extract_icu_stay_id(gt_payload, gt_prediction_path)
+        if int(icu_stay_id) in gt_actions_by_stay:
+            raise ValueError(f"Duplicate GT entries for icu_stay_id={icu_stay_id} in {gt_dir}")
+        gt_actions, gt_red_flags = _load_gt_targets_by_interval(gt_prediction_path)
+        gt_actions_by_stay[int(icu_stay_id)] = gt_actions
+        gt_red_flags_by_stay[int(icu_stay_id)] = gt_red_flags
+        gt_intervals_by_stay[int(icu_stay_id)] = _load_gt_window_intervals(gt_prediction_path)
+
+    prediction_stays = int(len(prediction_intervals_by_stay))
+    gt_stays = int(len(gt_intervals_by_stay))
+    prediction_windows_total = int(sum(len(v) for v in prediction_intervals_by_stay.values()))
+    gt_windows_total = int(sum(len(v) for v in gt_intervals_by_stay.values()))
+
+    matched_intervals_by_stay: Dict[int, Set[Tuple[float, float]]] = {}
+    skipped_missing_gt_stays = 0
+    skipped_unmatched_prediction_windows = 0
+    matched_windows_total = 0
+    for icu_stay_id, pred_intervals in prediction_intervals_by_stay.items():
+        gt_intervals = gt_intervals_by_stay.get(int(icu_stay_id))
+        if gt_intervals is None:
+            skipped_missing_gt_stays += 1
+            skipped_unmatched_prediction_windows += int(len(pred_intervals))
             continue
-        oracle_actions_by_window, oracle_red_flags_by_window = _load_oracle_targets_by_window(oracle_prediction_path)
+        shared_intervals = pred_intervals.intersection(gt_intervals)
+        skipped_unmatched_prediction_windows += int(len(pred_intervals) - len(shared_intervals))
+        if shared_intervals:
+            matched_intervals_by_stay[int(icu_stay_id)] = set(shared_intervals)
+            matched_windows_total += int(len(shared_intervals))
+    matched_stays = int(len(matched_intervals_by_stay))
+    window_match_stats = {
+        "prediction_stays": prediction_stays,
+        "gt_stays": gt_stays,
+        "matched_stays": matched_stays,
+        "prediction_windows": prediction_windows_total,
+        "gt_windows": gt_windows_total,
+        "matched_windows": int(matched_windows_total),
+        "skipped_prediction_stays_missing_gt": int(skipped_missing_gt_stays),
+        "skipped_prediction_windows_missing_gt": int(skipped_unmatched_prediction_windows),
+    }
+
+    tasks: List[Dict[str, Any]] = []
+    skipped_no_gt_action_windows = 0
+    windows_without_gt_red_flags = 0
+    for record in prediction_records:
+        pred_path = record["pred_path"]
+        payload = record["payload"]
+        predictions = record["predictions"]
+        patient_id = pred_path.parent.name
+        icu_stay_id = int(record["icu_stay_id"])
+        matched_intervals = matched_intervals_by_stay.get(int(icu_stay_id))
+        if matched_intervals is None:
+            continue
+        gt_actions_by_interval = gt_actions_by_stay.get(int(icu_stay_id))
+        gt_red_flags_by_interval = gt_red_flags_by_stay.get(int(icu_stay_id))
+        if gt_actions_by_interval is None or gt_red_flags_by_interval is None:
+            continue
 
         subject_id_raw = payload.get("subject_id")
-        icu_stay_id_raw = payload.get("icu_stay_id")
-        if subject_id_raw is None or icu_stay_id_raw is None:
-            raise ValueError(f"Missing subject_id/icu_stay_id in {pred_path}")
+        if subject_id_raw is None:
+            raise ValueError(f"Missing subject_id in {pred_path}")
         subject_id = int(subject_id_raw)
-        icu_stay_id = int(icu_stay_id_raw)
 
         num_memory_snapshots_raw = payload.get("num_memory_snapshots")
         if num_memory_snapshots_raw is None:
@@ -775,13 +969,12 @@ def _load_window_and_prediction_rows(
         source_patient_dir = Path(str(source_patient_dir_raw))
         memory_depth_map = _memory_depth_by_window(source_patient_dir)
 
-        predictions = payload.get("recommendation_predictions")
-        if not isinstance(predictions, list):
-            raise ValueError(f"Missing recommendation_predictions list in {pred_path}")
-
         for item in predictions:
             if not isinstance(item, Mapping):
                 raise ValueError(f"Invalid prediction row in {pred_path}")
+            interval_key = _resolve_prediction_interval(item=item, source_path=pred_path)
+            if interval_key not in matched_intervals:
+                continue
 
             window_raw = item.get("window_index")
             if window_raw is None:
@@ -789,22 +982,19 @@ def _load_window_and_prediction_rows(
             window_index = int(window_raw)
             if window_index < 0:
                 raise ValueError(f"Negative window_index={window_index} in {pred_path}")
-            if normalized_window_stride is not None and normalized_window_stride > 1:
-                if int(window_index) % int(normalized_window_stride) != 0:
-                    continue
 
             recommended_actions = item.get("recommended_actions")
             if not isinstance(recommended_actions, list):
                 raise ValueError(f"Missing recommended_actions list in {pred_path} window={window_index}")
             prediction_items = [dict(action) for action in recommended_actions if isinstance(action, Mapping)]
             red_flag_gt_items: List[Dict[str, Any]] = []
-            if window_index not in oracle_actions_by_window:
-                skipped_no_oracle_gt_windows += 1
+            if interval_key not in gt_actions_by_interval:
+                skipped_no_gt_action_windows += 1
                 continue
-            gt_items = [dict(action) for action in oracle_actions_by_window[window_index]]
-            red_flag_gt_items = [dict(action) for action in oracle_red_flags_by_window.get(window_index, [])]
+            gt_items = [dict(action) for action in gt_actions_by_interval[interval_key]]
+            red_flag_gt_items = [dict(action) for action in gt_red_flags_by_interval.get(interval_key, [])]
             if not red_flag_gt_items:
-                windows_without_oracle_red_flags += 1
+                windows_without_gt_red_flags += 1
 
             num_windows = int(num_memory_snapshots)
             if num_windows > 1:
@@ -814,7 +1004,10 @@ def _load_window_and_prediction_rows(
             relative_time = min(max(relative_time, 0.0), 1.0)
 
             time_bin = assign_normalized_time_bin(relative_time, num_bins=NUM_TIME_BINS)
-            hours_since_admission = float(item.get("hours_since_admission") or 0.0)
+            hours_since_admission_raw = item.get("hours_since_admission")
+            if hours_since_admission_raw is None:
+                raise ValueError(f"Missing hours_since_admission in {pred_path} window={window_index}")
+            hours_since_admission = float(hours_since_admission_raw)
             memory_depth = memory_depth_map.get(window_index)
 
             tasks.append(
@@ -833,6 +1026,9 @@ def _load_window_and_prediction_rows(
                     "num_ground_truth_red_flags": int(len(red_flag_gt_items)),
                     "memory_depth": memory_depth,
                     "matcher_backend": str(backend),
+                    "oracle_window_marker_id": _interval_marker_id(interval_key),
+                    "oracle_interval_start_hour": float(interval_key[0]),
+                    "oracle_interval_end_hour": float(interval_key[1]),
                     "prediction_items": prediction_items,
                     "oracle_recommended_gt_items": gt_items,
                     "oracle_red_flag_gt_items": red_flag_gt_items,
@@ -841,19 +1037,27 @@ def _load_window_and_prediction_rows(
 
     total_tasks = int(len(tasks))
     if total_tasks == 0:
-        if skipped_missing_oracle_patients > 0:
+        if skipped_missing_gt_stays > 0:
             raise ValueError(
                 "No recommendation prediction windows found for evaluation after skipping "
-                f"{skipped_missing_oracle_patients} patients without oracle_predictions.json."
+                f"{skipped_missing_gt_stays} ICU stays without matching GT."
             )
         raise ValueError("No recommendation prediction windows found for evaluation.")
     print(
         f"Loaded recommendation predictions: patients={len(prediction_files)}, "
         f"windows={total_tasks}, workers={int(num_workers)}"
     )
-    print(f"Skipped patients with missing oracle_predictions.json: {skipped_missing_oracle_patients}")
-    print(f"Skipped windows with no Oracle best_practice/acceptable actions: {skipped_no_oracle_gt_windows}")
-    print(f"Windows with no Oracle red_flags: {windows_without_oracle_red_flags}")
+    print(
+        "Window matching summary: "
+        f"prediction_stays={window_match_stats['prediction_stays']}, "
+        f"gt_stays={window_match_stats['gt_stays']}, "
+        f"matched_stays={window_match_stats['matched_stays']}, "
+        f"matched_windows={window_match_stats['matched_windows']}"
+    )
+    print(f"Skipped prediction stays with missing GT: {skipped_missing_gt_stays}")
+    print(f"Skipped prediction windows not matched in GT: {skipped_unmatched_prediction_windows}")
+    print(f"Skipped windows with no GT best_practice/acceptable actions: {skipped_no_gt_action_windows}")
+    print(f"Windows with no GT red_flags: {windows_without_gt_red_flags}")
 
     window_rows: List[Dict[str, Any]] = []
     prediction_rows: List[Dict[str, Any]] = []
@@ -920,11 +1124,201 @@ def _load_window_and_prediction_rows(
         "input_tokens": int(total_input_tokens),
         "output_tokens": int(total_output_tokens),
         "total_tokens": int(total_input_tokens + total_output_tokens),
-        "skipped_missing_oracle_patients": int(skipped_missing_oracle_patients),
-        "skipped_no_oracle_gt_windows": int(skipped_no_oracle_gt_windows),
-        "windows_without_oracle_red_flags": int(windows_without_oracle_red_flags),
+        "window_match_stats": {
+            "prediction_stays": int(window_match_stats["prediction_stays"]),
+            "gt_stays": int(window_match_stats["gt_stays"]),
+            "matched_stays": int(window_match_stats["matched_stays"]),
+            "prediction_windows": int(window_match_stats["prediction_windows"]),
+            "gt_windows": int(window_match_stats["gt_windows"]),
+            "matched_windows": int(window_match_stats["matched_windows"]),
+            "skipped_prediction_stays_missing_gt": int(window_match_stats["skipped_prediction_stays_missing_gt"]),
+            "skipped_prediction_windows_missing_gt": int(window_match_stats["skipped_prediction_windows_missing_gt"]),
+        },
+        "skipped_missing_gt_stays": int(skipped_missing_gt_stays),
+        "skipped_unmatched_prediction_windows": int(skipped_unmatched_prediction_windows),
+        "skipped_no_gt_action_windows": int(skipped_no_gt_action_windows),
+        "windows_without_gt_red_flags": int(windows_without_gt_red_flags),
     }
     return window_frame, prediction_frame, matcher_usage
+
+
+def _load_reused_recommendation_frames(reuse_eval_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    window_path = reuse_eval_dir / "window_level_windows.csv"
+    if not window_path.exists():
+        raise FileNotFoundError(f"Missing reused matcher window file: {window_path}")
+    window_frame = pd.read_csv(window_path)
+    if window_frame.empty:
+        raise ValueError(f"Reused matcher window file is empty: {window_path}")
+
+    list_columns = (
+        "matched_prediction_indices",
+        "matched_pairs",
+        "matched_red_flag_prediction_indices",
+        "matched_red_flag_pairs",
+    )
+    for column in list_columns:
+        if column not in window_frame.columns:
+            window_frame[column] = [[] for _ in range(len(window_frame))]
+        else:
+            window_frame[column] = window_frame[column].map(_parse_json_list_cell)
+
+    prediction_path = reuse_eval_dir / "window_level_predictions.csv"
+    prediction_frame = pd.read_csv(prediction_path) if prediction_path.exists() else pd.DataFrame()
+
+    metrics_path = reuse_eval_dir / "metrics.json"
+    metrics_payload = _load_json(metrics_path) if metrics_path.exists() else {}
+    matcher_usage = metrics_payload.get("matcher_usage")
+    if not isinstance(matcher_usage, dict):
+        matcher_usage = {
+            "matcher_backend": MATCHER_BACKEND_LLM,
+            "matcher_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "window_match_stats": {},
+        }
+    matcher_usage = dict(matcher_usage)
+    matcher_usage["reused_from"] = str(reuse_eval_dir)
+    return window_frame, prediction_frame, matcher_usage
+
+
+def _write_recommendation_analysis_outputs(
+    *,
+    window_frame: pd.DataFrame,
+    prediction_frame: pd.DataFrame,
+    matcher_usage: Dict[str, Any],
+    prediction_root: Optional[Path],
+    gt_root: Optional[Path],
+    output_dir: Path,
+    reuse_eval_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    llm_usage = {
+        "llm_calls": int(matcher_usage.get("matcher_calls", 0)),
+        "input_tokens": int(matcher_usage.get("input_tokens", 0)),
+        "output_tokens": int(matcher_usage.get("output_tokens", 0)),
+        "total_tokens": int(matcher_usage.get("total_tokens", 0)),
+    }
+
+    k_values = [int(FIXED_EVAL_K)]
+    selected_k = int(FIXED_EVAL_K)
+
+    window_k_frame = _expand_window_rows_by_k(window_frame, k_values=k_values)
+    metrics_by_k_df = _compute_metrics_by_k(window_k_frame)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics_payload = {
+        "generated_at": datetime.now().isoformat(),
+        "prediction_dir": str(prediction_root) if prediction_root is not None else None,
+        "gt_dir": str(gt_root) if gt_root is not None else None,
+        "reuse_eval_dir": str(reuse_eval_dir) if reuse_eval_dir is not None else None,
+        "matcher_backend": str(matcher_usage.get("matcher_backend", MATCHER_BACKEND_LLM)),
+        "llm_provider": LLM_MATCHER_PROVIDER,
+        "llm_model": LLM_MATCHER_MODEL,
+        "llm_max_tokens": int(LLM_MATCHER_MAX_TOKENS),
+        "matcher_usage": matcher_usage,
+        "llm_usage": llm_usage,
+        "fixed_k": int(FIXED_EVAL_K),
+        "hit_match_count_threshold_exclusive": int(HIT_MATCH_COUNT_THRESHOLD),
+        "num_patients": int(window_k_frame["patient_id"].nunique()),
+        "num_windows": int(window_frame.shape[0]),
+        "k_values": [int(k) for k in k_values],
+        "selected_k_for_plots": int(selected_k),
+        "metrics_by_k": metrics_by_k_df.to_dict(orient="records"),
+    }
+    _json_dump(output_dir / "metrics.json", metrics_payload)
+
+    metrics_by_k_df.to_csv(output_dir / "metrics_by_k.csv", index=False)
+
+    window_export_df = window_frame.copy()
+    window_export_df["matched_prediction_indices"] = window_export_df["matched_prediction_indices"].map(
+        lambda value: json.dumps(value, ensure_ascii=False)
+    )
+    window_export_df["matched_pairs"] = window_export_df["matched_pairs"].map(
+        lambda value: json.dumps(value, ensure_ascii=False)
+    )
+    window_export_df["matched_red_flag_prediction_indices"] = window_export_df[
+        "matched_red_flag_prediction_indices"
+    ].map(lambda value: json.dumps(value, ensure_ascii=False))
+    window_export_df["matched_red_flag_pairs"] = window_export_df["matched_red_flag_pairs"].map(
+        lambda value: json.dumps(value, ensure_ascii=False)
+    )
+    window_export_df.to_csv(output_dir / "window_level_windows.csv", index=False)
+
+    prediction_frame.to_csv(output_dir / "window_level_predictions.csv", index=False)
+    window_k_frame.to_csv(output_dir / "window_level_metrics.csv", index=False)
+
+    relative_curve_df = _plot_relative_time_curve(
+        window_k_frame,
+        selected_k=selected_k,
+        output_path=output_dir / "plot1_relative_time_hit_precision_curve.png",
+    )
+    relative_curve_df.to_csv(output_dir / "plot1_relative_time_hit_precision_curve.csv", index=False)
+
+    prefix_curve_df = _plot_prefix_curve(
+        window_k_frame,
+        selected_k=selected_k,
+        output_path=output_dir / "plot2_prefix_cumulative_hit_precision_curve.png",
+    )
+    prefix_curve_df.to_csv(output_dir / "plot2_prefix_cumulative_hit_precision_curve.csv", index=False)
+
+    heatmap_long_df, heatmap_source_df = _plot_time_memory_heatmap(
+        window_k_frame,
+        selected_k=selected_k,
+        output_path=output_dir / "plot3_time_memory_hit_precision_heatmap.png",
+    )
+    heatmap_long_df.to_csv(output_dir / "plot3_time_memory_hit_precision_heatmap.csv", index=False)
+    heatmap_source_df.to_csv(output_dir / "plot3_time_memory_source_rows.csv", index=False)
+
+    num_patient_plots, num_patient_heatmaps = _plot_patient_level_figures(
+        window_k_frame,
+        selected_k=selected_k,
+        output_dir=output_dir,
+    )
+
+    selected_metrics = metrics_by_k_df[metrics_by_k_df["k"] == int(selected_k)]
+    if selected_metrics.empty:
+        raise ValueError(f"Missing selected K metrics for k={selected_k}")
+    summary_row = selected_metrics.iloc[0]
+
+    print(f"Saved evaluation outputs to: {output_dir}")
+    print("Recommendation Evaluation:")
+    print(
+        f"  K={selected_k} (fixed), hit rule: matches > {int(HIT_MATCH_COUNT_THRESHOLD)} "
+        f"micro_hit={float(summary_row['micro_hit_at_k']):.4f} "
+        f"micro_precision={float(summary_row['micro_precision_at_k']):.4f} "
+        f"macro_hit={float(summary_row['macro_hit_at_k']):.4f} "
+        f"macro_precision={float(summary_row['macro_precision_at_k']):.4f} "
+        f"(patients={int(summary_row['num_patients'])}, windows={int(summary_row['num_windows'])})"
+    )
+    if not pd.isna(summary_row["red_flag_micro_hit_at_k"]):
+        print(
+            f"  Red-Flag@K={selected_k} "
+            f"micro_hit={float(summary_row['red_flag_micro_hit_at_k']):.4f} "
+            f"micro_precision={float(summary_row['red_flag_micro_precision_at_k']):.4f} "
+            f"macro_hit={float(summary_row['red_flag_macro_hit_at_k']):.4f} "
+            f"macro_precision={float(summary_row['red_flag_macro_precision_at_k']):.4f} "
+            f"(patients={int(summary_row['num_patients_with_red_flags'])}, "
+            f"windows={int(summary_row['num_windows_with_red_flags'])})"
+        )
+    print(
+        f"  LLM matcher: provider={LLM_MATCHER_PROVIDER}, model={LLM_MATCHER_MODEL}, "
+        f"calls={llm_usage['llm_calls']}, tokens={llm_usage['total_tokens']}"
+    )
+    print(
+        f"  Patient plots: patients={int(num_patient_plots)}, "
+        f"heatmaps_generated={int(num_patient_heatmaps)} "
+        f"(saved under {output_dir / 'patient_plots'})"
+    )
+
+    return {
+        "selected_k": int(selected_k),
+        "relative_curve_df": relative_curve_df,
+        "prefix_curve_df": prefix_curve_df,
+        "window_k_frame": window_k_frame,
+        "output_dir": output_dir,
+        "prediction_root": prediction_root,
+    }
 
 
 def _expand_window_rows_by_k(window_frame: pd.DataFrame, *, k_values: Sequence[int]) -> pd.DataFrame:
@@ -1806,170 +2200,127 @@ def _evaluate_single_prediction_dir(
     *,
     prediction_root: Path,
     output_dir: Path,
-    oracle_results_dir: Path,
-    window_stride: Optional[int],
+    gt_dir: Path,
     num_workers: int,
 ) -> Dict[str, Any]:
-    oracle_results_root = _ensure_oracle_results_dir(oracle_results_dir)
+    gt_root = _ensure_gt_dir(gt_dir)
 
     backend = MATCHER_BACKEND_LLM
 
     if int(num_workers) < 1:
         raise ValueError(f"num_workers must be >= 1, got {num_workers}")
-    if window_stride is not None and int(window_stride) < 1:
-        raise ValueError(f"window_stride must be >= 1 when provided, got {window_stride}")
 
     print(f"Prediction directory: {prediction_root}")
-    print(f"Oracle results directory: {oracle_results_root}")
+    print(f"GT directory: {gt_root}")
     print(
         f"Matcher config: backend={backend}, provider={LLM_MATCHER_PROVIDER}, model={LLM_MATCHER_MODEL}, "
-        f"max_tokens={int(LLM_MATCHER_MAX_TOKENS)}, workers={int(num_workers)}, window_stride={window_stride}"
+        f"max_tokens={int(LLM_MATCHER_MAX_TOKENS)}, workers={int(num_workers)}"
     )
 
     window_frame, prediction_frame, matcher_usage = _load_window_and_prediction_rows(
         prediction_dir=prediction_root,
-        oracle_results_dir=oracle_results_root,
-        window_stride=int(window_stride) if window_stride is not None else None,
+        gt_dir=gt_root,
         num_workers=int(num_workers),
     )
-
-    llm_usage = {
-        "llm_calls": int(matcher_usage["matcher_calls"]),
-        "input_tokens": int(matcher_usage["input_tokens"]),
-        "output_tokens": int(matcher_usage["output_tokens"]),
-        "total_tokens": int(matcher_usage["total_tokens"]),
-    }
-
-    k_values = [int(FIXED_EVAL_K)]
-    selected_k = int(FIXED_EVAL_K)
-
-    window_k_frame = _expand_window_rows_by_k(window_frame, k_values=k_values)
-    metrics_by_k_df = _compute_metrics_by_k(window_k_frame)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    metrics_payload = {
-        "generated_at": datetime.now().isoformat(),
-        "prediction_dir": str(prediction_root),
-        "oracle_results_dir": str(oracle_results_root),
-        "matcher_backend": str(backend),
-        "llm_provider": LLM_MATCHER_PROVIDER,
-        "llm_model": LLM_MATCHER_MODEL,
-        "llm_max_tokens": int(LLM_MATCHER_MAX_TOKENS),
-        "matcher_usage": matcher_usage,
-        "llm_usage": llm_usage,
-        "fixed_k": int(FIXED_EVAL_K),
-        "hit_match_count_threshold_exclusive": int(HIT_MATCH_COUNT_THRESHOLD),
-        "window_stride": int(window_stride) if window_stride is not None else None,
-        "num_patients": int(window_k_frame["patient_id"].nunique()),
-        "num_windows": int(window_frame.shape[0]),
-        "k_values": [int(k) for k in k_values],
-        "selected_k_for_plots": int(selected_k),
-        "metrics_by_k": metrics_by_k_df.to_dict(orient="records"),
-    }
-    _json_dump(output_dir / "metrics.json", metrics_payload)
-
-    metrics_by_k_df.to_csv(output_dir / "metrics_by_k.csv", index=False)
-
-    window_export_df = window_frame.copy()
-    window_export_df["matched_prediction_indices"] = window_export_df["matched_prediction_indices"].map(
-        lambda value: json.dumps(value, ensure_ascii=False)
-    )
-    window_export_df["matched_pairs"] = window_export_df["matched_pairs"].map(
-        lambda value: json.dumps(value, ensure_ascii=False)
-    )
-    window_export_df["matched_red_flag_prediction_indices"] = window_export_df[
-        "matched_red_flag_prediction_indices"
-    ].map(lambda value: json.dumps(value, ensure_ascii=False))
-    window_export_df["matched_red_flag_pairs"] = window_export_df["matched_red_flag_pairs"].map(
-        lambda value: json.dumps(value, ensure_ascii=False)
-    )
-    window_export_df.to_csv(output_dir / "window_level_windows.csv", index=False)
-
-    prediction_frame.to_csv(output_dir / "window_level_predictions.csv", index=False)
-    window_k_frame.to_csv(output_dir / "window_level_metrics.csv", index=False)
-
-    relative_curve_df = _plot_relative_time_curve(
-        window_k_frame,
-        selected_k=selected_k,
-        output_path=output_dir / "plot1_relative_time_hit_precision_curve.png",
-    )
-    relative_curve_df.to_csv(output_dir / "plot1_relative_time_hit_precision_curve.csv", index=False)
-
-    prefix_curve_df = _plot_prefix_curve(
-        window_k_frame,
-        selected_k=selected_k,
-        output_path=output_dir / "plot2_prefix_cumulative_hit_precision_curve.png",
-    )
-    prefix_curve_df.to_csv(output_dir / "plot2_prefix_cumulative_hit_precision_curve.csv", index=False)
-
-    heatmap_long_df, heatmap_source_df = _plot_time_memory_heatmap(
-        window_k_frame,
-        selected_k=selected_k,
-        output_path=output_dir / "plot3_time_memory_hit_precision_heatmap.png",
-    )
-    heatmap_long_df.to_csv(output_dir / "plot3_time_memory_hit_precision_heatmap.csv", index=False)
-    heatmap_source_df.to_csv(output_dir / "plot3_time_memory_source_rows.csv", index=False)
-
-    num_patient_plots, num_patient_heatmaps = _plot_patient_level_figures(
-        window_k_frame,
-        selected_k=selected_k,
+    return _write_recommendation_analysis_outputs(
+        window_frame=window_frame,
+        prediction_frame=prediction_frame,
+        matcher_usage=matcher_usage,
+        prediction_root=prediction_root,
+        gt_root=gt_root,
         output_dir=output_dir,
     )
 
-    selected_metrics = metrics_by_k_df[metrics_by_k_df["k"] == int(selected_k)]
-    if selected_metrics.empty:
-        raise ValueError(f"Missing selected K metrics for k={selected_k}")
-    summary_row = selected_metrics.iloc[0]
 
-    print(f"Saved evaluation outputs to: {output_dir}")
-    print("Recommendation Evaluation:")
-    print(
-        f"  K={selected_k} (fixed), hit rule: matches > {int(HIT_MATCH_COUNT_THRESHOLD)} "
-        f"micro_hit={float(summary_row['micro_hit_at_k']):.4f} "
-        f"micro_precision={float(summary_row['micro_precision_at_k']):.4f} "
-        f"macro_hit={float(summary_row['macro_hit_at_k']):.4f} "
-        f"macro_precision={float(summary_row['macro_precision_at_k']):.4f} "
-        f"(patients={int(summary_row['num_patients'])}, windows={int(summary_row['num_windows'])})"
+def _evaluate_reused_eval_dir(
+    *,
+    reuse_eval_dir: Path,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    print(f"Reuse eval directory: {reuse_eval_dir}")
+    window_frame, prediction_frame, matcher_usage = _load_reused_recommendation_frames(reuse_eval_dir)
+    return _write_recommendation_analysis_outputs(
+        window_frame=window_frame,
+        prediction_frame=prediction_frame,
+        matcher_usage=matcher_usage,
+        prediction_root=None,
+        gt_root=None,
+        output_dir=output_dir,
+        reuse_eval_dir=reuse_eval_dir,
     )
-    if not pd.isna(summary_row["red_flag_micro_hit_at_k"]):
-        print(
-            f"  Red-Flag@K={selected_k} "
-            f"micro_hit={float(summary_row['red_flag_micro_hit_at_k']):.4f} "
-            f"micro_precision={float(summary_row['red_flag_micro_precision_at_k']):.4f} "
-            f"macro_hit={float(summary_row['red_flag_macro_hit_at_k']):.4f} "
-            f"macro_precision={float(summary_row['red_flag_macro_precision_at_k']):.4f} "
-            f"(patients={int(summary_row['num_patients_with_red_flags'])}, "
-            f"windows={int(summary_row['num_windows_with_red_flags'])})"
-        )
-    print(
-        f"  LLM matcher: provider={LLM_MATCHER_PROVIDER}, model={LLM_MATCHER_MODEL}, "
-        f"calls={llm_usage['llm_calls']}, tokens={llm_usage['total_tokens']}"
-    )
-    print(
-        f"  Patient plots: patients={int(num_patient_plots)}, "
-        f"heatmaps_generated={int(num_patient_heatmaps)} "
-        f"(saved under {output_dir / 'patient_plots'})"
-    )
-
-    return {
-        "selected_k": int(selected_k),
-        "relative_curve_df": relative_curve_df,
-        "prefix_curve_df": prefix_curve_df,
-        "window_k_frame": window_k_frame,
-        "output_dir": output_dir,
-        "prediction_root": prediction_root,
-    }
 
 
 def run_evaluation(
     *,
-    prediction_dir: Path,
+    prediction_dir: Optional[Path],
     output_dir: Optional[Path],
-    oracle_results_dir: Path,
-    window_stride: Optional[int],
+    gt_dir: Optional[Path],
     num_workers: int,
+    reuse_eval_dir: Optional[Path] = None,
 ) -> None:
+    if reuse_eval_dir is not None:
+        reuse_root = _ensure_recommendation_eval_dir(reuse_eval_dir)
+        mode_dirs = _discover_recommendation_eval_mode_dirs(reuse_root)
+        if mode_dirs:
+            output_root = output_dir if output_dir is not None else reuse_root
+            output_root.mkdir(parents=True, exist_ok=True)
+            print("Detected reused recommendation modes: " + ", ".join(sorted(mode_dirs.keys())) + f" under {reuse_root}")
+
+            relative_curves_by_mode: Dict[str, pd.DataFrame] = {}
+            prefix_curves_by_mode: Dict[str, pd.DataFrame] = {}
+            mode_results: Dict[str, Dict[str, Any]] = {}
+            for mode in sorted(mode_dirs.keys()):
+                mode_output_dir = output_root / mode
+                print("")
+                print(f"=== Reusing matched results for mode: {mode} ===")
+                single_result = _evaluate_reused_eval_dir(
+                    reuse_eval_dir=mode_dirs[mode],
+                    output_dir=mode_output_dir,
+                )
+                mode_label = f"{mode} (K={int(single_result['selected_k'])})"
+                relative_curves_by_mode[mode_label] = single_result["relative_curve_df"]
+                prefix_curves_by_mode[mode_label] = single_result["prefix_curve_df"]
+                mode_results[mode] = single_result
+
+            if len(relative_curves_by_mode) > 1:
+                combined_relative_df = _plot_relative_time_curve_by_mode(
+                    relative_curves_by_mode,
+                    output_path=output_root / "plot1_relative_time_hit_precision_curve_by_mode.png",
+                )
+                combined_relative_df.to_csv(
+                    output_root / "plot1_relative_time_hit_precision_curve_by_mode.csv", index=False
+                )
+
+            if len(prefix_curves_by_mode) > 1:
+                combined_prefix_df = _plot_prefix_curve_by_mode(
+                    prefix_curves_by_mode,
+                    output_path=output_root / "plot2_prefix_cumulative_hit_precision_curve_by_mode.png",
+                )
+                combined_prefix_df.to_csv(
+                    output_root / "plot2_prefix_cumulative_hit_precision_curve_by_mode.csv", index=False
+                )
+
+            patient_relative_count, patient_prefix_count = _plot_patient_mode_comparison_curves(
+                mode_results,
+                output_root=output_root,
+            )
+            print("")
+            print(
+                f"Saved patient mode-comparison plots: relative={patient_relative_count}, "
+                f"prefix={patient_prefix_count} under {output_root / 'patient_mode_plots'}"
+            )
+            print(f"Saved reused multi-mode evaluation outputs to: {output_root}")
+            return
+
+        final_output_dir = output_dir if output_dir is not None else reuse_root
+        _evaluate_reused_eval_dir(reuse_eval_dir=reuse_root, output_dir=final_output_dir)
+        return
+
+    if prediction_dir is None:
+        raise ValueError("--prediction-dir is required unless --reuse-eval-dir is provided.")
+    if gt_dir is None:
+        raise ValueError("--gt-dir is required unless --reuse-eval-dir is provided.")
+
     mode_dirs = _discover_recommendation_mode_dirs(prediction_dir)
     if mode_dirs:
         base_output_root = (
@@ -1990,8 +2341,7 @@ def run_evaluation(
             single_result = _evaluate_single_prediction_dir(
                 prediction_root=prediction_root,
                 output_dir=mode_output_dir,
-                oracle_results_dir=oracle_results_dir,
-                window_stride=int(window_stride) if window_stride is not None else None,
+                gt_dir=gt_dir,
                 num_workers=int(num_workers),
             )
             mode_label = f"{mode} (K={int(single_result['selected_k'])})"
@@ -2042,8 +2392,7 @@ def run_evaluation(
     _evaluate_single_prediction_dir(
         prediction_root=prediction_root,
         output_dir=final_output_dir,
-        oracle_results_dir=oracle_results_dir,
-        window_stride=int(window_stride) if window_stride is not None else None,
+        gt_dir=gt_dir,
         num_workers=int(num_workers),
     )
 
@@ -2053,7 +2402,7 @@ def main() -> None:
     parser.add_argument(
         "--prediction-dir",
         type=str,
-        required=True,
+        default=None,
         help="Recommendation prediction directory.",
     )
     parser.add_argument(
@@ -2069,12 +2418,21 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--oracle-results-dir",
+        "--gt-dir",
         type=str,
-        required=True,
+        default=None,
         help=(
-            "Oracle run directory with patients/*/oracle_predictions.json. "
+            "GT directory with patients/*/oracle_predictions.json. "
             "Only actions labeled acceptable/best_practice are used as GT."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-eval-dir",
+        type=str,
+        default=None,
+        help=(
+            "Existing evaluation output directory containing window_level_windows.csv. "
+            "If provided, skips matcher inference and recomputes metrics/plots from saved matcher results."
         ),
     )
     parser.add_argument(
@@ -2083,20 +2441,14 @@ def main() -> None:
         default=4,
         help="Number of parallel workers for window-level matching.",
     )
-    parser.add_argument(
-        "--window-stride",
-        type=int,
-        default=None,
-        help="Evaluate every n-th window by window_index modulo n. If omitted, evaluate all windows.",
-    )
     args = parser.parse_args()
 
     run_evaluation(
-        prediction_dir=Path(args.prediction_dir),
+        prediction_dir=Path(args.prediction_dir) if args.prediction_dir else None,
         output_dir=Path(args.output_dir) if args.output_dir else None,
-        oracle_results_dir=Path(args.oracle_results_dir),
-        window_stride=int(args.window_stride) if args.window_stride is not None else None,
+        gt_dir=Path(args.gt_dir) if args.gt_dir else None,
         num_workers=int(args.num_workers),
+        reuse_eval_dir=Path(args.reuse_eval_dir) if args.reuse_eval_dir else None,
     )
 
 
