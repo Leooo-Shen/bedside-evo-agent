@@ -382,8 +382,41 @@ def _serialize_event_strings(events: Any) -> List[str]:
 
 
 def _serialize_critical_event_strings(critical_events: Any) -> List[str]:
-    lines = _format_episode_critical_event_lines(critical_events)
-    return [] if lines == ["- None"] else lines
+    if not isinstance(critical_events, list):
+        return []
+
+    lines: List[str] = []
+    seen = set()
+
+    for item in critical_events:
+        if isinstance(item, str):
+            line = _safe_text(item)
+            if line and line not in seen:
+                seen.add(line)
+                lines.append(line)
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        supporting_event_lines = _serialize_event_strings(item.get("supporting_events"))
+        if supporting_event_lines:
+            for line in supporting_event_lines:
+                if line and line not in seen:
+                    seen.add(line)
+                    lines.append(line)
+            continue
+
+        supporting_ids = _normalize_int_list(item.get("supporting_event_ids", []))
+        event_text = _safe_text(item.get("event"))
+        if supporting_ids and event_text:
+            fallback_line = f"[{supporting_ids[0]}] {event_text}"
+        else:
+            fallback_line = event_text
+        if fallback_line and fallback_line not in seen:
+            seen.add(fallback_line)
+            lines.append(fallback_line)
+
+    return lines
 
 
 def _extract_event_reference_id(event: Dict[str, Any]) -> Optional[int]:
@@ -700,65 +733,6 @@ def _format_episode_input_lines(
     return lines
 
 
-def _format_episode_critical_event_lines(critical_events: Any) -> List[str]:
-    if not isinstance(critical_events, list) or not critical_events:
-        return ["- None"]
-
-    lines: List[str] = []
-    for item in critical_events:
-        if isinstance(item, str):
-            line = _safe_text(item)
-            if line:
-                lines.append(line)
-            continue
-        if not isinstance(item, dict):
-            continue
-        event_text = _safe_text(item.get("event")) or "critical event"
-        reason = _safe_text(item.get("reason"))
-        supporting_ids = _normalize_int_list(item.get("supporting_event_ids", []))
-        line = f"- {event_text}"
-        if reason:
-            line = f"{line} | {reason}"
-        if supporting_ids:
-            line = f"{line} | supporting_event_ids={supporting_ids}"
-        lines.append(line)
-    return lines or ["- None"]
-
-
-def _format_insight_critical_event_lines(critical_events: Any) -> List[str]:
-    if not isinstance(critical_events, list) or not critical_events:
-        return ["- None"]
-
-    lines: List[str] = []
-    for item in critical_events:
-        if isinstance(item, str):
-            line = _safe_text(item)
-            if line:
-                lines.append(line)
-            continue
-        if not isinstance(item, dict):
-            continue
-
-        reason = _safe_text(item.get("reason"))
-        supporting_event_lines = _serialize_event_strings(item.get("supporting_events"))
-        if supporting_event_lines:
-            for event_line in supporting_event_lines:
-                if reason:
-                    lines.append(f"{event_line} | critical_reason={reason}")
-                else:
-                    lines.append(event_line)
-            continue
-
-        supporting_ids = _normalize_int_list(item.get("supporting_event_ids", []))
-        event_text = _safe_text(item.get("event")) or "critical event"
-        line = f"[{supporting_ids[0]}] {event_text}" if supporting_ids else f"- {event_text}"
-        if reason:
-            line = f"{line} | critical_reason={reason}"
-        lines.append(line)
-
-    return lines or ["- None"]
-
-
 def _format_prior_episode_summary_text(trajectory_memory: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
     for item in trajectory_memory:
@@ -1001,7 +975,11 @@ class MedEvoMemory:
                     f"Window {entry.start_window}-{entry.end_window} "
                     f"(hour {entry.start_hour:.1f}-{entry.end_hour:.1f})"
                 )
-                parts.extend(_format_episode_critical_event_lines(entry.critical_events))
+                critical_event_lines = _serialize_critical_event_strings(entry.critical_events)
+                if critical_event_lines:
+                    parts.extend(critical_event_lines)
+                else:
+                    parts.append("- None")
         else:
             parts.append("- None")
 
@@ -1374,9 +1352,9 @@ class InsightAgent:
         )
         critical_events_text = "- None"
         if critical_events_entry is not None and critical_events_entry.critical_events:
-            critical_events_text = "\n".join(
-                _format_insight_critical_event_lines(critical_events_entry.critical_events)
-            )
+            critical_events_lines = _serialize_critical_event_strings(critical_events_entry.critical_events)
+            if critical_events_lines:
+                critical_events_text = "\n".join(critical_events_lines)
 
         trend_lines = _format_trend_block_lines(trend_block)
         vital_trends_text = "\n".join(line for line in trend_lines if line is not None).strip() or "- None"

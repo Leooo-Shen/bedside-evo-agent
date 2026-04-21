@@ -28,7 +28,7 @@ from experiments.create_memory import (
 )
 from experiments.oracle.common import extract_overall_label
 from prompts.predictor_prompts import get_patient_status_prediction_prompt
-from utils.event_format import format_event_lines
+from utils.event_format import format_event_line
 from utils.json_parse import parse_json_dict_best_effort
 from utils.llm_errors import is_context_length_exceeded_error
 from utils.llm_log_viewer import save_llm_calls_html
@@ -258,16 +258,27 @@ def _extract_current_window(snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
     return current_window
 
 
-def _window_events(window: Mapping[str, Any]) -> List[Dict[str, Any]]:
+def _window_events(window: Mapping[str, Any]) -> List[Any]:
     events = window.get("events")
     if not isinstance(events, list):
         return []
-    return [dict(event) for event in events if isinstance(event, Mapping)]
+    return list(events)
 
 
-def _render_flat_raw_events(events: Sequence[Mapping[str, Any]]) -> str:
-    event_rows = [dict(event) for event in events if isinstance(event, Mapping)]
-    return "\n".join(format_event_lines(event_rows, empty_text="(No events)"))
+def _render_flat_raw_events(events: Sequence[Any]) -> str:
+    lines: List[str] = []
+    for event in events:
+        if isinstance(event, Mapping):
+            line = format_event_line(dict(event))
+        elif isinstance(event, str):
+            line = event.strip()
+        else:
+            line = ""
+        if line:
+            lines.append(line)
+    if not lines:
+        return "(No events)"
+    return "\n".join(lines)
 
 
 def _build_full_history_event_context(
@@ -278,7 +289,7 @@ def _build_full_history_event_context(
 ) -> str:
     candidate_windows = {int(index) for index in snapshot_by_window.keys() if int(index) <= int(selected_window_index)}
     candidate_windows.add(int(selected_window_index))
-    merged_events: List[Dict[str, Any]] = []
+    merged_events: List[Any] = []
     for window_index in sorted(candidate_windows):
         if int(window_index) == int(selected_window_index):
             snapshot = selected_snapshot

@@ -20,12 +20,24 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiments.oracle.common import assign_normalized_time_bin, extract_overall_label
+from evaluation.plot_style import (
+    METRIC_BAND_ALPHA,
+    MODE_TRACE_ALPHA,
+    PATIENT_TRACE_ALPHA,
+    configure_plot_style,
+    heatmap_cmap,
+    metric_color,
+    metric_mean_color,
+    mode_color_map,
+    system_color,
+)
 from utils.status_scoring import normalize_status_label
 
 NUM_TIME_BINS = 10
 MEMORY_DEPTH_NUM_BINS = 6
 BOOTSTRAP_SAMPLES = 1000
 BOOTSTRAP_SEED = 20260409
+ABSOLUTE_TIME_BIN_HOURS = 24.0
 ORACLE_INTERVAL_DECIMALS = 6
 KNOWN_PATIENT_STATUS_MODES = (
     "memory",
@@ -36,6 +48,8 @@ PATIENT_STATUS_ROOT_NAMES = (
     "patient_status",
     "patient_status_experiment",
 )
+
+configure_plot_style()
 
 
 @dataclass(frozen=True)
@@ -544,16 +558,15 @@ def _plot_relative_time_accuracy(
     plot_df = pd.DataFrame(plot_rows).sort_values(["system", "time_bin"]).reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    colors = {"MedEvo": "#1f77b4", "Baseline": "#ff7f0e"}
     for system_name in plot_df["system"].unique().tolist():
         subset = plot_df[plot_df["system"] == system_name].copy()
         x = subset["time_bin_mid_pct"].to_numpy(dtype=float)
         y = subset["accuracy"].to_numpy(dtype=float)
         low = subset["ci_low"].to_numpy(dtype=float)
         high = subset["ci_high"].to_numpy(dtype=float)
-        color = colors.get(system_name, None)
+        color = system_color(str(system_name))
         ax.plot(x, y, marker="o", linewidth=2.2, label=system_name, color=color)
-        ax.fill_between(x, low, high, alpha=0.18, color=color)
+        ax.fill_between(x, low, high, alpha=METRIC_BAND_ALPHA, color=color)
 
     ax.set_xlabel("Relative Window Position (%)")
     ax.set_ylabel("Window-Level Accuracy")
@@ -600,12 +613,12 @@ def _plot_prefix_accuracy(frame: pd.DataFrame, output_path: Path) -> pd.DataFram
     for _, patient_df in med_evo.groupby("patient_id"):
         x = patient_df["relative_time"].to_numpy(dtype=float) * 100.0
         y = patient_df["prefix_accuracy"].to_numpy(dtype=float)
-        ax.plot(x, y, color="#1f77b4", alpha=0.18, linewidth=1.0)
+        ax.plot(x, y, color=metric_color("accuracy"), alpha=PATIENT_TRACE_ALPHA, linewidth=1.0)
 
     ax.plot(
         mean_df["relative_time_pct"].to_numpy(dtype=float),
         mean_df["cohort_mean_prefix_accuracy"].to_numpy(dtype=float),
-        color="#0b3c8c",
+        color=metric_mean_color("accuracy"),
         linewidth=3.0,
         marker="o",
         label="Cohort Mean (MedEvo)",
@@ -623,6 +636,134 @@ def _plot_prefix_accuracy(frame: pd.DataFrame, output_path: Path) -> pd.DataFram
     return mean_df
 
 
+def _absolute_hour_bin_frame(frame: pd.DataFrame) -> Tuple[pd.DataFrame, int, float]:
+    if "hours_since_admission" not in frame.columns:
+        raise ValueError("Absolute-hour plots require hours_since_admission column.")
+
+    normalized = frame.copy()
+    normalized["hours_since_admission"] = pd.to_numeric(normalized["hours_since_admission"], errors="coerce")
+    normalized = normalized.dropna(subset=["hours_since_admission"]).copy()
+    if normalized.empty:
+        raise ValueError("Absolute-hour plots require non-empty hours_since_admission values.")
+    if (normalized["hours_since_admission"] < 0).any():
+        raise ValueError("Absolute-hour plots require non-negative hours_since_admission values.")
+
+    max_hour = float(normalized["hours_since_admission"].max())
+    max_bin = int(math.floor(max_hour / float(ABSOLUTE_TIME_BIN_HOURS)))
+    max_edge = float((max_bin + 1) * float(ABSOLUTE_TIME_BIN_HOURS))
+    normalized["absolute_hour_bin"] = np.floor(
+        normalized["hours_since_admission"].to_numpy(dtype=float) / float(ABSOLUTE_TIME_BIN_HOURS)
+    ).astype(int)
+    return normalized, max_bin, max_edge
+
+
+def _plot_absolute_hour_accuracy(frame: pd.DataFrame, output_path: Path) -> pd.DataFrame:
+    normalized, max_bin, max_edge = _absolute_hour_bin_frame(frame)
+
+    plot_rows: List[Dict[str, Any]] = []
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    for system_name, system_df in normalized.groupby("system"):
+        for hour_bin in range(max_bin + 1):
+            subset = system_df[system_df["absolute_hour_bin"] == int(hour_bin)]
+            values = subset["is_correct"].astype(float).tolist()
+            mean_acc = float(np.mean(values)) if values else float("nan")
+            ci_low, ci_high = _bootstrap_mean_ci(values, n_samples=BOOTSTRAP_SAMPLES, rng=rng)
+            plot_rows.append(
+                {
+                    "system": str(system_name),
+                    "absolute_hour_bin": int(hour_bin),
+                    "hour_start": float(hour_bin * float(ABSOLUTE_TIME_BIN_HOURS)),
+                    "hour_end": float((hour_bin + 1) * float(ABSOLUTE_TIME_BIN_HOURS)),
+                    "hour_mid": float((hour_bin + 0.5) * float(ABSOLUTE_TIME_BIN_HOURS)),
+                    "n_windows": int(len(values)),
+                    "accuracy": mean_acc,
+                    "ci_low": ci_low,
+                    "ci_high": ci_high,
+                }
+            )
+
+    plot_df = pd.DataFrame(plot_rows).sort_values(["system", "absolute_hour_bin"]).reset_index(drop=True)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for system_name in plot_df["system"].unique().tolist():
+        subset = plot_df[plot_df["system"] == system_name].copy()
+        x = subset["hour_mid"].to_numpy(dtype=float)
+        y = subset["accuracy"].to_numpy(dtype=float)
+        low = subset["ci_low"].to_numpy(dtype=float)
+        high = subset["ci_high"].to_numpy(dtype=float)
+        color = system_color(str(system_name))
+        ax.plot(x, y, marker="o", linewidth=2.2, label=system_name, color=color)
+        ax.fill_between(x, low, high, alpha=METRIC_BAND_ALPHA, color=color)
+
+    ax.set_xlabel("Hours Since ICU Admission")
+    ax.set_ylabel("Window-Level Accuracy")
+    ax.set_title("Absolute-Time Accuracy Curve")
+    ax.set_xlim(0, max_edge)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return plot_df
+
+
+def _plot_absolute_hour_prefix_accuracy(frame: pd.DataFrame, output_path: Path) -> pd.DataFrame:
+    med_evo = frame[frame["system"] == "MedEvo"].copy()
+    if med_evo.empty:
+        raise ValueError("Absolute-time prefix accuracy plot requires MedEvo rows.")
+
+    med_evo, max_bin, max_edge = _absolute_hour_bin_frame(med_evo)
+    med_evo = med_evo.sort_values(["patient_id", "hours_since_admission", "window_index"]).reset_index(drop=True)
+    med_evo["cum_correct"] = med_evo.groupby("patient_id")["is_correct"].cumsum()
+    med_evo["cum_count"] = med_evo.groupby("patient_id").cumcount() + 1
+    med_evo["prefix_accuracy"] = med_evo["cum_correct"] / med_evo["cum_count"]
+
+    thresholds = [float(index * float(ABSOLUTE_TIME_BIN_HOURS)) for index in range(max_bin + 2)]
+    mean_rows: List[Dict[str, Any]] = []
+    for threshold in thresholds:
+        patient_values: List[float] = []
+        for _, patient_df in med_evo.groupby("patient_id"):
+            valid = patient_df[patient_df["hours_since_admission"] <= float(threshold)]
+            if valid.empty:
+                continue
+            patient_values.append(float(valid["prefix_accuracy"].iloc[-1]))
+        mean_rows.append(
+            {
+                "hours_since_admission": float(threshold),
+                "num_patients": int(len(patient_values)),
+                "cohort_mean_prefix_accuracy": float(np.mean(patient_values)) if patient_values else float("nan"),
+            }
+        )
+    mean_df = pd.DataFrame(mean_rows)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for _, patient_df in med_evo.groupby("patient_id"):
+        x = patient_df["hours_since_admission"].to_numpy(dtype=float)
+        y = patient_df["prefix_accuracy"].to_numpy(dtype=float)
+        ax.plot(x, y, color=metric_color("accuracy"), alpha=PATIENT_TRACE_ALPHA, linewidth=1.0)
+
+    ax.plot(
+        mean_df["hours_since_admission"].to_numpy(dtype=float),
+        mean_df["cohort_mean_prefix_accuracy"].to_numpy(dtype=float),
+        color=metric_mean_color("accuracy"),
+        linewidth=3.0,
+        marker="o",
+        label="Cohort Mean (MedEvo)",
+    )
+    ax.set_xlabel("Hours Since ICU Admission")
+    ax.set_ylabel("Cumulative Accuracy")
+    ax.set_title("Absolute-Time Prefix Cumulative Accuracy Curve")
+    ax.set_xlim(0, max_edge)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return mean_df
+
+
 def _plot_relative_time_accuracy_by_mode(
     curves_by_mode: Dict[str, pd.DataFrame],
     output_path: Path,
@@ -631,6 +772,7 @@ def _plot_relative_time_accuracy_by_mode(
         raise ValueError("No mode curves provided for relative-time comparison plot.")
 
     fig, ax = plt.subplots(figsize=(10, 5))
+    color_by_mode = mode_color_map(sorted(curves_by_mode.keys()))
     rows: List[Dict[str, Any]] = []
     for mode_name in sorted(curves_by_mode.keys()):
         curve_df = curves_by_mode[mode_name]
@@ -640,7 +782,8 @@ def _plot_relative_time_accuracy_by_mode(
         ordered = med_evo_curve.sort_values("time_bin").reset_index(drop=True)
         x = ordered["time_bin_mid_pct"].to_numpy(dtype=float)
         y = ordered["accuracy"].to_numpy(dtype=float)
-        ax.plot(x, y, marker="o", linewidth=2.2, label=str(mode_name))
+        color = color_by_mode[str(mode_name)]
+        ax.plot(x, y, marker="o", linewidth=2.2, label=str(mode_name), color=color, alpha=MODE_TRACE_ALPHA)
         for _, row in ordered.iterrows():
             rows.append(
                 {
@@ -679,6 +822,7 @@ def _plot_prefix_accuracy_by_mode(
         raise ValueError("No mode curves provided for prefix comparison plot.")
 
     fig, ax = plt.subplots(figsize=(10, 5))
+    color_by_mode = mode_color_map(sorted(curves_by_mode.keys()))
     rows: List[Dict[str, Any]] = []
     for mode_name in sorted(curves_by_mode.keys()):
         curve_df = curves_by_mode[mode_name]
@@ -687,7 +831,8 @@ def _plot_prefix_accuracy_by_mode(
         ordered = curve_df.sort_values("relative_time_pct").reset_index(drop=True)
         x = ordered["relative_time_pct"].to_numpy(dtype=float)
         y = ordered["cohort_mean_prefix_accuracy"].to_numpy(dtype=float)
-        ax.plot(x, y, marker="o", linewidth=2.2, label=str(mode_name))
+        color = color_by_mode[str(mode_name)]
+        ax.plot(x, y, marker="o", linewidth=2.2, label=str(mode_name), color=color, alpha=MODE_TRACE_ALPHA)
         for _, row in ordered.iterrows():
             rows.append(
                 {
@@ -712,6 +857,108 @@ def _plot_prefix_accuracy_by_mode(
     comparison_df = pd.DataFrame(rows)
     if comparison_df.empty:
         raise ValueError("No rows generated for prefix mode comparison plot.")
+    return comparison_df
+
+
+def _plot_absolute_hour_accuracy_by_mode(
+    curves_by_mode: Dict[str, pd.DataFrame],
+    output_path: Path,
+) -> pd.DataFrame:
+    if not curves_by_mode:
+        raise ValueError("No mode curves provided for absolute-hour comparison plot.")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    color_by_mode = mode_color_map(sorted(curves_by_mode.keys()))
+    rows: List[Dict[str, Any]] = []
+    max_hour = 0.0
+    for mode_name in sorted(curves_by_mode.keys()):
+        curve_df = curves_by_mode[mode_name]
+        med_evo_curve = curve_df[curve_df["system"] == "MedEvo"].copy()
+        if med_evo_curve.empty:
+            continue
+        ordered = med_evo_curve.sort_values("absolute_hour_bin").reset_index(drop=True)
+        x = ordered["hour_mid"].to_numpy(dtype=float)
+        y = ordered["accuracy"].to_numpy(dtype=float)
+        color = color_by_mode[str(mode_name)]
+        ax.plot(x, y, marker="o", linewidth=2.2, label=str(mode_name), color=color, alpha=MODE_TRACE_ALPHA)
+        max_hour = max(max_hour, float(ordered["hour_end"].max()))
+        for _, row in ordered.iterrows():
+            rows.append(
+                {
+                    "mode": str(mode_name),
+                    "absolute_hour_bin": int(row["absolute_hour_bin"]),
+                    "hour_start": float(row["hour_start"]),
+                    "hour_end": float(row["hour_end"]),
+                    "hour_mid": float(row["hour_mid"]),
+                    "n_windows": int(row["n_windows"]),
+                    "accuracy": float(row["accuracy"]),
+                    "ci_low": float(row["ci_low"]),
+                    "ci_high": float(row["ci_high"]),
+                }
+            )
+
+    ax.set_xlabel("Hours Since ICU Admission")
+    ax.set_ylabel("Window-Level Accuracy")
+    ax.set_title("Absolute-Time Accuracy by Mode")
+    ax.set_xlim(0, max_hour)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+    comparison_df = pd.DataFrame(rows)
+    if comparison_df.empty:
+        raise ValueError("No rows generated for absolute-hour mode comparison plot.")
+    return comparison_df
+
+
+def _plot_absolute_hour_prefix_accuracy_by_mode(
+    curves_by_mode: Dict[str, pd.DataFrame],
+    output_path: Path,
+) -> pd.DataFrame:
+    if not curves_by_mode:
+        raise ValueError("No mode curves provided for absolute-hour prefix comparison plot.")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    color_by_mode = mode_color_map(sorted(curves_by_mode.keys()))
+    rows: List[Dict[str, Any]] = []
+    max_hour = 0.0
+    for mode_name in sorted(curves_by_mode.keys()):
+        curve_df = curves_by_mode[mode_name]
+        if curve_df.empty:
+            continue
+        ordered = curve_df.sort_values("hours_since_admission").reset_index(drop=True)
+        x = ordered["hours_since_admission"].to_numpy(dtype=float)
+        y = ordered["cohort_mean_prefix_accuracy"].to_numpy(dtype=float)
+        color = color_by_mode[str(mode_name)]
+        ax.plot(x, y, marker="o", linewidth=2.2, label=str(mode_name), color=color, alpha=MODE_TRACE_ALPHA)
+        max_hour = max(max_hour, float(ordered["hours_since_admission"].max()))
+        for _, row in ordered.iterrows():
+            rows.append(
+                {
+                    "mode": str(mode_name),
+                    "hours_since_admission": float(row["hours_since_admission"]),
+                    "num_patients": int(row["num_patients"]),
+                    "cohort_mean_prefix_accuracy": float(row["cohort_mean_prefix_accuracy"]),
+                }
+            )
+
+    ax.set_xlabel("Hours Since ICU Admission")
+    ax.set_ylabel("Cumulative Accuracy")
+    ax.set_title("Absolute-Time Prefix Cumulative Accuracy by Mode")
+    ax.set_xlim(0, max_hour)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+    comparison_df = pd.DataFrame(rows)
+    if comparison_df.empty:
+        raise ValueError("No rows generated for absolute-hour prefix mode comparison plot.")
     return comparison_df
 
 
@@ -752,7 +999,7 @@ def _plot_time_memory_heatmap(frame: pd.DataFrame, output_path: Path) -> Tuple[p
 
     fig, ax = plt.subplots(figsize=(12, 6))
     heatmap_data = mean_table.to_numpy(dtype=float)
-    image = ax.imshow(heatmap_data, aspect="auto", origin="lower", cmap="YlGnBu", vmin=0.0, vmax=1.0)
+    image = ax.imshow(heatmap_data, aspect="auto", origin="lower", cmap=heatmap_cmap("accuracy"), vmin=0.0, vmax=1.0)
     colorbar = fig.colorbar(image, ax=ax)
     colorbar.set_label("Accuracy")
 
@@ -913,6 +1160,21 @@ def _evaluate_single_prediction_dir(
     )
     prefix_curve_df.to_csv(output_dir / "plot2_prefix_cumulative_accuracy_curve.csv", index=False)
 
+    absolute_hour_curve_df = _plot_absolute_hour_accuracy(
+        combined_frame,
+        output_path=output_dir / "plot4_absolute_hour_accuracy_curve.png",
+    )
+    absolute_hour_curve_df.to_csv(output_dir / "plot4_absolute_hour_accuracy_curve.csv", index=False)
+
+    absolute_hour_prefix_curve_df = _plot_absolute_hour_prefix_accuracy(
+        combined_frame,
+        output_path=output_dir / "plot5_absolute_hour_prefix_cumulative_accuracy_curve.png",
+    )
+    absolute_hour_prefix_curve_df.to_csv(
+        output_dir / "plot5_absolute_hour_prefix_cumulative_accuracy_curve.csv",
+        index=False,
+    )
+
     heatmap_long_df, med_evo_heatmap_source = _plot_time_memory_heatmap(
         combined_frame,
         output_path=output_dir / "plot3_time_memory_accuracy_heatmap.png",
@@ -948,6 +1210,8 @@ def _evaluate_single_prediction_dir(
     return {
         "relative_curve_df": relative_curve_df,
         "prefix_curve_df": prefix_curve_df,
+        "absolute_hour_curve_df": absolute_hour_curve_df,
+        "absolute_hour_prefix_curve_df": absolute_hour_prefix_curve_df,
         "output_dir": output_dir,
     }
 
@@ -1000,6 +1264,8 @@ def run_evaluation(
         )
         relative_curves_by_mode: Dict[str, pd.DataFrame] = {}
         prefix_curves_by_mode: Dict[str, pd.DataFrame] = {}
+        absolute_hour_curves_by_mode: Dict[str, pd.DataFrame] = {}
+        absolute_hour_prefix_curves_by_mode: Dict[str, pd.DataFrame] = {}
 
         for mode in sorted(discovered_mode_dirs.keys()):
             mode_prediction_dir = discovered_mode_dirs[mode]
@@ -1014,6 +1280,8 @@ def run_evaluation(
             )
             relative_curves_by_mode[mode] = mode_result["relative_curve_df"]
             prefix_curves_by_mode[mode] = mode_result["prefix_curve_df"]
+            absolute_hour_curves_by_mode[mode] = mode_result["absolute_hour_curve_df"]
+            absolute_hour_prefix_curves_by_mode[mode] = mode_result["absolute_hour_prefix_curve_df"]
 
         if len(relative_curves_by_mode) > 1:
             combined_relative_df = _plot_relative_time_accuracy_by_mode(
@@ -1030,6 +1298,23 @@ def run_evaluation(
             )
             combined_prefix_df.to_csv(
                 output_root / "plot2_prefix_cumulative_accuracy_curve_by_mode.csv", index=False
+            )
+        if len(absolute_hour_curves_by_mode) > 1:
+            combined_absolute_hour_df = _plot_absolute_hour_accuracy_by_mode(
+                absolute_hour_curves_by_mode,
+                output_path=output_root / "plot4_absolute_hour_accuracy_curve_by_mode.png",
+            )
+            combined_absolute_hour_df.to_csv(
+                output_root / "plot4_absolute_hour_accuracy_curve_by_mode.csv", index=False
+            )
+        if len(absolute_hour_prefix_curves_by_mode) > 1:
+            combined_absolute_hour_prefix_df = _plot_absolute_hour_prefix_accuracy_by_mode(
+                absolute_hour_prefix_curves_by_mode,
+                output_path=output_root / "plot5_absolute_hour_prefix_cumulative_accuracy_curve_by_mode.png",
+            )
+            combined_absolute_hour_prefix_df.to_csv(
+                output_root / "plot5_absolute_hour_prefix_cumulative_accuracy_curve_by_mode.csv",
+                index=False,
             )
 
         print(f"Saved multi-mode evaluation outputs to: {output_root}")

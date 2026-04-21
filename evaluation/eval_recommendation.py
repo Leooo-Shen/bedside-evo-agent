@@ -28,6 +28,16 @@ from experiments.oracle.action_validity_common import (
 from experiments.oracle.common import assign_normalized_time_bin
 from model.llms import LLMClient
 from prompts.action_matcher_prompts import get_action_matcher_prompt
+from evaluation.plot_style import (
+    METRIC_BAND_ALPHA,
+    MODE_TRACE_ALPHA,
+    PATIENT_TRACE_ALPHA,
+    configure_plot_style,
+    heatmap_cmap,
+    metric_color,
+    metric_mean_color,
+    mode_color_map,
+)
 from utils.json_parse import parse_json_dict_best_effort
 
 ORACLE_POSITIVE_LABELS = frozenset({"best_practice", "acceptable"})
@@ -46,6 +56,8 @@ HIT_MATCH_COUNT_THRESHOLD = 1
 ABSOLUTE_TIME_BIN_HOURS = 24.0
 _THREAD_LOCAL = threading.local()
 ORACLE_INTERVAL_DECIMALS = 6
+
+configure_plot_style()
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -1562,8 +1574,8 @@ def _plot_relative_time_curve(
     y_hit = plot_df["hit_at_k"].to_numpy(dtype=float)
     low_hit = plot_df["hit_ci_low"].to_numpy(dtype=float)
     high_hit = plot_df["hit_ci_high"].to_numpy(dtype=float)
-    axes[0].plot(x, y_hit, marker="o", linewidth=2.2, color="#1f77b4")
-    axes[0].fill_between(x, low_hit, high_hit, alpha=0.18, color="#1f77b4")
+    axes[0].plot(x, y_hit, marker="o", linewidth=2.2, color=metric_color("hit"))
+    axes[0].fill_between(x, low_hit, high_hit, alpha=METRIC_BAND_ALPHA, color=metric_color("hit"))
     axes[0].set_xlabel("Relative Window Position (%)")
     axes[0].set_ylabel(f"Hit@{selected_k}")
     axes[0].set_title(f"Relative-Time Hit@{selected_k}")
@@ -1574,8 +1586,14 @@ def _plot_relative_time_curve(
     y_precision = plot_df["precision_at_k"].to_numpy(dtype=float)
     low_precision = plot_df["precision_ci_low"].to_numpy(dtype=float)
     high_precision = plot_df["precision_ci_high"].to_numpy(dtype=float)
-    axes[1].plot(x, y_precision, marker="o", linewidth=2.2, color="#ff7f0e")
-    axes[1].fill_between(x, low_precision, high_precision, alpha=0.18, color="#ff7f0e")
+    axes[1].plot(x, y_precision, marker="o", linewidth=2.2, color=metric_color("precision"))
+    axes[1].fill_between(
+        x,
+        low_precision,
+        high_precision,
+        alpha=METRIC_BAND_ALPHA,
+        color=metric_color("precision"),
+    )
     axes[1].set_xlabel("Relative Window Position (%)")
     axes[1].set_ylabel(f"Precision@{selected_k}")
     axes[1].set_title(f"Relative-Time Precision@{selected_k}")
@@ -1641,13 +1659,19 @@ def _plot_prefix_curve(
         x = patient_df["relative_time"].to_numpy(dtype=float) * 100.0
         hit_y = patient_df["prefix_hit_at_k"].to_numpy(dtype=float)
         precision_y = patient_df["prefix_precision_at_k"].to_numpy(dtype=float)
-        axes[0].plot(x, hit_y, color="#1f77b4", alpha=0.18, linewidth=1.0)
-        axes[1].plot(x, precision_y, color="#ff7f0e", alpha=0.18, linewidth=1.0)
+        axes[0].plot(x, hit_y, color=metric_color("hit"), alpha=PATIENT_TRACE_ALPHA, linewidth=1.0)
+        axes[1].plot(
+            x,
+            precision_y,
+            color=metric_color("precision"),
+            alpha=PATIENT_TRACE_ALPHA,
+            linewidth=1.0,
+        )
 
     axes[0].plot(
         mean_df["relative_time_pct"].to_numpy(dtype=float),
         mean_df["cohort_mean_prefix_hit_at_k"].to_numpy(dtype=float),
-        color="#0b3c8c",
+        color=metric_mean_color("hit"),
         linewidth=3.0,
         marker="o",
         label=f"Cohort Mean Hit@{selected_k}",
@@ -1663,7 +1687,7 @@ def _plot_prefix_curve(
     axes[1].plot(
         mean_df["relative_time_pct"].to_numpy(dtype=float),
         mean_df["cohort_mean_prefix_precision_at_k"].to_numpy(dtype=float),
-        color="#b85e00",
+        color=metric_mean_color("precision"),
         linewidth=3.0,
         marker="o",
         label=f"Cohort Mean Precision@{selected_k}",
@@ -1753,8 +1777,8 @@ def _plot_absolute_hour_curve(
     y_hit = plot_df["hit_at_k"].to_numpy(dtype=float)
     low_hit = plot_df["hit_ci_low"].to_numpy(dtype=float)
     high_hit = plot_df["hit_ci_high"].to_numpy(dtype=float)
-    axes[0].plot(x, y_hit, marker="o", linewidth=2.2, color="#1f77b4")
-    axes[0].fill_between(x, low_hit, high_hit, alpha=0.18, color="#1f77b4")
+    axes[0].plot(x, y_hit, marker="o", linewidth=2.2, color=metric_color("hit"))
+    axes[0].fill_between(x, low_hit, high_hit, alpha=METRIC_BAND_ALPHA, color=metric_color("hit"))
     axes[0].set_xlabel("Hours Since ICU Admission")
     axes[0].set_ylabel(f"Hit@{selected_k}")
     axes[0].set_title(f"Absolute-Time Hit@{selected_k}")
@@ -1765,8 +1789,14 @@ def _plot_absolute_hour_curve(
     y_precision = plot_df["precision_at_k"].to_numpy(dtype=float)
     low_precision = plot_df["precision_ci_low"].to_numpy(dtype=float)
     high_precision = plot_df["precision_ci_high"].to_numpy(dtype=float)
-    axes[1].plot(x, y_precision, marker="o", linewidth=2.2, color="#ff7f0e")
-    axes[1].fill_between(x, low_precision, high_precision, alpha=0.18, color="#ff7f0e")
+    axes[1].plot(x, y_precision, marker="o", linewidth=2.2, color=metric_color("precision"))
+    axes[1].fill_between(
+        x,
+        low_precision,
+        high_precision,
+        alpha=METRIC_BAND_ALPHA,
+        color=metric_color("precision"),
+    )
     axes[1].set_xlabel("Hours Since ICU Admission")
     axes[1].set_ylabel(f"Precision@{selected_k}")
     axes[1].set_title(f"Absolute-Time Precision@{selected_k}")
@@ -1833,13 +1863,19 @@ def _plot_absolute_hour_prefix_curve(
         x = patient_df["hours_since_admission"].to_numpy(dtype=float)
         hit_y = patient_df["prefix_hit_at_k"].to_numpy(dtype=float)
         precision_y = patient_df["prefix_precision_at_k"].to_numpy(dtype=float)
-        axes[0].plot(x, hit_y, color="#1f77b4", alpha=0.18, linewidth=1.0)
-        axes[1].plot(x, precision_y, color="#ff7f0e", alpha=0.18, linewidth=1.0)
+        axes[0].plot(x, hit_y, color=metric_color("hit"), alpha=PATIENT_TRACE_ALPHA, linewidth=1.0)
+        axes[1].plot(
+            x,
+            precision_y,
+            color=metric_color("precision"),
+            alpha=PATIENT_TRACE_ALPHA,
+            linewidth=1.0,
+        )
 
     axes[0].plot(
         mean_df["hours_since_admission"].to_numpy(dtype=float),
         mean_df["cohort_mean_prefix_hit_at_k"].to_numpy(dtype=float),
-        color="#0b3c8c",
+        color=metric_mean_color("hit"),
         linewidth=3.0,
         marker="o",
         label=f"Cohort Mean Hit@{selected_k}",
@@ -1855,7 +1891,7 @@ def _plot_absolute_hour_prefix_curve(
     axes[1].plot(
         mean_df["hours_since_admission"].to_numpy(dtype=float),
         mean_df["cohort_mean_prefix_precision_at_k"].to_numpy(dtype=float),
-        color="#b85e00",
+        color=metric_mean_color("precision"),
         linewidth=3.0,
         marker="o",
         label=f"Cohort Mean Precision@{selected_k}",
@@ -1927,7 +1963,7 @@ def _plot_time_memory_heatmap(
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
 
     hit_data = hit_table.to_numpy(dtype=float)
-    hit_image = axes[0].imshow(hit_data, aspect="auto", origin="lower", cmap="YlGnBu", vmin=0.0, vmax=1.0)
+    hit_image = axes[0].imshow(hit_data, aspect="auto", origin="lower", cmap=heatmap_cmap("hit"), vmin=0.0, vmax=1.0)
     hit_cbar = fig.colorbar(hit_image, ax=axes[0])
     hit_cbar.set_label(f"Hit@{selected_k}")
 
@@ -1936,7 +1972,7 @@ def _plot_time_memory_heatmap(
         precision_data,
         aspect="auto",
         origin="lower",
-        cmap="YlOrBr",
+        cmap=heatmap_cmap("precision"),
         vmin=0.0,
         vmax=1.0,
     )
@@ -2123,14 +2159,24 @@ def _plot_patient_mode_relative_curve(
         raise ValueError(f"No mode curves provided for patient_id={patient_id}")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    color_by_mode = mode_color_map(sorted(curves_by_mode.keys()))
     rows: List[Dict[str, Any]] = []
     for mode_label, curve_df in curves_by_mode.items():
         ordered = curve_df.sort_values("time_bin").reset_index(drop=True)
         x = ordered["time_bin_mid_pct"].to_numpy(dtype=float)
         hit = ordered["hit_at_k"].to_numpy(dtype=float)
         precision = ordered["precision_at_k"].to_numpy(dtype=float)
-        axes[0].plot(x, hit, marker="o", linewidth=2.2, label=str(mode_label))
-        axes[1].plot(x, precision, marker="o", linewidth=2.2, label=str(mode_label))
+        color = color_by_mode[str(mode_label)]
+        axes[0].plot(x, hit, marker="o", linewidth=2.2, label=str(mode_label), color=color, alpha=MODE_TRACE_ALPHA)
+        axes[1].plot(
+            x,
+            precision,
+            marker="o",
+            linewidth=2.2,
+            label=str(mode_label),
+            color=color,
+            alpha=MODE_TRACE_ALPHA,
+        )
         for _, row in ordered.iterrows():
             rows.append(
                 {
@@ -2180,14 +2226,24 @@ def _plot_patient_mode_prefix_curve(
         raise ValueError(f"No mode curves provided for patient_id={patient_id}")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    color_by_mode = mode_color_map(sorted(curves_by_mode.keys()))
     rows: List[Dict[str, Any]] = []
     for mode_label, curve_df in curves_by_mode.items():
         ordered = curve_df.sort_values("relative_time_pct").reset_index(drop=True)
         x = ordered["relative_time_pct"].to_numpy(dtype=float)
         hit = ordered["prefix_hit_at_k"].to_numpy(dtype=float)
         precision = ordered["prefix_precision_at_k"].to_numpy(dtype=float)
-        axes[0].plot(x, hit, marker="o", linewidth=2.2, label=str(mode_label))
-        axes[1].plot(x, precision, marker="o", linewidth=2.2, label=str(mode_label))
+        color = color_by_mode[str(mode_label)]
+        axes[0].plot(x, hit, marker="o", linewidth=2.2, label=str(mode_label), color=color, alpha=MODE_TRACE_ALPHA)
+        axes[1].plot(
+            x,
+            precision,
+            marker="o",
+            linewidth=2.2,
+            label=str(mode_label),
+            color=color,
+            alpha=MODE_TRACE_ALPHA,
+        )
         for _, row in ordered.iterrows():
             rows.append(
                 {
@@ -2303,6 +2359,7 @@ def _plot_relative_time_curve_by_mode(
         raise ValueError("No mode curves provided for relative-time comparison plot.")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    color_by_mode = mode_color_map(sorted(curve_by_mode.keys()))
     rows: List[Dict[str, Any]] = []
     for mode_label, curve_df in curve_by_mode.items():
         if curve_df.empty:
@@ -2311,8 +2368,17 @@ def _plot_relative_time_curve_by_mode(
         x = ordered["time_bin_mid_pct"].to_numpy(dtype=float)
         y_hit = ordered["hit_at_k"].to_numpy(dtype=float)
         y_precision = ordered["precision_at_k"].to_numpy(dtype=float)
-        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label))
-        axes[1].plot(x, y_precision, marker="o", linewidth=2.2, label=str(mode_label))
+        color = color_by_mode[str(mode_label)]
+        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label), color=color, alpha=MODE_TRACE_ALPHA)
+        axes[1].plot(
+            x,
+            y_precision,
+            marker="o",
+            linewidth=2.2,
+            label=str(mode_label),
+            color=color,
+            alpha=MODE_TRACE_ALPHA,
+        )
         for _, row in ordered.iterrows():
             rows.append(
                 {
@@ -2360,6 +2426,7 @@ def _plot_prefix_curve_by_mode(
         raise ValueError("No mode curves provided for prefix comparison plot.")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    color_by_mode = mode_color_map(sorted(curve_by_mode.keys()))
     rows: List[Dict[str, Any]] = []
     for mode_label, curve_df in curve_by_mode.items():
         if curve_df.empty:
@@ -2368,8 +2435,17 @@ def _plot_prefix_curve_by_mode(
         x = ordered["relative_time_pct"].to_numpy(dtype=float)
         y_hit = ordered["cohort_mean_prefix_hit_at_k"].to_numpy(dtype=float)
         y_precision = ordered["cohort_mean_prefix_precision_at_k"].to_numpy(dtype=float)
-        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label))
-        axes[1].plot(x, y_precision, marker="o", linewidth=2.2, label=str(mode_label))
+        color = color_by_mode[str(mode_label)]
+        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label), color=color, alpha=MODE_TRACE_ALPHA)
+        axes[1].plot(
+            x,
+            y_precision,
+            marker="o",
+            linewidth=2.2,
+            label=str(mode_label),
+            color=color,
+            alpha=MODE_TRACE_ALPHA,
+        )
         for _, row in ordered.iterrows():
             rows.append(
                 {
@@ -2416,6 +2492,7 @@ def _plot_absolute_hour_curve_by_mode(
         raise ValueError("No mode curves provided for absolute-hour comparison plot.")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    color_by_mode = mode_color_map(sorted(curve_by_mode.keys()))
     rows: List[Dict[str, Any]] = []
     max_hour = 0.0
     for mode_label, curve_df in curve_by_mode.items():
@@ -2425,8 +2502,17 @@ def _plot_absolute_hour_curve_by_mode(
         x = ordered["hour_mid"].to_numpy(dtype=float)
         y_hit = ordered["hit_at_k"].to_numpy(dtype=float)
         y_precision = ordered["precision_at_k"].to_numpy(dtype=float)
-        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label))
-        axes[1].plot(x, y_precision, marker="o", linewidth=2.2, label=str(mode_label))
+        color = color_by_mode[str(mode_label)]
+        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label), color=color, alpha=MODE_TRACE_ALPHA)
+        axes[1].plot(
+            x,
+            y_precision,
+            marker="o",
+            linewidth=2.2,
+            label=str(mode_label),
+            color=color,
+            alpha=MODE_TRACE_ALPHA,
+        )
         max_hour = max(max_hour, float(ordered["hour_end"].max()))
         for _, row in ordered.iterrows():
             rows.append(
@@ -2477,6 +2563,7 @@ def _plot_absolute_hour_prefix_curve_by_mode(
         raise ValueError("No mode curves provided for absolute-hour prefix comparison plot.")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    color_by_mode = mode_color_map(sorted(curve_by_mode.keys()))
     rows: List[Dict[str, Any]] = []
     max_hour = 0.0
     for mode_label, curve_df in curve_by_mode.items():
@@ -2486,8 +2573,17 @@ def _plot_absolute_hour_prefix_curve_by_mode(
         x = ordered["hours_since_admission"].to_numpy(dtype=float)
         y_hit = ordered["cohort_mean_prefix_hit_at_k"].to_numpy(dtype=float)
         y_precision = ordered["cohort_mean_prefix_precision_at_k"].to_numpy(dtype=float)
-        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label))
-        axes[1].plot(x, y_precision, marker="o", linewidth=2.2, label=str(mode_label))
+        color = color_by_mode[str(mode_label)]
+        axes[0].plot(x, y_hit, marker="o", linewidth=2.2, label=str(mode_label), color=color, alpha=MODE_TRACE_ALPHA)
+        axes[1].plot(
+            x,
+            y_precision,
+            marker="o",
+            linewidth=2.2,
+            label=str(mode_label),
+            color=color,
+            alpha=MODE_TRACE_ALPHA,
+        )
         max_hour = max(max_hour, float(ordered["hours_since_admission"].max()))
         for _, row in ordered.iterrows():
             rows.append(
